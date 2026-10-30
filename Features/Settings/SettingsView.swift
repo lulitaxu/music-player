@@ -11,7 +11,7 @@ public struct SettingsView: View {
                 Section("About") {
                     LabeledContent("Version", value: "0.2.0 (search + playback)")
                     Text("Streams via Audius. Metadata via MusicBrainz and the Cover Art Archive.")
-                        .font(AppTypography.footnote)
+                        .font(AppTypography.caption)
                         .foregroundStyle(AppColors.inkSecondary)
                     LabeledContent("Target device", value: "iPhone XS")
                     LabeledContent("Minimum OS", value: "iOS 18")
