@@ -1,0 +1,8 @@
+# Generated Xcode project is NOT committed. project.yml is the source of truth.
+*.xcodeproj
+xcuserdata/
+DerivedData/
+build/
+.DS_Store
+*.xcuserstate
+.swiftpm/

@@ -1,0 +1,53 @@
+# XcodeGen project definition. The .xcodeproj is generated from this file
+# (on a Mac or in CI) and is never committed.
+name: MusicApp
+options:
+  bundleIdPrefix: com.arz
+  deploymentTarget:
+    iOS: "18.0"
+packages:
+  GRDB:
+    url: https://github.com/groue/GRDB.swift
+    from: 6.29.0
+  Nuke:
+    url: https://github.com/kean/Nuke
+    from: 12.7.0
+targets:
+  MusicApp:
+    type: application
+    platform: iOS
+    sources:
+      - App
+      - Core
+      - Features
+      - Providers
+      - DesignSystem
+      - Resources
+    dependencies:
+      - package: GRDB
+      - package: Nuke
+        product: NukeUI
+    settings:
+      base:
+        SWIFT_VERSION: "5.9"
+        INFOPLIST_KEY_UILaunchStoryboardName: ""
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        # Background audio mode is declared now because Phase 3 depends on it;
+        # it ships in the plist from day one so CI validates it early.
+        INFOPLIST_KEY_UIBackgroundModes: audio
+  MusicAppTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests/UnitTests
+      - Tests/IntegrationTests
+    dependencies:
+      - target: MusicApp
+  MusicAppUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - Tests/UITests
+    dependencies:
+      - target: MusicApp
