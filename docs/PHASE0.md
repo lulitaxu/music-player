@@ -142,7 +142,11 @@ phases land after the Meta hackathon (Nov 5) and Haven (Nov 13-14):
 - **Phase 5:** downloads (Audius/IA/Jamendo where permitted) + import,
   offline library.
 - **Phase 6:** playlists, favorites, sleep timer, battery guard,
-  history/statistics.
+  history/statistics. Plus the 2026-10-31 addendum: the on-device
+  discovery engine (taste profile, made-for-you mixes, radio) and
+  mixing stage 2 (configurable crossfade). Animation tokens already
+  landed in Milestone 1; Now Playing motion lands in Phase 3 and
+  karaoke motion in Phase 4. See SPEC.md addendum.
 - **Phase 7:** performance, security, accessibility gates.
 - **Phase 8:** device testing on the physical iPhone, release prep,
   provisioning decision executed.
