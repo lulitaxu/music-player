@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    runs-on: macos-15
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (iOS Simulator, generic)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project MusicApp.xcodeproj \
+            -scheme MusicApp \
+            -destination 'generic/platform=iOS Simulator'
+
+      - name: Test (iPhone 16 simulator)
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project MusicApp.xcodeproj \
+            -scheme MusicApp \
+            -destination 'platform=iOS Simulator,name=iPhone 16'
