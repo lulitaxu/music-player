@@ -30,12 +30,12 @@ targets:
     settings:
       base:
         SWIFT_VERSION: "5.9"
-        INFOPLIST_KEY_UILaunchStoryboardName: ""
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
-        # Background audio mode is declared now because Phase 3 depends on it;
-        # it ships in the plist from day one so CI validates it early.
-        INFOPLIST_KEY_UIBackgroundModes: audio
+        # NOTE: UIBackgroundModes (audio) is added in Phase 3 via the
+        # generated Info.plist properties, where the playback engine
+        # actually lands. Declaring it earlier would claim a capability
+        # the shell does not have yet.
   MusicAppTests:
     type: bundle.unit-test
     platform: iOS
@@ -51,3 +51,14 @@ targets:
       - Tests/UITests
     dependencies:
       - target: MusicApp
+schemes:
+  MusicApp:
+    build:
+      targets:
+        MusicApp: all
+        MusicAppTests: [test]
+    test:
+      targets:
+        - MusicAppTests
+    run:
+      config: Debug

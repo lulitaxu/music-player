@@ -2,17 +2,14 @@ import SwiftUI
 
 @main
 struct MusicApp: App {
+    @StateObject private var coordinator = AppCoordinator()
+    private let container = DependencyContainer.live
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            RootTabView(container: container)
+                .environmentObject(coordinator)
+                .preferredColorScheme(.dark)
         }
-    }
-}
-
-/// Placeholder root for Phase 0. Replaced by the tab shell in Phase 1
-/// (Milestone 1 acceptance is a building, launching empty shell, not UI).
-struct ContentView: View {
-    var body: some View {
-        Text("Music Player")
     }
 }
