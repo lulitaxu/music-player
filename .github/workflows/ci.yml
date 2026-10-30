@@ -74,3 +74,62 @@ jobs:
           name: MusicPlayer-unsigned-ipa
           path: MusicPlayer-unsigned.ipa
           if-no-files-found: error
+
+  screenshots:
+    # Renders the real app in a simulator and captures every screen.
+    if: github.event_name == 'push'
+    needs: build-test
+    runs-on: macos-15
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build for simulator
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project MusicApp.xcodeproj \
+            -scheme MusicApp \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build/DDSim
+
+      - name: Boot a simulator
+        id: sim
+        run: |
+          UDID=$(xcrun simctl create ShotPhone "iPhone 16")
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+
+      - name: Install and capture every screen
+        run: |
+          UDID=${{ steps.sim.outputs.udid }}
+          APP=build/DDSim/Build/Products/Debug-iphonesimulator/MusicApp.app
+          BID=$(/usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" "$APP/Info.plist")
+          mkdir -p shots
+          xcrun simctl install "$UDID" "$APP"
+          shoot() {
+            xcrun simctl terminate "$UDID" "$BID" || true
+            xcrun simctl launch "$UDID" "$BID" $2
+            sleep $3
+            xcrun simctl io "$UDID" screenshot "shots/$1.png"
+          }
+          shoot home "" 8
+          shoot search "-tab search" 4
+          shoot library "-tab library" 4
+          shoot downloads "-tab downloads" 4
+          shoot settings "-tab settings" 4
+          shoot nowplaying "-demoplay -nowplaying" 12
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: MusicPlayer-screenshots
+          path: shots/
+          if-no-files-found: error
