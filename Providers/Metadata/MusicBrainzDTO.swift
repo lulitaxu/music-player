@@ -38,3 +38,8 @@ public struct MusicBrainzRecording: Decodable, Sendable {
         )
     }
 }
+
+/// Envelope of a MusicBrainz recording search: { "recordings": [ ... ] }.
+public struct MusicBrainzSearchResponse: Decodable, Sendable {
+    public let recordings: [MusicBrainzRecording]
+}
