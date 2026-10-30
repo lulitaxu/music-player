@@ -29,7 +29,7 @@ public struct HomeView: View {
     public var body: some View {
         NavigationStack {
             content
-                .navigationTitle("Home")
+                .navigationTitle("arzxsh")
                 .task { await model.load() }
         }
     }
@@ -44,7 +44,7 @@ public struct HomeView: View {
             }
         } else {
             List {
-                Section("Trending on Audius") {
+                Section("Trending") {
                     ForEach(Array(model.trending.enumerated()), id: \.element.id) { index, track in
                         Button {
                             engine.playQueue(model.trending, startAt: index)

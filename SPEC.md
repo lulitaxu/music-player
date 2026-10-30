@@ -286,3 +286,11 @@ and playlists work; lyrics sync correctly for supported tracks;
 authorized downloads and offline playback work; sleep timer works;
 battery guard works within iOS execution limits; errors handled without
 crashes; UI responsive; tests pass; setup and architecture docs exist.
+
+### 6. Product name: arzxsh
+Added 2026-10-31 (Arz). The app is his product and carries his name:
+home-screen display name and in-app branding are "arzxsh". Provider
+names do not headline user-facing screens; honest attribution lives
+in Settings > About (streams via Audius, metadata via MusicBrainz
+and the Cover Art Archive). Availability honesty is unchanged:
+Playable vs Metadata only labels stay.
