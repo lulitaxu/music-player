@@ -1,7 +1,7 @@
 import Foundation
 
 /// Shared errors for every provider adapter.
-public enum ProviderError: Error, Sendable {
+public enum ProviderError: Error, Sendable, Equatable {
     case unsupported          // the provider cannot do this; declared in its capabilities
     case http(Int)            // non-2xx response
     case transport            // no usable response / bad URL
