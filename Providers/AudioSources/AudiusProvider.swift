@@ -16,7 +16,7 @@ public struct AudiusProvider: MusicMetadataProvider, AudioSourceProvider {
 
     private let client = APIClient()
     private static let base = "https://api.audius.co/v1"
-    private static let appName = "music-player-arz"
+    private static let appName = "arzxsh"
 
     public init() {}
 
