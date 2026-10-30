@@ -20,6 +20,13 @@ public struct MiniPlayerBar: View {
         .sheet(isPresented: $showNowPlaying) {
             NowPlayingView()
         }
+        .onChange(of: engine.currentTrack?.id) { _, newID in
+            #if DEBUG
+            if newID != nil, ProcessInfo.processInfo.arguments.contains("-nowplaying") {
+                showNowPlaying = true
+            }
+            #endif
+        }
     }
 
     private var idleBar: some View {

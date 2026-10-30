@@ -5,6 +5,8 @@ import SwiftUI
 public struct RootTabView: View {
     public let container: DependencyContainer
     @EnvironmentObject private var coordinator: AppCoordinator
+    @EnvironmentObject private var engine: PlaybackEngine
+    @State private var didApplyLaunchArgs = false
 
     public init(container: DependencyContainer) { self.container = container }
 
@@ -30,5 +32,35 @@ public struct RootTabView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             MiniPlayerBar()
         }
+        .onAppear { applyLaunchArgs() }
+    }
+
+    /// CI screenshot hooks (Debug builds only): -tab <name> selects a
+    /// tab, -demoplay starts real trending playback, -nowplaying opens
+    /// the Now Playing sheet once a track loads. Release builds ignore
+    /// all of it.
+    private func applyLaunchArgs() {
+        guard !didApplyLaunchArgs else { return }
+        didApplyLaunchArgs = true
+        #if DEBUG
+        let args = ProcessInfo.processInfo.arguments
+        if let i = args.firstIndex(of: "-tab"), args.indices.contains(i + 1) {
+            switch args[i + 1] {
+            case "search": coordinator.selectedTab = .search
+            case "library": coordinator.selectedTab = .library
+            case "downloads": coordinator.selectedTab = .downloads
+            case "settings": coordinator.selectedTab = .settings
+            default: break
+            }
+        }
+        if args.contains("-demoplay") {
+            Task {
+                let provider = AudiusProvider()
+                if let tracks = try? await provider.trending(limit: 10), !tracks.isEmpty {
+                    engine.playQueue(tracks, startAt: 0)
+                }
+            }
+        }
+        #endif
     }
 }
