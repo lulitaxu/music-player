@@ -235,6 +235,25 @@ Full beat-matched DJ mixing across arbitrary remote streams
 is **not** promised; if smart transitions prove out on local files,
 the phase plan revisits it with evidence.
 
+### 4. Live Art on Now Playing (Phase 3, reactive layer grows Phase 7)
+The popular services' animated covers (Apple's animated artwork,
+Spotify Canvas) are artist/label assets that exist only inside those
+platforms; no API licenses them to a third-party app, and extracting
+them is out of bounds. The buildable equivalent is **Live Art**:
+animation generated on-device from the song itself.
+- Layer 1: artwork color field (ambient tinting, from the design
+  study) cross-fading per track.
+- Layer 2: the cover in slow motion: a subtle Ken Burns drift and
+  breathing scale, off entirely under Reduce Motion.
+- Layer 3: audio-reactive visuals driven by the actual playing audio
+  (level/frequency data rendered as a restrained waveform or radial
+  field, frame-capped for the XS). Local files get the true reactive
+  layer first via the audio-engine tap; streamed playback gets
+  Layers 1-2 until the stream tap lands as a Phase 7 stretch item.
+Live Art is a Now Playing surface only, never a list background, and
+it pauses with playback. It is generated, never downloaded, so it
+works for every track including the user's own files.
+
 ## Definition of done
 App builds; runs on iPhone XS / iOS 18; search returns real
 provider-backed results; at least one legitimate audio source plays

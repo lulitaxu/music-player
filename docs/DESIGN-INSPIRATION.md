@@ -104,8 +104,22 @@ a lyric. Same honesty rule as lyrics matching.
   unusable in the hand: layered blurs murder the XS frame rate and
   repeat the exact legibility failure Apple had to patch. Our glass
   is one material layer, tinted, with scrim rules.
-- **Looping video backgrounds (Spotify Canvas).** Data, battery, and
-  licensing cost for decoration that fights the artwork. Out.
+- **Looping video backgrounds (Spotify Canvas), meaning their loops.**
+  The assets are artist uploads locked inside Spotify; importing or
+  imitating them costs data and battery for decoration that fights
+  the artwork. Out. Our answer to "live animation" is different and
+  is adopted as its own item below.
+
+### 8. Live Art, generated not downloaded (answering the animated-cover ask)
+What users love in Apple Music's animated artwork and Canvas is that
+the player feels alive and specific to the song. The assets
+themselves are not available to any third-party app. So Now Playing
+generates its life on-device (SPEC addendum item 4): artwork color
+field, a slow Ken Burns drift on the cover, and an audio-reactive
+layer driven by the actual waveform of what is playing. It is more
+honest than a borrowed loop, it works on the user's own files where
+Apple and Spotify have nothing, and it costs no data. XS guardrails:
+frame-capped rendering, Now Playing only, dead under Reduce Motion.
 - **The algorithmic infinite feed as home.** An engagement pattern,
   not a music pattern. Home is finite, arranged, and labeled.
 - **Text over raw artwork.** Everywhere it appears in the references,
