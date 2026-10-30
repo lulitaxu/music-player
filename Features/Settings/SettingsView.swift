@@ -9,7 +9,7 @@ public struct SettingsView: View {
         NavigationStack {
             List {
                 Section("About") {
-                    LabeledContent("Version", value: "0.1.0 (Milestone 1 shell)")
+                    LabeledContent("Version", value: "0.2.0 (search + playback)")
                     LabeledContent("Target device", value: "iPhone XS")
                     LabeledContent("Minimum OS", value: "iOS 18")
                 }

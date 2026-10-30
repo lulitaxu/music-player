@@ -28,3 +28,8 @@ public struct AudiusTrack: Decodable, Sendable {
         )
     }
 }
+
+/// Envelope of Audius list/search responses: { "data": [ ... ] }.
+public struct AudiusListResponse: Decodable, Sendable {
+    public let data: [AudiusTrack]
+}
