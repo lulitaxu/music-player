@@ -187,6 +187,54 @@ only; validate imported files; local database consistency; no
 unnecessary analytics; no listening-data collection without explicit
 consent; document external providers and their privacy policies.
 
+## Addendum 2026-10-31 (Arz): animation, discovery algorithms, mixing
+
+Three additions, adopted with phase placement and honest limits.
+
+### 1. Apple Music-style animation (Phases 1, 3, 4)
+- Motion is a design-system layer, not per-screen improvisation:
+  shared spring tokens live in `DesignSystem/Animations` (landed with
+  Milestone 1), artwork-driven ambient color backgrounds on Now
+  Playing, fluid mini-player expansion, animated karaoke line
+  emphasis in the lyrics UI.
+- Static artwork gets subtle life (slow pan/zoom, color-reactive
+  ambience). Apple's own animated album covers are label-supplied
+  assets exclusive to Apple Music; no third-party app can license
+  them, so they are explicitly out of scope.
+- All motion respects Reduce Motion: a complete static experience is
+  the fallback, never a broken one. The XS performance budget rules:
+  no stacked blur animations, no perpetual loops on list screens.
+
+### 2. Discovery algorithms (Phase 6, growing in Phase 7)
+Spotify's recommender is trained on hundreds of millions of users;
+that dataset cannot be replicated and this spec does not pretend to.
+What is built instead, honestly labeled in the UI as it matures:
+- **Taste profile, on-device only:** weighted artists, genres, and
+  eras from the user's own listening history, favorites, and skips.
+  It never leaves the device (consistent with the privacy section).
+- **Made-for-you mixes:** generated locally from the taste profile
+  against provider catalogs (Audius trending, Jamendo and Internet
+  Archive categories, MusicBrainz relationships).
+- **Radio mode:** seed a track or artist, the queue extends itself
+  from similar tracks (provider related-data plus metadata graph).
+- **Similar artists and tracks** on every artist and track page
+  (extends section A discovery).
+Quality grows with the user's own listening, which the UI may say.
+It must never claim Spotify-scale intelligence it does not have.
+
+### 3. Mixing (Phase 6, staged)
+In increasing order of difficulty, shipped in this order:
+- **Gapless** playback (already in section B).
+- **Configurable crossfade** (1 to 12 seconds, volume-ramped, two
+  player instances). This is the Spotify setting most users mean.
+- **Smart transitions (stretch, Phase 7):** crossfade alignment using
+  tempo and energy metadata where it exists (local files analyzed
+  on-device; tracks without data fall back to plain crossfade).
+Full beat-matched DJ mixing across arbitrary remote streams
+(Spotify's newest Mix feature) is research-grade on a phone CPU and
+is **not** promised; if smart transitions prove out on local files,
+the phase plan revisits it with evidence.
+
 ## Definition of done
 App builds; runs on iPhone XS / iOS 18; search returns real
 provider-backed results; at least one legitimate audio source plays
