@@ -254,6 +254,30 @@ Live Art is a Now Playing surface only, never a list background, and
 it pauses with playback. It is generated, never downloaded, so it
 works for every track including the user's own files.
 
+### 5. International text: Bangla and every language render properly
+Added 2026-10-31 (Arz). Lyrics, metadata, and search are multilingual
+by design, with Bangla as a first-class case, not an edge case.
+- All ingested text (providers, LRC files, local file tags) is
+  normalized to Unicode NFC. Legacy non-Unicode encodings (e.g. Bijoy
+  for Bangla) are out of scope unless a real source demands them, and
+  are never silently rendered as garbage without a note.
+- Content text uses system fonts so script fallback works (iOS ships
+  Kohinoor Bangla for Bengali). No Latin-only custom font may be
+  applied to lyrics or metadata.
+- Bangla conjuncts and vowel signs must survive intact: karaoke
+  highlighting is by whole line, and no code may split grapheme
+  clusters for animation or truncation.
+- Lyric lines carry per-line direction: the first strong character
+  decides LTR vs RTL (Arabic, Urdu, Hebrew right-align; Bangla and
+  Latin left-align), including mixed lines inside one song.
+- LRC parsing treats lyric text as opaque Unicode; only the
+  timestamp tags are parsed.
+- Search accepts input in any script; queries are percent-encoded.
+- Foundation landed early: `Core/Utilities/LocalizedText.swift`
+  (NFC normalization + per-line direction) with unit tests covering
+  Bangla, Arabic, mixed, and decomposed-input cases. The lyrics
+  layer's acceptance tests must add Bangla and Arabic LRC fixtures.
+
 ## Definition of done
 App builds; runs on iPhone XS / iOS 18; search returns real
 provider-backed results; at least one legitimate audio source plays
