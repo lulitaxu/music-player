@@ -30,34 +30,29 @@ targets:
     settings:
       base:
         SWIFT_VERSION: "5.9"
-        GENERATE_INFOPLIST_FILE: "YES"
-        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
-        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
-        # NOTE: UIBackgroundModes (audio) is added in Phase 3 via the
-        # generated Info.plist properties, where the playback engine
-        # actually lands. Declaring it earlier would claim a capability
-        # the shell does not have yet.
+        GENERATE_INFOPLIST_FILE: "NO"
+        INFOPLIST_FILE: App/Info.plist
   MusicAppTests:
     type: bundle.unit-test
     platform: iOS
-    settings:
-      base:
-        GENERATE_INFOPLIST_FILE: "YES"
     sources:
       - Tests/UnitTests
       - Tests/IntegrationTests
     dependencies:
       - target: MusicApp
-  MusicAppUITests:
-    type: bundle.ui-testing
-    platform: iOS
     settings:
       base:
         GENERATE_INFOPLIST_FILE: "YES"
+  MusicAppUITests:
+    type: bundle.ui-testing
+    platform: iOS
     sources:
       - Tests/UITests
     dependencies:
       - target: MusicApp
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: "YES"
 schemes:
   MusicApp:
     build:

@@ -1,29 +1,76 @@
 import SwiftUI
 
-/// Globally accessible mini-player (SPEC navigation). In Milestone 1 it
-/// is an honest shell: it says nothing is playing and that the playback
-/// engine lands in Phase 3. It never fakes a track or a working button.
+/// The global mini-player. With nothing loaded it says so plainly;
+/// with a track loaded it is a real control: play/pause works here,
+/// and tapping the bar opens Now Playing.
 public struct MiniPlayerBar: View {
+    @EnvironmentObject private var engine: PlaybackEngine
+    @State private var showNowPlaying = false
+
     public init() {}
+
     public var body: some View {
+        Group {
+            if let track = engine.currentTrack {
+                loadedBar(track)
+            } else {
+                idleBar
+            }
+        }
+        .sheet(isPresented: $showNowPlaying) {
+            NowPlayingView()
+        }
+    }
+
+    private var idleBar: some View {
         HStack(spacing: 12) {
             ArtworkView(size: 40)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Nothing playing")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(AppColors.ink)
-                Text("Playback engine arrives in Phase 3")
+                Text("Tap a song on Home or Search")
                     .font(.caption)
                     .foregroundStyle(AppColors.inkSecondary)
             }
             Spacer()
-            Image(systemName: "play.fill")
-                .foregroundStyle(.tertiary)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .glassSurface(cornerRadius: 16)
         .padding(.horizontal, 12)
         .padding(.bottom, 4)
+    }
+
+    private func loadedBar(_ track: Track) -> some View {
+        HStack(spacing: 12) {
+            ArtworkView(url: track.artworkURL, size: 40)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(track.title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(AppColors.ink)
+                    .lineLimit(1)
+                Text(track.artistName)
+                    .font(.caption)
+                    .foregroundStyle(AppColors.inkSecondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Button {
+                engine.togglePlayPause()
+            } label: {
+                Image(systemName: engine.isPlaying ? "pause.fill" : "play.fill")
+                    .font(.title3)
+                    .foregroundStyle(AppColors.ink)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .glassSurface(cornerRadius: 16)
+        .padding(.horizontal, 12)
+        .padding(.bottom, 4)
+        .contentShape(Rectangle())
+        .onTapGesture { showNowPlaying = true }
     }
 }
