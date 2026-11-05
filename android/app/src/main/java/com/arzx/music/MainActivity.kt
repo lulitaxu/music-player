@@ -177,7 +177,7 @@ class MainActivity : Activity() {
         text.addView(label("${track.artist} · Playable", 13, orange))
         row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
         row.addView(Button(this).apply {
-            text = "Play"
+            this.text = "Play"
             setOnClickListener { play(track) }
         }
                 })
