@@ -179,8 +179,7 @@ class MainActivity : Activity() {
         row.addView(Button(this).apply {
             this.text = "Play"
             setOnClickListener { play(track) }
-        }
-                })
+        })
         target.addView(row)
     }
 
