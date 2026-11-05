@@ -63,7 +63,7 @@ public struct AudiusProvider: MusicMetadataProvider, AudioSourceProvider {
     }
 
     public func stream(for track: Track) async throws -> AudioStream? {
-        guard track.providerID == id else { return nil }
+        guard track.providerID == id, track.id.hasPrefix("\(id):") else { return nil }
         let rawID = String(track.id.dropFirst("\(id):".count))
         guard let url = Self.streamURL(forTrackID: rawID) else { return nil }
         return AudioStream(url: url)
