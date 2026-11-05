@@ -21,6 +21,19 @@ Source, docs, and Git live here. Builds run on macOS:
 No feature is "done" because code exists. A feature is done when its
 tests pass in CI and, where the spec requires it, on the physical device.
 
+## Platform versions
+
+- `App/`, `Core/`, `Features/`, and `Providers/` contain the native SwiftUI
+  iOS app for iOS 18 and later.
+- `android/` contains the native Kotlin Android app. It uses the same honest
+  availability wording and authorized Audius streaming source, with Android
+  playback handled by `MediaPlayer`.
+
+The Android project can be opened as a standalone Gradle project. Both
+platforms intentionally keep downloads, lyrics, and local library features
+unavailable until their provider and persistence implementations are ready;
+they do not show fake controls for unfinished features.
+
 ## Non-negotiables (from SPEC.md)
 
 - No DRM bypass, no provider-restriction bypass, ever.

@@ -76,13 +76,16 @@ public struct NowPlayingView: View {
             Button { engine.previous() } label: {
                 Image(systemName: "backward.fill").font(.title2)
             }
+            .accessibilityLabel("Previous track")
             Button { engine.togglePlayPause() } label: {
                 Image(systemName: engine.isPlaying ? "pause.circle.fill" : "play.circle.fill")
                     .font(.system(size: 56))
             }
+            .accessibilityLabel(engine.isPlaying ? "Pause" : "Play")
             Button { engine.next() } label: {
                 Image(systemName: "forward.fill").font(.title2)
             }
+            .accessibilityLabel("Next track")
         }
         .foregroundStyle(AppColors.ink)
         .buttonStyle(.plain)
@@ -94,7 +97,7 @@ public struct NowPlayingView: View {
                 .font(AppTypography.sectionTitle)
                 .foregroundStyle(AppColors.ink)
             List {
-                ForEach(Array(engine.queue.enumerated()), id: \.element.id) { index, track in
+                ForEach(Array(engine.queue.enumerated().filter { $0.offset > engine.currentIndex }), id: \.element.id) { index, track in
                     Button { engine.playAt(index: index) } label: {
                         TrackRow(track: track, availability: .playable,
                                  isCurrent: index == engine.currentIndex)

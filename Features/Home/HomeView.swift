@@ -42,6 +42,12 @@ public struct HomeView: View {
             ErrorStateView(message: error) {
                 Task { await model.load() }
             }
+        } else if model.trending.isEmpty {
+            EmptyStateView(
+                systemImage: "music.note",
+                title: "No trending tracks",
+                message: "There are no playable trending tracks available right now."
+            )
         } else {
             List {
                 Section("Trending") {
