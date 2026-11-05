@@ -11,7 +11,7 @@ public struct SearchView: View {
         NavigationStack {
             content
                 .navigationTitle("Search")
-                .searchable(text: $query, prompt: Text("Songs, artists, albums"))
+                .searchable(text: $query, prompt: Text("Songs or artists"))
                 .onSubmit(of: .search) {
                     Task { await service.search(query) }
                 }
@@ -40,6 +40,12 @@ public struct SearchView: View {
             )
         } else {
             List {
+                if let warning = service.warningMessage {
+                    Text(warning)
+                        .font(AppTypography.caption)
+                        .foregroundStyle(AppColors.inkSecondary)
+                        .listRowBackground(Color.clear)
+                }
                 if !service.playable.isEmpty {
                     Section("Playable") {
                         ForEach(Array(service.playable.enumerated()), id: \.element.id) { index, track in

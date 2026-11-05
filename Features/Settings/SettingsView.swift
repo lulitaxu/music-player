@@ -20,7 +20,7 @@ public struct SettingsView: View {
                     LabeledContent("Metadata", value: "MusicBrainz")
                     LabeledContent("Artwork", value: "Cover Art Archive")
                     LabeledContent("Streaming", value: "Audius")
-                    LabeledContent("Lyrics", value: "LRCLIB")
+                    LabeledContent("Lyrics", value: "Not available yet")
                 }
                 Section("Principles") {
                     Text("No DRM bypass, ever. A song being listed is not the same as it being playable, and this app always labels which one is true.")
