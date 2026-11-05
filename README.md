@@ -34,6 +34,12 @@ platforms intentionally keep downloads, lyrics, and local library features
 unavailable until their provider and persistence implementations are ready;
 they do not show fake controls for unfinished features.
 
+The player UI includes built-in power-user features inspired by desktop
+customization ecosystems: a visualizer surface, animated Now Playing artwork
+that respects Reduce Motion, a compact mini-player preference, and a
+segmented Player/Queue view. These are app features, not installable
+third-party add-ons.
+
 ## Non-negotiables (from SPEC.md)
 
 - No DRM bypass, no provider-restriction bypass, ever.
