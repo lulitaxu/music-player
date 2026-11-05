@@ -13,6 +13,8 @@ public struct MiniPlayerBar: View {
         Group {
             if let track = engine.currentTrack {
                 loadedBar(track)
+            } else if let error = engine.playbackError {
+                errorBar(error)
             } else {
                 idleBar
             }
@@ -40,6 +42,23 @@ public struct MiniPlayerBar: View {
                     .font(.caption)
                     .foregroundStyle(AppColors.inkSecondary)
             }
+
+            private func errorBar(_ message: String) -> some View {
+                HStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .foregroundStyle(AppColors.accent)
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(AppColors.inkSecondary)
+                        .lineLimit(2)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .glassSurface(cornerRadius: 16)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 4)
+            }
             Spacer()
         }
         .padding(.horizontal, 12)
@@ -64,6 +83,15 @@ public struct MiniPlayerBar: View {
             }
             Spacer()
             Button {
+                showNowPlaying = true
+            } label: {
+                Image(systemName: "chevron.up")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(AppColors.inkSecondary)
+                    .accessibilityLabel("Open Now Playing")
+            }
+            .buttonStyle(.plain)
+            Button {
                 engine.togglePlayPause()
             } label: {
                 Image(systemName: engine.isPlaying ? "pause.fill" : "play.fill")
@@ -78,6 +106,5 @@ public struct MiniPlayerBar: View {
         .padding(.horizontal, 12)
         .padding(.bottom, 4)
         .contentShape(Rectangle())
-        .onTapGesture { showNowPlaying = true }
     }
 }
