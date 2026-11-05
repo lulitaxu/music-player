@@ -242,7 +242,8 @@ class MainActivity : Activity() {
                     setBackgroundColor(orange)
                     layoutParams = LinearLayout.LayoutParams(4, height).apply {
                         setMargins(2, 0, 2, 0)
-                    })
+                    }
+                })
             }
         }
     }
