@@ -6,6 +6,7 @@ import SwiftUI
 public struct MiniPlayerBar: View {
     @EnvironmentObject private var engine: PlaybackEngine
     @State private var showNowPlaying = false
+    @AppStorage("compactMiniPlayer") private var compactMiniPlayer = false
 
     public init() {}
 
@@ -42,23 +43,23 @@ public struct MiniPlayerBar: View {
                     .font(.caption)
                     .foregroundStyle(AppColors.inkSecondary)
             }
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .glassSurface(cornerRadius: 16)
+        .padding(.horizontal, 12)
+        .padding(.bottom, 4)
+    }
 
-            private func errorBar(_ message: String) -> some View {
-                HStack(spacing: 12) {
-                    Image(systemName: "exclamationmark.triangle")
-                        .foregroundStyle(AppColors.accent)
-                    Text(message)
-                        .font(.caption)
-                        .foregroundStyle(AppColors.inkSecondary)
-                        .lineLimit(2)
-                    Spacer()
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .glassSurface(cornerRadius: 16)
-                .padding(.horizontal, 12)
-                .padding(.bottom, 4)
-            }
+    private func errorBar(_ message: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(AppColors.accent)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(AppColors.inkSecondary)
+                .lineLimit(2)
             Spacer()
         }
         .padding(.horizontal, 12)
@@ -101,7 +102,7 @@ public struct MiniPlayerBar: View {
             .buttonStyle(.plain)
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.vertical, compactMiniPlayer ? 4 : 8)
         .glassSurface(cornerRadius: 16)
         .padding(.horizontal, 12)
         .padding(.bottom, 4)

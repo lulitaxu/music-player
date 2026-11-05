@@ -4,6 +4,10 @@ import SwiftUI
 /// build and its providers. No decorative toggles that do nothing;
 /// functional preferences arrive with their features in Phase 6.
 public struct SettingsView: View {
+    @AppStorage("showBuiltInVisualizer") private var showVisualizer = true
+    @AppStorage("compactMiniPlayer") private var compactMiniPlayer = false
+    @AppStorage("animateArtwork") private var animateArtwork = true
+
     public init() {}
     public var body: some View {
         NavigationStack {
@@ -21,6 +25,14 @@ public struct SettingsView: View {
                     LabeledContent("Artwork", value: "Cover Art Archive")
                     LabeledContent("Streaming", value: "Audius")
                     LabeledContent("Lyrics", value: "Not available yet")
+                }
+                Section("Built-in player features") {
+                    Toggle("Visualizer", isOn: $showVisualizer)
+                    Toggle("Animated artwork", isOn: $animateArtwork)
+                    Toggle("Compact mini-player", isOn: $compactMiniPlayer)
+                    Text("These features are built into arzxsh rather than installed as add-ons. Visualizer bars are visual-only until audio level data is available.")
+                        .font(AppTypography.caption)
+                        .foregroundStyle(AppColors.inkSecondary)
                 }
                 Section("Principles") {
                     Text("No DRM bypass, ever. A song being listed is not the same as it being playable, and this app always labels which one is true.")

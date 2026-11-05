@@ -28,6 +28,8 @@ class MainActivity : Activity() {
     private var player: MediaPlayer? = null
     private var current: Track? = null
     private lateinit var content: LinearLayout
+    private lateinit var mini: LinearLayout
+    private lateinit var visualizerView: LinearLayout
     private lateinit var miniTitle: TextView
     private lateinit var miniButton: Button
     private val orange = Color.rgb(255, 92, 61)
@@ -51,7 +53,7 @@ class MainActivity : Activity() {
         }
         root.addView(content, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        val mini = LinearLayout(this).apply {
+        mini = LinearLayout(this).apply {
             setPadding(16, 10, 16, 10)
             setBackgroundColor(Color.rgb(23, 23, 27))
             gravity = Gravity.CENTER_VERTICAL
@@ -63,6 +65,10 @@ class MainActivity : Activity() {
             setOnClickListener { togglePlayback() }
         }
         mini.addView(miniButton)
+        visualizerView = visualizer().apply {
+            visibility = if (getPreferences(MODE_PRIVATE).getBoolean("setting_Visualizer", true)) View.VISIBLE else View.GONE
+        }
+        mini.addView(visualizerView)
         root.addView(mini)
 
         val nav = LinearLayout(this).apply {
@@ -148,6 +154,10 @@ class MainActivity : Activity() {
         content.addView(label("Streams via Audius. Metadata via MusicBrainz.", 15, secondary))
         content.addView(label("Lyrics: Not available yet", 15, secondary))
         content.addView(label("No DRM bypass, ever.", 15, secondary))
+        content.addView(label("Built-in player features", 19, Color.WHITE))
+        content.addView(setting("Visualizer", true))
+        content.addView(setting("Compact mini-player", false))
+        content.addView(label("Power-user controls are built into arzxsh instead of installed as add-ons.", 14, secondary))
     }
 
     private fun showEmpty(title: String, heading: String, message: String) {
@@ -201,6 +211,38 @@ class MainActivity : Activity() {
         } else {
             active.start()
             miniButton.text = "Pause"
+        }
+    }
+
+    private fun setting(name: String, default: Boolean): Switch {
+        val key = "setting_$name"
+        return Switch(this).apply {
+            text = name
+            textSize = 15f
+            setTextColor(Color.WHITE)
+            isChecked = getPreferences(MODE_PRIVATE).getBoolean(key, default)
+            setOnCheckedChangeListener { _, checked ->
+                getPreferences(MODE_PRIVATE).edit().putBoolean(key, checked).apply()
+                if (name == "Visualizer") {
+                    visualizerView.visibility = if (checked) View.VISIBLE else View.GONE
+                }
+                if (name == "Compact mini-player") {
+                    mini.setPadding(16, if (checked) 4 else 10, 16, if (checked) 4 else 10)
+                }
+            }
+        }
+    }
+
+    private fun visualizer(): LinearLayout {
+        return LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            for (height in listOf(10, 18, 30, 20, 12)) {
+                addView(View(this@MainActivity).apply {
+                    setBackgroundColor(orange)
+                    layoutParams = LinearLayout.LayoutParams(4, height).apply {
+                        setMargins(2, 0, 2, 0)
+                    })
+            }
         }
     }
 

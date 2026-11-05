@@ -2,31 +2,46 @@ import SwiftUI
 
 /// Full Now Playing: artwork, honest progress with seek, transport
 /// controls, and the live queue. Presented from the mini-player.
-/// (Live Art layers land on this screen in the polish layer.)
+/// Includes built-in visualizer and artwork motion preferences.
 public struct NowPlayingView: View {
     @EnvironmentObject private var engine: PlaybackEngine
     @Environment(\.dismiss) private var dismiss
+    @AppStorage("showBuiltInVisualizer") private var showVisualizer = true
+    @AppStorage("animateArtwork") private var animateArtwork = true
+    @State private var selectedPanel = 0
 
     public init() {}
 
     public var body: some View {
         NavigationStack {
-            VStack(spacing: 24) {
+            VStack(spacing: 20) {
+                Picker("Player section", selection: $selectedPanel) {
+                    Text("Player").tag(0)
+                    Text("Queue").tag(1)
+                }
+                .pickerStyle(.segmented)
                 if let track = engine.currentTrack {
-                    ArtworkView(url: track.artworkURL, size: 280)
-                        .padding(.top, 12)
-                    VStack(spacing: 4) {
-                        Text(track.title)
-                            .font(.title3.weight(.bold))
-                            .foregroundStyle(AppColors.ink)
-                            .multilineTextAlignment(.center)
-                            .lineLimit(2)
-                        Text(track.artistName)
-                            .font(AppTypography.body)
-                            .foregroundStyle(AppColors.inkSecondary)
+                    if selectedPanel == 0 {
+                        ArtworkView(url: track.artworkURL, size: 280, animated: animateArtwork)
+                            .padding(.top, 4)
+                        VStack(spacing: 4) {
+                            Text(track.title)
+                                .font(.title3.weight(.bold))
+                                .foregroundStyle(AppColors.ink)
+                                .multilineTextAlignment(.center)
+                                .lineLimit(2)
+                            Text(track.artistName)
+                                .font(AppTypography.body)
+                                .foregroundStyle(AppColors.inkSecondary)
+                        }
+                        if showVisualizer {
+                            VisualizerView()
+                        }
+                        progress
+                        transport
+                    } else {
+                        queueList
                     }
-                    progress
-                    transport
                 } else {
                     EmptyStateView(
                         systemImage: "music.note",
@@ -34,7 +49,7 @@ public struct NowPlayingView: View {
                         message: "Play a song from Home or Search and it will live here."
                     )
                 }
-                if !engine.queue.isEmpty {
+                if selectedPanel == 0, !engine.queue.isEmpty {
                     queueList
                 }
                 Spacer(minLength: 0)
