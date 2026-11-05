@@ -33,7 +33,7 @@ class MainActivity : Activity() {
     private lateinit var miniTitle: TextView
     private lateinit var miniButton: Button
     private val orange = Color.rgb(255, 92, 61)
-    private val background = Color.rgb(10, 10, 12)
+    private val backgroundColor = Color.rgb(10, 10, 12)
     private val secondary = Color.rgb(154, 154, 163)
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -45,7 +45,7 @@ class MainActivity : Activity() {
     private fun showShell() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(background)
+            setBackgroundColor(backgroundColor)
         }
         content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -117,7 +117,7 @@ class MainActivity : Activity() {
             hint = "Songs or artists"
             setTextColor(Color.WHITE)
             setHintTextColor(secondary)
-            singleLine = true
+            setSingleLine(true)
         }
         val search = Button(this).apply { text = "Search" }
         val results = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -179,7 +179,8 @@ class MainActivity : Activity() {
         row.addView(Button(this).apply {
             text = "Play"
             setOnClickListener { play(track) }
-        })
+        }
+                })
         target.addView(row)
     }
 
