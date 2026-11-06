@@ -188,8 +188,14 @@ class MainActivity : Activity() {
 
     private lateinit var npShuffleBtn: ImageView
     private lateinit var npRepeatBtn: ImageView
+    private lateinit var npShuffleDot: View
+    private lateinit var npRepeatDot: View
     private lateinit var npDownloadBtn: ImageView
+    private lateinit var npDownloadProgress: ProgressBar
     private lateinit var npSleepLabel: TextView
+    private val manualIndices = mutableSetOf<Int>()
+    private var sleepAfterTrack = false
+    private var artWasPlaying = false
 
     private lateinit var menuOverlay: FrameLayout
     private lateinit var menuPanel: LinearLayout
@@ -201,11 +207,7 @@ class MainActivity : Activity() {
 
     private val sleepFire = Runnable {
         sleepDeadline = 0L
-        try {
-            if (player?.isPlaying == true) player?.pause()
-        } catch (_: IllegalStateException) {
-        }
-        refreshPlaybackUi()
+        fadeOutAndPause()
         updateSleepLabel()
         Toast.makeText(this@MainActivity, "Sleep timer ended", Toast.LENGTH_SHORT).show()
     }
@@ -293,6 +295,32 @@ class MainActivity : Activity() {
             visibility = if (getPreferences(MODE_PRIVATE).getBoolean("setting_Visualizer", true)) View.VISIBLE else View.GONE
         }
         mini.addView(visualizerView)
+        // Swipe left/right on the mini player skips tracks (iOS 26.1
+        // behavior, spec §1.1); a plain tap still opens Now Playing.
+        var miniDownX = 0f
+        mini.setOnTouchListener { _, e ->
+            when (e.action) {
+                android.view.MotionEvent.ACTION_DOWN -> {
+                    miniDownX = e.x
+                    false
+                }
+                android.view.MotionEvent.ACTION_UP -> {
+                    val dx = e.x - miniDownX
+                    when {
+                        dx < -dp(48) -> {
+                            playNext()
+                            true
+                        }
+                        dx > dp(48) -> {
+                            playPrevious()
+                            true
+                        }
+                        else -> false
+                    }
+                }
+                else -> false
+            }
+        }
         val miniLp = LinearLayout.LayoutParams(-1, if (getPreferences(MODE_PRIVATE).getBoolean("setting_Compact mini-player", false)) dp(48) else dp(58))
         miniLp.setMargins(dp(14), 0, dp(14), 0)
         bottomBar.addView(mini, miniLp)
@@ -370,6 +398,32 @@ class MainActivity : Activity() {
         }
     }
 
+    /** Pill action button: filled accent or glass, per page action rows. */
+    private fun pillButton(text: String, filled: Boolean, onClick: () -> Unit): TextView {
+        return label(text, 15f, Color.WHITE, boldTf).apply {
+            gravity = Gravity.CENTER
+            background = if (filled) {
+                GradientDrawable().apply {
+                    setColor(accent)
+                    cornerRadius = dp(999).toFloat()
+                }
+            } else {
+                glassBg(999f, Color.argb(28, 255, 255, 255), Color.argb(20, 255, 255, 255))
+            }
+            isClickable = true
+            setOnClickListener { onClick() }
+        }
+    }
+
+    /** Small accent dot shown beneath an active transport toggle. */
+    private fun dotView(): View = View(this).apply {
+        background = GradientDrawable().apply {
+            setColor(accent)
+            shape = GradientDrawable.OVAL
+        }
+        visibility = View.INVISIBLE
+    }
+
     private fun glassBg(radiusDp: Float, fill: Int, stroke: Int): GradientDrawable =
         GradientDrawable().apply {
             setColor(fill)
@@ -392,12 +446,8 @@ class MainActivity : Activity() {
         scaleType = ImageView.ScaleType.CENTER_INSIDE
         isClickable = true
         isFocusable = true
-        // Native borderless ripple: every icon button answers a press
-        // immediately instead of feeling dead until the action lands.
-        val tv = TypedValue()
-        if (theme.resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, tv, true)) {
-            setBackgroundResource(tv.resourceId)
-        }
+        // No Material ripple on player controls / chrome (spec §13.4):
+        // feedback there is glyph swap + scale, handled at the call site.
     }
 
     /** Rectangular ripple press feedback for list rows. */
@@ -1130,6 +1180,29 @@ class MainActivity : Activity() {
                 banner.addView(labels, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
                 content.addView(banner)
                 if (p.topSongs.isNotEmpty()) {
+                    // Play / Shuffle pill pair with Top Songs (spec §11.1).
+                    val actions = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER
+                    }
+                    val aLp = LinearLayout.LayoutParams(-1, -2)
+                    aLp.topMargin = dp(18)
+                    actions.layoutParams = aLp
+                    val playPill = pillButton("Play", filled = true) {
+                        setQueue(p.topSongs)
+                        play(p.topSongs.first())
+                    }
+                    actions.addView(playPill, LinearLayout.LayoutParams(dp(120), dp(40)))
+                    val shufflePill = pillButton("Shuffle", filled = false) {
+                        shuffleOn = true
+                        setQueue(p.topSongs)
+                        refreshTransportStates()
+                        play(p.topSongs[playOrder.firstOrNull() ?: 0])
+                    }
+                    val sLp = LinearLayout.LayoutParams(dp(120), dp(40))
+                    sLp.marginStart = dp(12)
+                    actions.addView(shufflePill, sLp)
+                    content.addView(actions)
                     content.addView(sectionTitle("Top Songs"))
                     addRows(p.topSongs, withHairlines = true, queueContext = p.topSongs)
                 }
@@ -1212,22 +1285,52 @@ class MainActivity : Activity() {
                 }
                 content.addView(head)
                 if (p.tracks.isNotEmpty()) {
-                    val playAll = label("Play", 15f, Color.WHITE, boldTf).apply {
+                    // Action row (spec §12.1): circular Shuffle | wide
+                    // Play pill | circular Download, centered.
+                    val actions = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
                         gravity = Gravity.CENTER
-                        background = GradientDrawable().apply {
-                            setColor(accent)
-                            cornerRadius = dp(999).toFloat()
-                        }
+                    }
+                    val aLp = LinearLayout.LayoutParams(-1, -2)
+                    aLp.topMargin = dp(18)
+                    aLp.bottomMargin = dp(6)
+                    actions.layoutParams = aLp
+                    val shuffleBtn = icon(R.drawable.ic_shuffle, Color.WHITE).apply {
+                        background = glassBg(999f, Color.argb(28, 255, 255, 255), Color.argb(20, 255, 255, 255))
+                        setPadding(dp(10), dp(10), dp(10), dp(10))
                         setOnClickListener {
+                            shuffleOn = true
                             setQueue(p.tracks)
-                            play(p.tracks.first())
+                            refreshTransportStates()
+                            play(p.tracks[playOrder.firstOrNull() ?: 0])
                         }
                     }
+                    actions.addView(shuffleBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
+                    val playAll = pillButton("Play", filled = true) {
+                        setQueue(p.tracks)
+                        play(p.tracks.first())
+                    }
                     val playLp = LinearLayout.LayoutParams(dp(132), dp(40))
-                    playLp.gravity = Gravity.CENTER_HORIZONTAL
-                    playLp.topMargin = dp(18)
-                    playLp.bottomMargin = dp(6)
-                    content.addView(playAll, playLp)
+                    playLp.setMargins(dp(14), 0, dp(14), 0)
+                    actions.addView(playAll, playLp)
+                    val allDown = p.tracks.all { Downloads.isDownloaded(this, it) }
+                    val dlBtn = icon(
+                        if (allDown) R.drawable.ic_downloaded else R.drawable.ic_download,
+                        if (allDown) accent else Color.WHITE
+                    ).apply {
+                        background = glassBg(999f, Color.argb(28, 255, 255, 255), Color.argb(20, 255, 255, 255))
+                        setPadding(dp(10), dp(10), dp(10), dp(10))
+                        setOnClickListener {
+                            if (allDown) {
+                                Toast.makeText(this@MainActivity, "Already downloaded", Toast.LENGTH_SHORT).show()
+                            } else {
+                                p.tracks.filter { !Downloads.isDownloaded(this@MainActivity, it) }
+                                    .forEach { startDownload(it) }
+                            }
+                        }
+                    }
+                    actions.addView(dlBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
+                    content.addView(actions)
                     addRows(p.tracks, withHairlines = true, queueContext = p.tracks)
                 } else {
                     content.addView(label("No tracks listed for this album.", 15f, white50).apply {
@@ -1358,16 +1461,37 @@ class MainActivity : Activity() {
         val controlsLp = LinearLayout.LayoutParams(-1, -2)
         controlsLp.topMargin = dp(22)
         controls.layoutParams = controlsLp
+        // Spotify state treatment for the v4 deviation (spec §2.1/§3):
+        // active = accent glyph + a dot beneath it; repeat-one adds the
+        // "1" worked into the glyph.
         npShuffleBtn = icon(R.drawable.ic_shuffle, white55).apply { setOnClickListener { toggleShuffle() } }
+        npShuffleDot = dotView()
+        val shuffleBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        shuffleBox.addView(npShuffleBtn, LinearLayout.LayoutParams(dp(30), dp(30)))
+        val shDotLp = LinearLayout.LayoutParams(dp(4), dp(4))
+        shDotLp.topMargin = dp(3)
+        shuffleBox.addView(npShuffleDot, shDotLp)
         val prevBtn = icon(R.drawable.ic_skip_prev, Color.WHITE).apply { setOnClickListener { playPrevious() } }
         npPlayButton = icon(R.drawable.ic_play, Color.WHITE).apply { setOnClickListener { togglePlayback() } }
         val nextBtn = icon(R.drawable.ic_skip_next, Color.WHITE).apply { setOnClickListener { playNext() } }
         npRepeatBtn = icon(R.drawable.ic_repeat, white55).apply { setOnClickListener { toggleRepeat() } }
-        controls.addView(npShuffleBtn, LinearLayout.LayoutParams(0, dp(44), 1f))
+        npRepeatDot = dotView()
+        val repeatBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        repeatBox.addView(npRepeatBtn, LinearLayout.LayoutParams(dp(30), dp(30)))
+        val rpDotLp = LinearLayout.LayoutParams(dp(4), dp(4))
+        rpDotLp.topMargin = dp(3)
+        repeatBox.addView(npRepeatDot, rpDotLp)
+        controls.addView(shuffleBox, LinearLayout.LayoutParams(0, dp(44), 1f))
         controls.addView(prevBtn, LinearLayout.LayoutParams(0, dp(52), 1f))
         controls.addView(npPlayButton, LinearLayout.LayoutParams(0, dp(68), 1.2f))
         controls.addView(nextBtn, LinearLayout.LayoutParams(0, dp(52), 1f))
-        controls.addView(npRepeatBtn, LinearLayout.LayoutParams(0, dp(44), 1f))
+        controls.addView(repeatBox, LinearLayout.LayoutParams(0, dp(44), 1f))
         inner.addView(controls)
 
         val volRow = LinearLayout(this).apply {
@@ -1420,6 +1544,11 @@ class MainActivity : Activity() {
         npDownloadBtn = icon(R.drawable.ic_download, white75).apply {
             setOnClickListener { downloadCurrent() }
         }
+        npDownloadProgress = ProgressBar(this).apply {
+            isIndeterminate = true
+            visibility = View.GONE
+            indeterminateTintList = ColorStateList.valueOf(accent)
+        }
         val shareBtn = icon(R.drawable.ic_share, white75).apply {
             setOnClickListener { shareTrack(current) }
         }
@@ -1428,7 +1557,12 @@ class MainActivity : Activity() {
         }
         bottomRow.addView(lyricsBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
         bottomRow.addView(queueBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
-        bottomRow.addView(npDownloadBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
+        // Download slot: arrow (idle) -> indeterminate ring (working) ->
+        // accent check (done), the three states in one footprint.
+        val downloadSlot = FrameLayout(this)
+        downloadSlot.addView(npDownloadBtn, FrameLayout.LayoutParams(dp(32), dp(32), Gravity.CENTER))
+        downloadSlot.addView(npDownloadProgress, FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER))
+        bottomRow.addView(downloadSlot, LinearLayout.LayoutParams(0, dp(32), 1f))
         bottomRow.addView(shareBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
         bottomRow.addView(moreBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
         inner.addView(bottomRow)
@@ -1592,6 +1726,7 @@ class MainActivity : Activity() {
     /** Replaces the queue and rebuilds the play order around it. */
     private fun setQueue(newQueue: List<Track>, startIndex: Int = -1) {
         queue = newQueue
+        manualIndices.clear()
         if (startIndex in newQueue.indices) {
             queueIndex = startIndex
         } else if (queueIndex !in newQueue.indices) {
@@ -1636,6 +1771,12 @@ class MainActivity : Activity() {
         npShuffleBtn.setColorFilter(if (shuffleOn) accent else white55)
         npRepeatBtn.setImageResource(if (repeatMode == 2) R.drawable.ic_repeat_one else R.drawable.ic_repeat)
         npRepeatBtn.setColorFilter(if (repeatMode > 0) accent else white55)
+        if (::npShuffleDot.isInitialized) {
+            npShuffleDot.visibility = if (shuffleOn) View.VISIBLE else View.INVISIBLE
+        }
+        if (::npRepeatDot.isInitialized) {
+            npRepeatDot.visibility = if (repeatMode > 0) View.VISIBLE else View.INVISIBLE
+        }
     }
 
     /** End-of-track: repeat-one replays, otherwise advance through the
@@ -1643,6 +1784,13 @@ class MainActivity : Activity() {
     private fun handleCompletion() {
         val t = current
         if (t == null) {
+            refreshPlaybackUi()
+            return
+        }
+        if (sleepAfterTrack) {
+            // "End of track" sleep timer: stop here instead of advancing.
+            sleepAfterTrack = false
+            updateSleepLabel()
             refreshPlaybackUi()
             return
         }
@@ -1711,19 +1859,32 @@ class MainActivity : Activity() {
         val pos = currentOrderPos()
         val newOrder = playOrder.map { if (it >= insertPos) it + 1 else it }.toMutableList()
         newOrder.add(if (pos >= 0) pos + 1 else newOrder.size, insertPos)
+        val shifted = manualIndices.map { if (it >= insertPos) it + 1 else it }.toMutableSet()
+        shifted.add(insertPos)
+        manualIndices.clear()
+        manualIndices.addAll(shifted)
         queue = newQueue
         playOrder = newOrder
         Toast.makeText(this, "Will play next", Toast.LENGTH_SHORT).show()
     }
 
-    /** Appends [track] at the end of the queue and the play order. */
+    /** Adds [track] to the manual queue: stored at the end of the
+     *  queue list, but its PLAY position is after the current track and
+     *  any already manually queued tracks, before the source
+     *  continuation (Spotify's Next in Queue rule). */
     private fun appendToQueue(track: Track) {
         if (queue.isEmpty()) {
             setQueue(listOf(track))
         } else {
             val newIndex = queue.size
             queue = queue + track
-            playOrder = playOrder + newIndex
+            manualIndices.add(newIndex)
+            val pos = currentOrderPos()
+            var insertAt = if (pos >= 0) pos + 1 else playOrder.size
+            while (insertAt < playOrder.size && playOrder[insertAt] in manualIndices) insertAt++
+            val newOrder = playOrder.toMutableList()
+            newOrder.add(insertAt, newIndex)
+            playOrder = newOrder
         }
         Toast.makeText(this, "Added to queue", Toast.LENGTH_SHORT).show()
     }
@@ -1783,6 +1944,14 @@ class MainActivity : Activity() {
             }
         } catch (_: IllegalStateException) {
         }
+        // Small scale pop on the glyph swap (spec §13.4), transform-only.
+        if (::npPlayButton.isInitialized && nowPlaying.visibility == View.VISIBLE) {
+            npPlayButton.animate().scaleX(0.88f).scaleY(0.88f).setDuration(70)
+                .withEndAction {
+                    npPlayButton.animate().scaleX(1f).scaleY(1f).setDuration(140).start()
+                }
+                .start()
+        }
         refreshPlaybackUi()
     }
 
@@ -1801,6 +1970,14 @@ class MainActivity : Activity() {
         }
         refreshTransportStates()
         refreshDownloadButton()
+        // Apple signature detail (spec §13.3): the artwork breathes —
+        // slightly smaller while paused, full size while playing.
+        if (::npArtwork.isInitialized && playing != artWasPlaying) {
+            artWasPlaying = playing
+            val s = if (playing) 1f else 0.92f
+            npArtwork.animate().scaleX(s).scaleY(s).setDuration(260)
+                .setInterpolator(DecelerateInterpolator()).start()
+        }
         if (t == null) return
         miniTitle.text = t.title
         miniArtist.text = t.artist
@@ -1834,7 +2011,7 @@ class MainActivity : Activity() {
         }
         menuTitle = label("", 13.5f, white50, boldTf).apply {
             setPadding(dp(14), dp(6), dp(14), dp(8))
-            maxLines = 1
+            maxLines = 2
             ellipsize = TextUtils.TruncateAt.END
         }
         menuList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -1890,50 +2067,109 @@ class MainActivity : Activity() {
      *  jump and queue actions alongside. */
     private fun showNpMenu() {
         val t = current ?: return
+        // Adopted menu order (spec §5.2): queue actions early,
+        // navigation mid, sleep timer near the bottom, radio last.
         val items = mutableListOf<Pair<String, () -> Unit>>()
-        items += "Start Radio" to { startRadioFor(t) }
-        val sleepText = if (sleepDeadline > System.currentTimeMillis()) {
-            "Sleep Timer · " + fmt((sleepDeadline - System.currentTimeMillis()).toInt()) + " left"
-        } else {
-            "Sleep Timer"
-        }
-        items += sleepText to { showSleepMenu() }
+        items += "Play Next" to { playNextInsert(t) }
+        items += "Add to Queue" to { appendToQueue(t) }
         if (t.artistId != null) {
             items += "Go to Artist" to {
                 hideNowPlaying()
                 showArtist(t.artistId, t.artist, t.artworkLarge)
             }
         }
-        items += "Play Next" to { playNextInsert(t) }
-        items += "Add to Queue" to { appendToQueue(t) }
-        showMenu(t.title, items)
+        val sleepText = when {
+            sleepDeadline > System.currentTimeMillis() ->
+                "Sleep Timer · " + fmt((sleepDeadline - System.currentTimeMillis()).toInt()) + " left"
+            sleepAfterTrack -> "Sleep Timer · ends after this track"
+            else -> "Sleep Timer"
+        }
+        items += sleepText to { showSleepMenu() }
+        items += "Start Radio" to { startRadioFor(t) }
+        val header = if (t.artist.isNotEmpty()) "${t.title}\n${t.artist}" else t.title
+        showMenu(header, items)
     }
 
     private fun showSleepMenu() {
-        val items = mutableListOf<Pair<String, () -> Unit>>()
-        items += "Off" to { setSleepTimer(0) }
-        for (m in listOf(5, 10, 15, 30, 45, 60)) {
-            items += "$m minutes" to { setSleepTimer(m) }
+        val now = System.currentTimeMillis()
+        val title = when {
+            sleepDeadline > now -> "Sleep timer · " + fmt((sleepDeadline - now).toInt()) + " left"
+            sleepAfterTrack -> "Sleep timer · ends after this track"
+            else -> "Sleep Timer"
         }
-        showMenu("Sleep Timer", items)
+        val items = mutableListOf<Pair<String, () -> Unit>>()
+        for (m in listOf(5, 10, 15, 30, 45, 60)) {
+            items += (if (m == 60) "1 hour" else "$m minutes") to { setSleepTimer(m) }
+        }
+        items += "End of track" to { setSleepEndOfTrack() }
+        if (sleepDeadline > now || sleepAfterTrack) {
+            items += "Turn off timer" to { setSleepTimer(0) }
+        }
+        showMenu(title, items)
     }
 
     private fun setSleepTimer(minutes: Int) {
         handler.removeCallbacks(sleepFire)
+        sleepAfterTrack = false
         if (minutes <= 0) {
             sleepDeadline = 0L
             Toast.makeText(this, "Sleep timer off", Toast.LENGTH_SHORT).show()
         } else {
             sleepDeadline = System.currentTimeMillis() + minutes * 60_000L
             handler.postDelayed(sleepFire, minutes * 60_000L)
-            Toast.makeText(this, "Sleep timer: $minutes min", Toast.LENGTH_SHORT).show()
+            // The single confirmation (spec §6); Android Toast stands
+            // in for Spotify's white snackbar.
+            Toast.makeText(this, "Your sleep timer is set.", Toast.LENGTH_SHORT).show()
         }
         updateSleepLabel()
+    }
+
+    private fun setSleepEndOfTrack() {
+        handler.removeCallbacks(sleepFire)
+        sleepDeadline = 0L
+        sleepAfterTrack = true
+        updateSleepLabel()
+        Toast.makeText(this, "Your sleep timer is set.", Toast.LENGTH_SHORT).show()
+    }
+
+    /** Sleep-timer expiry fades the volume out over ~2s, then pauses
+     *  (spec §6), instead of hard-cutting. */
+    private fun fadeOutAndPause() {
+        val p = player ?: return
+        try {
+            if (!p.isPlaying) return
+        } catch (_: IllegalStateException) {
+            return
+        }
+        var step = 0
+        val fade = object : Runnable {
+            override fun run() {
+                step++
+                try {
+                    val v = (1f - step / 20f).coerceAtLeast(0f)
+                    p.setVolume(v, v)
+                    if (step < 20) {
+                        handler.postDelayed(this, 100)
+                    } else {
+                        p.pause()
+                        p.setVolume(1f, 1f)
+                        refreshPlaybackUi()
+                    }
+                } catch (_: IllegalStateException) {
+                }
+            }
+        }
+        handler.post(fade)
     }
 
     /** The honest remaining-time label under the Now Playing controls. */
     private fun updateSleepLabel() {
         if (!::npSleepLabel.isInitialized) return
+        if (sleepAfterTrack) {
+            npSleepLabel.text = "Sleep timer · ends after this track"
+            npSleepLabel.visibility = View.VISIBLE
+            return
+        }
         val remaining = sleepDeadline - System.currentTimeMillis()
         if (sleepDeadline > 0 && remaining > 0) {
             npSleepLabel.text = "Sleep timer · " + fmt(remaining.toInt())
@@ -1958,17 +2194,18 @@ class MainActivity : Activity() {
         } else {
             items += "Download" to { startDownload(track) }
         }
-        items += "Share" to { shareTrack(track) }
-        if (track.source == SOURCE_YOUTUBE) {
-            items += "Start Radio" to { startRadioFor(track) }
-        }
         if (track.artistId != null) {
             items += "Go to Artist" to {
                 if (::nowPlaying.isInitialized && nowPlaying.visibility == View.VISIBLE) hideNowPlaying()
                 showArtist(track.artistId, track.artist, track.artworkLarge)
             }
         }
-        showMenu(track.title, items)
+        items += "Share" to { shareTrack(track) }
+        if (track.source == SOURCE_YOUTUBE) {
+            items += "Start Radio" to { startRadioFor(track) }
+        }
+        val header = if (track.artist.isNotEmpty()) "${track.title}\n${track.artist}" else track.title
+        showMenu(header, items)
     }
 
     private fun shareTrack(track: Track?) {
@@ -1990,11 +2227,13 @@ class MainActivity : Activity() {
     private fun refreshDownloadButton() {
         if (!::npDownloadBtn.isInitialized) return
         val t = current ?: return
+        val busy = downloading.contains(Downloads.key(t))
+        if (::npDownloadProgress.isInitialized) {
+            npDownloadProgress.visibility = if (busy) View.VISIBLE else View.GONE
+        }
+        npDownloadBtn.visibility = if (busy) View.INVISIBLE else View.VISIBLE
         when {
-            downloading.contains(Downloads.key(t)) -> {
-                npDownloadBtn.setImageResource(R.drawable.ic_download)
-                npDownloadBtn.setColorFilter(white50)
-            }
+            busy -> Unit // the ring in the same slot carries this state
             Downloads.isDownloaded(this, t) -> {
                 npDownloadBtn.setImageResource(R.drawable.ic_downloaded)
                 npDownloadBtn.setColorFilter(accent)
@@ -2092,6 +2331,20 @@ class MainActivity : Activity() {
 
     private fun showQueue() {
         queueList.removeAllViews()
+        // Mode chips at the top of the queue (Apple puts the toggles
+        // here), reflecting and driving the same player state.
+        val modes = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(10), 0, dp(2))
+        }
+        modes.addView(modeChip("Shuffle", shuffleOn) { toggleShuffle(); showQueue() })
+        val repeatText = when (repeatMode) {
+            1 -> "Repeat All"
+            2 -> "Repeat One"
+            else -> "Repeat"
+        }
+        modes.addView(modeChip(repeatText, repeatMode > 0) { toggleRepeat(); showQueue() })
+        queueList.addView(modes)
         if (queue.isEmpty() || queueIndex < 0) {
             queueList.addView(label("Queue is empty.", 15f, white50).apply {
                 setPadding(0, dp(16), 0, 0)
@@ -2101,14 +2354,75 @@ class MainActivity : Activity() {
             queueList.addView(queueRow(queue[queueIndex], isCurrent = true))
             val pos = currentOrderPos()
             val upcoming = if (pos >= 0) playOrder.drop(pos + 1) else emptyList()
-            if (upcoming.isNotEmpty()) {
+            // Spotify's section rule: what the user queued by hand is
+            // its own section and plays before the source continuation.
+            val manual = upcoming.filter { it in manualIndices }
+            val rest = upcoming.filter { it !in manualIndices }
+            if (manual.isNotEmpty()) {
+                queueList.addView(queueSectionHeader("Next in Queue", showClear = true))
+                manual.forEach { qi -> queueList.addView(queueRow(queue[qi], isCurrent = false)) }
+            }
+            if (rest.isNotEmpty()) {
                 queueList.addView(sectionTitle("Next Up"))
-                upcoming.forEach { qi -> queueList.addView(queueRow(queue[qi], isCurrent = false)) }
+                rest.forEach { qi -> queueList.addView(queueRow(queue[qi], isCurrent = false)) }
             }
         }
         queueOverlay.visibility = View.VISIBLE
         queueOverlay.alpha = 0f
         queueOverlay.animate().alpha(1f).setDuration(180).start()
+    }
+
+    private fun modeChip(text: String, active: Boolean, onClick: () -> Unit): TextView {
+        val chip = label(text, 13.5f, if (active) accent else white55, boldTf).apply {
+            gravity = Gravity.CENTER
+            background = glassBg(
+                999f,
+                if (active) Color.argb(46, 252, 60, 68) else Color.argb(24, 255, 255, 255),
+                Color.argb(20, 255, 255, 255)
+            )
+            setPadding(dp(14), dp(7), dp(14), dp(7))
+            isClickable = true
+            setOnClickListener { onClick() }
+        }
+        val lp = LinearLayout.LayoutParams(-2, -2)
+        lp.marginEnd = dp(10)
+        chip.layoutParams = lp
+        return chip
+    }
+
+    /** Queue section header with an optional Clear action (Apple:
+     *  Clear empties only the manually queued part). */
+    private fun queueSectionHeader(title: String, showClear: Boolean): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val lp = LinearLayout.LayoutParams(-1, -2)
+        lp.topMargin = dp(24)
+        lp.bottomMargin = dp(6)
+        row.layoutParams = lp
+        row.addView(label(title, 21f, Color.WHITE, boldTf), LinearLayout.LayoutParams(0, -2, 1f))
+        if (showClear) {
+            val clear = label("Clear", 14.5f, accent, mediumTf).apply {
+                setPadding(dp(10), dp(4), dp(2), dp(4))
+                isClickable = true
+                setOnClickListener { clearManualQueue() }
+            }
+            row.addView(clear)
+        }
+        return row
+    }
+
+    private fun clearManualQueue() {
+        if (manualIndices.isEmpty()) return
+        val keep = queue.indices.filter { it == queueIndex || it !in manualIndices }
+        if (keep.size == queue.size) return
+        val keepSet = keep.toSet()
+        playOrder = playOrder.filter { it in keepSet }.map { keep.indexOf(it) }
+        queue = keep.map { queue[it] }
+        queueIndex = keep.indexOf(queueIndex)
+        manualIndices.clear()
+        showQueue()
     }
 
     private fun hideQueue() {
