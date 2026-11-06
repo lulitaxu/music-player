@@ -188,12 +188,17 @@ object YoutubeSource {
     }
 
     /**
-     * Resolves the best direct audio stream URL for a video id: AAC/m4a
-     * first (the platform player's most reliable format), then the
-     * highest-bitrate progressive stream. Null when nothing playable is
-     * exposed; throws on extraction/network failure.
+     * Resolves a direct audio stream URL for a video id from
+     * NewPipeExtractor's progressive streams, steered by [quality]
+     * ("data" = lowest bitrate, "normal" = best AAC at or under
+     * ~192kbps, "high" = best available). Null when nothing directly
+     * playable is exposed — note YouTube serves most audio as DASH,
+     * which this filter excludes on purpose because the URL goes
+     * straight to MediaPlayer; that scarcity is exactly why the
+     * Innertube resolver in [StreamResolver] runs first. Throws on
+     * extraction/network failure.
      */
-    fun resolveAudioUrl(videoId: String): String? {
+    fun resolveAudioUrl(videoId: String, quality: String = "high"): String? {
         ensureInit()
         val extractor = ServiceList.YouTube.getStreamExtractor(
             "https://www.youtube.com/watch?v=$videoId"
@@ -203,9 +208,48 @@ object YoutubeSource {
             it.isUrl && it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP
         }
         if (streams.isEmpty()) return null
-        val best = streams.filter { it.format?.suffix.equals("m4a", ignoreCase = true) }
-            .maxByOrNull { it.averageBitrate }
-            ?: streams.maxByOrNull { it.averageBitrate }
+        val m4a = streams.filter { it.format?.suffix.equals("m4a", ignoreCase = true) }
+        val best = when (quality) {
+            "data" -> streams.minByOrNull { it.averageBitrate }
+            "normal" -> m4a.filter { it.averageBitrate <= 192_000 }.maxByOrNull { it.averageBitrate }
+                ?: streams.minByOrNull { it.averageBitrate }
+            else -> m4a.maxByOrNull { it.averageBitrate }
+                ?: streams.maxByOrNull { it.averageBitrate }
+        }
         return best?.content?.takeIf { it.isNotEmpty() }
+    }
+}
+
+/**
+ * The one YouTube stream-resolution path for playback AND downloads.
+ * Primary: the app's own Innertube player layer ([YtmApi.resolveStream]),
+ * the same transport that already loads the catalog from the device —
+ * the embedded ANDROID_MUSIC / IOS contexts expose direct audio file
+ * URLs that MediaPlayer can play as-is. Fallback: NewPipeExtractor.
+ * When both fail, [Resolved.report] carries BOTH outcomes so the UI
+ * can print the real reason instead of a generic failure.
+ * Background thread only.
+ */
+object StreamResolver {
+    data class Resolved(val url: String?, val report: String)
+
+    fun resolveYoutube(videoId: String, quality: String): Resolved {
+        val inner = try {
+            YtmApi.resolveStream(videoId, quality)
+        } catch (t: Throwable) {
+            null
+        }
+        if (inner?.url != null) return Resolved(inner.url, "Innertube ${inner.report}")
+        val innerReport = inner?.report ?: "Innertube: resolver error"
+        var npError: String? = null
+        val npUrl = try {
+            YoutubeSource.resolveAudioUrl(videoId, quality)
+        } catch (t: Throwable) {
+            npError = "${t.javaClass.simpleName}: ${t.message?.replace('\n', ' ')?.take(120) ?: ""}".trim()
+            null
+        }
+        if (npUrl != null) return Resolved(npUrl, "NewPipe")
+        val npReport = npError ?: "NewPipe: no direct progressive stream exposed"
+        return Resolved(null, "Innertube: $innerReport · $npReport")
     }
 }
