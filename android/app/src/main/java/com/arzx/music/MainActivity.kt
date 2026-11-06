@@ -26,13 +26,18 @@ import java.net.URLEncoder
 import java.net.URL
 import java.util.concurrent.Executors
 
-private data class Track(
+const val SOURCE_AUDIUS = "audius"
+const val SOURCE_YOUTUBE = "youtube"
+
+data class Track(
     val id: String,
     val title: String,
     val artist: String,
     val duration: Int,
     val artworkSmall: String? = null,
-    val artworkLarge: String? = null
+    val artworkLarge: String? = null,
+    /** Catalog this track came from: [SOURCE_AUDIUS] or [SOURCE_YOUTUBE]. */
+    val source: String = SOURCE_AUDIUS
 )
 
 /**
@@ -166,6 +171,7 @@ class MainActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private var seeking = false
     private var generation = 0
+    private var playToken = 0
     private var activeTab = "Home"
     private val tabViews = mutableMapOf<String, Triple<LinearLayout, ImageView, TextView>>()
     private val categoryArtViews = mutableListOf<ImageView>()
@@ -428,12 +434,25 @@ class MainActivity : Activity() {
             resultsBox.removeAllViews()
             resultsBox.addView(label("Searching catalogs…", 14f, white50))
             executor.execute {
-                val found = fetch("/tracks/search?query=${URLEncoder.encode(q, "UTF-8")}&limit=25")
+                val audius = fetch("/tracks/search?query=${URLEncoder.encode(q, "UTF-8")}&limit=25")
+                var ytFailed = false
+                val yt = try {
+                    YoutubeSource.searchSongs(q)
+                } catch (_: Exception) {
+                    ytFailed = true
+                    emptyList()
+                }
+                // One merged result list (Audius first, then YouTube Music)
+                // so next/previous playback flows across both sources.
+                val found = mutableListOf<Track>()
+                audius?.let { found.addAll(it) }
+                found.addAll(yt)
                 runOnUiThread {
                     if (gen != generation) return@runOnUiThread
                     resultsBox.removeAllViews()
                     when {
-                        found == null -> resultsBox.addView(label("Playable results are unavailable right now.", 14f, white50))
+                        found.isEmpty() && audius == null && ytFailed ->
+                            resultsBox.addView(label("Playable results are unavailable right now.", 14f, white50))
                         found.isEmpty() -> resultsBox.addView(label("No results", 18f, Color.WHITE, boldTf))
                         else -> {
                             queue = found
@@ -591,7 +610,7 @@ class MainActivity : Activity() {
         beginScreen("Settings", showAvatar = false)
         content.addView(sectionTitle("About"))
         content.addView(label("Version 0.2.0", 15f, Color.WHITE))
-        content.addView(label("Streams via Audius. Metadata via MusicBrainz.", 15f, white50))
+        content.addView(label("Streams via Audius and YouTube. Metadata via MusicBrainz.", 15f, white50))
         content.addView(label("Lyrics: Not available yet", 15f, white50))
         content.addView(label("No DRM bypass, ever.", 15f, white50))
         content.addView(sectionTitle("Built-in player features"))
@@ -650,7 +669,18 @@ class MainActivity : Activity() {
             ellipsize = TextUtils.TruncateAt.END
         })
         row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
-        if (track.id == current?.id) {
+        if (track.source == SOURCE_YOUTUBE) {
+            val badge = label("YT", 9f, white75, boldTf).apply {
+                gravity = Gravity.CENTER
+                background = GradientDrawable().apply {
+                    setColor(Color.argb(38, 255, 255, 255))
+                    cornerRadius = dp(4).toFloat()
+                }
+                setPadding(dp(5), dp(2), dp(5), dp(2))
+            }
+            row.addView(badge)
+        }
+        if (track.id == current?.id && track.source == current?.source) {
             row.addView(visualizer())
         } else {
             row.addView(icon(R.drawable.ic_more, Color.argb(115, 255, 255, 255)), LinearLayout.LayoutParams(dp(28), dp(28)))
@@ -901,7 +931,7 @@ class MainActivity : Activity() {
     // ---------------------------------------------------------------- playback wiring (engine unchanged)
 
     private fun play(track: Track) {
-        val idx = queue.indexOfFirst { it.id == track.id }
+        val idx = queue.indexOfFirst { it.id == track.id && it.source == track.source }
         if (idx >= 0) {
             queueIndex = idx
         } else {
@@ -911,7 +941,35 @@ class MainActivity : Activity() {
         current = track
         saveRecent(track)
         refreshPlaybackUi()
-        val stream = "https://api.audius.co/v1/tracks/${track.id}/stream?app_name=arzxsh"
+        val token = ++playToken
+        if (track.source == SOURCE_YOUTUBE) {
+            // Stop the previous track now; the direct stream URL is
+            // resolved on-device in the background, then handed to the
+            // same player path as every other source.
+            player?.release()
+            player = null
+            executor.execute {
+                val url = try {
+                    YoutubeSource.resolveAudioUrl(track.id)
+                } catch (_: Exception) {
+                    null
+                }
+                runOnUiThread {
+                    if (token != playToken) return@runOnUiThread
+                    if (url == null) {
+                        Toast.makeText(this@MainActivity, "This track could not be played.", Toast.LENGTH_SHORT).show()
+                    } else {
+                        startPlayback(url)
+                    }
+                }
+            }
+        } else {
+            startPlayback("https://api.audius.co/v1/tracks/${track.id}/stream?app_name=arzxsh")
+        }
+    }
+
+    /** Shared player setup for every source: [stream] is a direct audio URL. */
+    private fun startPlayback(stream: String) {
         player?.release()
         player = MediaPlayer().apply {
             setAudioAttributes(AudioAttributes.Builder().setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
@@ -1015,7 +1073,8 @@ class MainActivity : Activity() {
                     o.getString("id"), o.getString("title"), o.getString("artist"),
                     o.optInt("duration"),
                     o.optString("artworkSmall", null)?.takeIf { it.isNotEmpty() },
-                    o.optString("artworkLarge", null)?.takeIf { it.isNotEmpty() }
+                    o.optString("artworkLarge", null)?.takeIf { it.isNotEmpty() },
+                    o.optString("source", SOURCE_AUDIUS)
                 )
             }
         } catch (_: Exception) {
@@ -1034,6 +1093,7 @@ class MainActivity : Activity() {
                 put("title", t.title)
                 put("artist", t.artist)
                 put("duration", t.duration)
+                put("source", t.source)
                 put("artworkSmall", t.artworkSmall ?: JSONObject.NULL)
                 put("artworkLarge", t.artworkLarge ?: JSONObject.NULL)
             })
