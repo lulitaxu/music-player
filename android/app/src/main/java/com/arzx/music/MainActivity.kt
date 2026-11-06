@@ -37,7 +37,9 @@ data class Track(
     val artworkSmall: String? = null,
     val artworkLarge: String? = null,
     /** Catalog this track came from: [SOURCE_AUDIUS] or [SOURCE_YOUTUBE]. */
-    val source: String = SOURCE_AUDIUS
+    val source: String = SOURCE_AUDIUS,
+    /** YouTube Music channel id of the track's artist, when known. */
+    val artistId: String? = null
 )
 
 /**
@@ -147,6 +149,7 @@ class MainActivity : Activity() {
     private val recentTracks = mutableListOf<Track>()
 
     private lateinit var content: LinearLayout
+    private lateinit var bottomBar: LinearLayout
     private lateinit var mini: LinearLayout
     private lateinit var visualizerView: LinearLayout
     private lateinit var miniArtwork: ImageView
@@ -220,7 +223,7 @@ class MainActivity : Activity() {
         scroll.addView(content, LinearLayout.LayoutParams(-1, -2))
         root.addView(scroll, FrameLayout.LayoutParams(-1, -1))
 
-        val bottomBar = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        bottomBar = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         // ---- glass mini player ----
         mini = LinearLayout(this).apply {
@@ -301,6 +304,19 @@ class MainActivity : Activity() {
         buildNowPlaying(root)
         setContentView(root)
         setActiveTab("Home")
+        bottomBar.post { fitContentPadding() }
+    }
+
+    /**
+     * Sizes the scroll content's bottom inset from the MEASURED floating
+     * bars (mini player + tab bar) plus breathing room, so the last rows
+     * can always scroll fully clear of both bars on any device. (v3 used
+     * a fixed guess and rows ended up hidden underneath.)
+     */
+    private fun fitContentPadding() {
+        if (::bottomBar.isInitialized && ::content.isInitialized && bottomBar.height > 0) {
+            content.setPadding(dp(22), dp(10), dp(22), bottomBar.height + dp(28))
+        }
     }
 
     private fun setActiveTab(name: String) {
@@ -348,41 +364,86 @@ class MainActivity : Activity() {
     private fun showHome() {
         val gen = ++generation
         beginScreen("Listen Now", showAvatar = true)
-        val loading = label("Loading trending…", 16f, white50)
+        val loading = label("Loading…", 16f, white50)
         content.addView(loading)
         executor.execute {
-            val result = fetch("/tracks/trending?limit=25")
+            val audius = fetch("/tracks/trending?limit=25")
+            var charts: YtmCharts? = null
+            var chartsErr: String? = null
+            try {
+                charts = YtmApi.charts()
+            } catch (t: Throwable) {
+                chartsErr = shortErr(t)
+            }
             runOnUiThread {
                 if (gen != generation) return@runOnUiThread
                 content.removeView(loading)
-                if (result == null || result.isEmpty()) {
-                    content.addView(label("No trending tracks", 18f, Color.WHITE, boldTf))
-                    content.addView(label("Playable tracks are unavailable right now.", 14f, white50))
-                } else {
+                var any = false
+                if (audius != null && audius.isNotEmpty()) {
                     tracks.clear()
-                    tracks.addAll(result)
-                    queue = result
-                    content.addView(featuredCard(result.first()))
-                    if (recentTracks.isNotEmpty()) {
-                        content.addView(sectionTitle("Recently Played"))
-                        addRows(recentTracks, withHairlines = true)
+                    tracks.addAll(audius)
+                }
+                val featured = audius?.firstOrNull() ?: charts?.songs?.firstOrNull()
+                if (featured != null) {
+                    val context = if (featured.source == SOURCE_YOUTUBE) {
+                        charts?.songs ?: listOf(featured)
                     } else {
-                        content.addView(sectionTitle("Trending Now"))
-                        addRows(result, withHairlines = true)
+                        audius ?: listOf(featured)
                     }
+                    val kicker = if (featured.source == SOURCE_YOUTUBE) {
+                        "TRENDING ON YOUTUBE MUSIC"
+                    } else {
+                        "FEATURED MIX"
+                    }
+                    content.addView(featuredCard(featured, kicker, context))
+                    any = true
+                }
+                if (recentTracks.isNotEmpty()) {
+                    content.addView(sectionTitle("Recently Played"))
+                    addRows(recentTracks, withHairlines = true, queueContext = recentTracks.toList())
+                    any = true
+                }
+                if (charts != null && charts.songs.isNotEmpty()) {
+                    content.addView(sectionTitle("Trending on YouTube Music"))
+                    val top = charts.songs.take(12)
+                    addRows(top, withHairlines = true, queueContext = top)
+                    any = true
+                } else if (chartsErr != null) {
+                    // A dead YouTube section shows WHY, never a silent hole.
+                    content.addView(sectionTitle("Trending on YouTube Music"))
+                    content.addView(errorLine("YouTube unavailable: $chartsErr"))
+                    any = true
+                }
+                if (charts != null && charts.artists.isNotEmpty()) {
+                    content.addView(sectionTitle("Top Artists"))
+                    content.addView(artistCircleRow(charts.artists.take(10)))
+                    any = true
+                }
+                if (audius != null && audius.size > 1) {
+                    content.addView(sectionTitle("Trending on Audius"))
+                    val rest = audius.drop(1).take(12)
+                    addRows(rest, withHairlines = true, queueContext = rest)
+                    any = true
+                }
+                if (!any) {
+                    content.addView(label("Nothing to play right now", 18f, Color.WHITE, boldTf))
+                    content.addView(label("Trending tracks are unavailable right now.", 14f, white50))
                 }
             }
         }
     }
 
-    private fun featuredCard(track: Track): FrameLayout {
+    private fun featuredCard(track: Track, kicker: String, context: List<Track>): FrameLayout {
         val card = FrameLayout(this).apply {
             background = GradientDrawable().apply {
                 setColor(Color.rgb(20, 20, 23))
                 cornerRadius = dp(16).toFloat()
             }
             clipToOutline = true
-            setOnClickListener { play(track) }
+            setOnClickListener {
+                queue = context
+                play(track)
+            }
         }
         val lp = LinearLayout.LayoutParams(-1, dp(196))
         lp.topMargin = dp(16)
@@ -401,7 +462,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), 0, dp(16), dp(13))
         }
-        labels.addView(label("FEATURED MIX", 11f, white75, boldTf).apply { letterSpacing = 0.11f })
+        labels.addView(label(kicker, 11f, white75, boldTf).apply { letterSpacing = 0.11f })
         labels.addView(TextView(this).apply {
             text = "${track.title}\n${track.artist}"
             setTextSize(20f)
@@ -435,29 +496,85 @@ class MainActivity : Activity() {
             resultsBox.addView(label("Searching catalogs…", 14f, white50))
             executor.execute {
                 val audius = fetch("/tracks/search?query=${URLEncoder.encode(q, "UTF-8")}&limit=25")
-                var ytFailed = false
-                val yt = try {
-                    YoutubeSource.searchSongs(q)
-                } catch (_: Exception) {
-                    ytFailed = true
-                    emptyList()
+                // Every YouTube call is separately guarded and its
+                // failure is RENDERED below the results (v3 swallowed
+                // the exception and YouTube quietly never appeared).
+                var ytSongs: List<Track> = emptyList()
+                var ytNote: String? = null
+                var ytErr: String? = null
+                try {
+                    val r = YoutubeSource.searchSongs(q)
+                    ytSongs = r.tracks
+                    ytNote = r.note
+                } catch (t: Throwable) {
+                    ytErr = shortErr(t)
                 }
-                // One merged result list (Audius first, then YouTube Music)
-                // so next/previous playback flows across both sources.
+                var ytArtists: List<YtmArtistRef> = emptyList()
+                var ytArtistsErr: String? = null
+                try {
+                    ytArtists = YtmApi.searchArtists(q)
+                } catch (t: Throwable) {
+                    ytArtistsErr = shortErr(t)
+                }
+                var ytAlbums: List<YtmAlbumRef> = emptyList()
+                var ytAlbumsErr: String? = null
+                try {
+                    ytAlbums = YtmApi.searchAlbums(q)
+                } catch (t: Throwable) {
+                    ytAlbumsErr = shortErr(t)
+                }
+                // One merged song list (Audius first, then YouTube
+                // Music) so next/previous playback flows across sources.
                 val found = mutableListOf<Track>()
                 audius?.let { found.addAll(it) }
-                found.addAll(yt)
+                found.addAll(ytSongs)
                 runOnUiThread {
                     if (gen != generation) return@runOnUiThread
                     resultsBox.removeAllViews()
-                    when {
-                        found.isEmpty() && audius == null && ytFailed ->
+                    val nothing = found.isEmpty() && ytArtists.isEmpty() && ytAlbums.isEmpty()
+                    if (nothing) {
+                        if (audius == null && ytErr != null) {
                             resultsBox.addView(label("Playable results are unavailable right now.", 14f, white50))
-                        found.isEmpty() -> resultsBox.addView(label("No results", 18f, Color.WHITE, boldTf))
-                        else -> {
-                            queue = found
-                            addRows(found, resultsBox, withHairlines = true)
+                        } else {
+                            resultsBox.addView(label("No results", 18f, Color.WHITE, boldTf))
                         }
+                    }
+                    if (ytArtists.isNotEmpty()) {
+                        resultsBox.addView(sectionTitle("Artists"))
+                        ytArtists.forEach { resultsBox.addView(artistResultRow(it)) }
+                    }
+                    if (ytAlbums.isNotEmpty()) {
+                        resultsBox.addView(sectionTitle("Albums"))
+                        ytAlbums.forEachIndexed { i, album ->
+                            if (i > 0) resultsBox.addView(hairline())
+                            resultsBox.addView(albumResultRow(album))
+                        }
+                    }
+                    if (found.isNotEmpty()) {
+                        if (ytArtists.isNotEmpty() || ytAlbums.isNotEmpty()) {
+                            resultsBox.addView(sectionTitle("Songs"))
+                        }
+                        queue = found
+                        addRows(found, resultsBox, withHairlines = true)
+                    }
+                    // Source status: always on screen, success or failure.
+                    val errors = listOfNotNull(
+                        ytErr?.let { "songs: $it" },
+                        ytArtistsErr?.let { "artists: $it" },
+                        ytAlbumsErr?.let { "albums: $it" }
+                    )
+                    if (errors.isNotEmpty()) {
+                        resultsBox.addView(errorLine("YouTube unavailable: " + errors.joinToString(" · ")))
+                    }
+                    if (ytNote != null) {
+                        resultsBox.addView(statusLine("YouTube: $ytNote"))
+                    }
+                    if (errors.isEmpty() && ytNote == null) {
+                        resultsBox.addView(
+                            statusLine(
+                                "YouTube Music: ${ytSongs.size} songs · ${ytArtists.size} artists · ${ytAlbums.size} albums"
+                            )
+                        )
                     }
                 }
             }
@@ -628,10 +745,15 @@ class MainActivity : Activity() {
 
     // ---------------------------------------------------------------- rows
 
-    private fun addRows(list: List<Track>, target: LinearLayout = content, withHairlines: Boolean) {
+    private fun addRows(
+        list: List<Track>,
+        target: LinearLayout = content,
+        withHairlines: Boolean,
+        queueContext: List<Track>? = null
+    ) {
         list.forEachIndexed { i, track ->
             if (withHairlines && i > 0) target.addView(hairline())
-            addTrackRow(track, target)
+            addTrackRow(track, target, queueContext)
         }
     }
 
@@ -643,12 +765,15 @@ class MainActivity : Activity() {
         return v
     }
 
-    private fun addTrackRow(track: Track, target: LinearLayout) {
+    private fun addTrackRow(track: Track, target: LinearLayout, queueContext: List<Track>? = null) {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(8), 0, dp(8))
-            setOnClickListener { play(track) }
+            setOnClickListener {
+                if (queueContext != null) queue = queueContext
+                play(track)
+            }
         }
         val img = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
@@ -664,21 +789,32 @@ class MainActivity : Activity() {
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
         })
-        text.addView(label(track.artist, 14.5f, white50).apply {
+        val artistLabel = label(track.artist, 14.5f, white50).apply {
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
-        })
+        }
+        if (track.artistId != null) {
+            artistLabel.setOnClickListener {
+                showArtist(track.artistId, track.artist, track.artworkLarge)
+            }
+        }
+        text.addView(artistLabel)
         row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
         if (track.source == SOURCE_YOUTUBE) {
-            val badge = label("YT", 9f, white75, boldTf).apply {
+            // Filled accent pill: the YouTube marker must be unmissable
+            // (v3's 9sp translucent chip effectively was invisible).
+            val badge = label("YT", 10.5f, Color.WHITE, boldTf).apply {
                 gravity = Gravity.CENTER
                 background = GradientDrawable().apply {
-                    setColor(Color.argb(38, 255, 255, 255))
-                    cornerRadius = dp(4).toFloat()
+                    setColor(accent)
+                    cornerRadius = dp(5).toFloat()
                 }
-                setPadding(dp(5), dp(2), dp(5), dp(2))
+                setPadding(dp(7), dp(3), dp(7), dp(3))
             }
-            row.addView(badge)
+            val badgeLp = LinearLayout.LayoutParams(-2, -2)
+            badgeLp.marginStart = dp(8)
+            badgeLp.marginEnd = dp(2)
+            row.addView(badge, badgeLp)
         }
         if (track.id == current?.id && track.source == current?.source) {
             row.addView(visualizer())
@@ -686,6 +822,350 @@ class MainActivity : Activity() {
             row.addView(icon(R.drawable.ic_more, Color.argb(115, 255, 255, 255)), LinearLayout.LayoutParams(dp(28), dp(28)))
         }
         target.addView(row)
+    }
+
+    // ---------------------------------------------------------------- youtube music screens
+
+    /** Compact "ClassName: message" for on-screen diagnostics. */
+    private fun shortErr(t: Throwable): String {
+        val msg = t.message?.replace('\n', ' ')?.trim().orEmpty()
+        val cls = t.javaClass.simpleName
+        return if (msg.isEmpty()) cls else "$cls: ${msg.take(140)}"
+    }
+
+    /** Visible failure line: a dead YouTube section says why, in accent. */
+    private fun errorLine(text: String): TextView {
+        val tv = label(text, 13f, accent)
+        val lp = LinearLayout.LayoutParams(-1, -2)
+        lp.topMargin = dp(14)
+        tv.layoutParams = lp
+        return tv
+    }
+
+    /** Small source-status line (counts, fallback notes). */
+    private fun statusLine(text: String): TextView {
+        val tv = label(text, 12.5f, white50)
+        val lp = LinearLayout.LayoutParams(-1, -2)
+        lp.topMargin = dp(12)
+        tv.layoutParams = lp
+        return tv
+    }
+
+    /** Clips a view to a circle with the placeholder fill behind art. */
+    private fun circularClip(v: View) {
+        v.background = GradientDrawable().apply {
+            setColor(placeholder)
+            shape = GradientDrawable.OVAL
+        }
+        v.clipToOutline = true
+    }
+
+    private fun artistResultRow(artist: YtmArtistRef): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+            setOnClickListener { showArtist(artist.id, artist.name, artist.artworkLarge) }
+        }
+        val img = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            circularClip(this)
+        }
+        ArtworkLoader.load(artist.artworkSmall ?: artist.artworkLarge, img)
+        row.addView(img, LinearLayout.LayoutParams(dp(46), dp(46)))
+        val text = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), 0, 0, 0)
+        }
+        text.addView(label(artist.name, 16f, Color.WHITE, mediumTf).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        text.addView(label(artist.meta ?: "Artist", 14f, white50).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
+        return row
+    }
+
+    private fun albumResultRow(album: YtmAlbumRef): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+            setOnClickListener { showAlbum(album) }
+        }
+        val img = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            roundedClip(this, 9)
+        }
+        ArtworkLoader.load(album.artworkSmall ?: album.artworkLarge, img)
+        row.addView(img, LinearLayout.LayoutParams(dp(52), dp(52)))
+        val text = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(13), 0, dp(8), 0)
+        }
+        text.addView(label(album.title, 16f, Color.WHITE, mediumTf).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        val sub = listOf(album.artist, album.year ?: "")
+            .filter { it.isNotEmpty() }.joinToString(" • ")
+        text.addView(label(sub.ifEmpty { "Album" }, 14.5f, white50).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
+        return row
+    }
+
+    /** Horizontal card row for an artist's albums / singles. */
+    private fun albumCardRow(items: List<YtmAlbumRef>): HorizontalScrollView {
+        val scroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            clipToPadding = false
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(4), 0, dp(2))
+        }
+        items.forEach { album ->
+            val box = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setOnClickListener { showAlbum(album) }
+            }
+            val boxLp = LinearLayout.LayoutParams(dp(132), -2)
+            boxLp.marginEnd = dp(14)
+            box.layoutParams = boxLp
+            val img = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                roundedClip(this, 10)
+            }
+            ArtworkLoader.load(album.artworkLarge ?: album.artworkSmall, img)
+            box.addView(img, LinearLayout.LayoutParams(dp(132), dp(132)))
+            box.addView(label(album.title, 13.5f, Color.WHITE, mediumTf).apply {
+                maxLines = 2
+                ellipsize = TextUtils.TruncateAt.END
+                val lp = LinearLayout.LayoutParams(-1, -2)
+                lp.topMargin = dp(7)
+                layoutParams = lp
+            })
+            box.addView(label(album.year ?: "", 12.5f, white50))
+            row.addView(box)
+        }
+        scroll.addView(row)
+        return scroll
+    }
+
+    /** Horizontal circle row: chart artists / related artists. */
+    private fun artistCircleRow(artists: List<YtmArtistRef>): HorizontalScrollView {
+        val scroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            clipToPadding = false
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(4), 0, dp(2))
+        }
+        artists.forEach { artist ->
+            val box = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                setOnClickListener { showArtist(artist.id, artist.name, artist.artworkLarge) }
+            }
+            val boxLp = LinearLayout.LayoutParams(dp(104), -2)
+            boxLp.marginEnd = dp(12)
+            box.layoutParams = boxLp
+            val img = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                circularClip(this)
+            }
+            ArtworkLoader.load(artist.artworkLarge ?: artist.artworkSmall, img)
+            box.addView(img, LinearLayout.LayoutParams(dp(92), dp(92)))
+            box.addView(label(artist.name, 13f, Color.WHITE, mediumTf).apply {
+                gravity = Gravity.CENTER
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                val lp = LinearLayout.LayoutParams(-1, -2)
+                lp.topMargin = dp(7)
+                layoutParams = lp
+            })
+            row.addView(box)
+        }
+        scroll.addView(row)
+        return scroll
+    }
+
+    private fun showArtist(artistId: String, fallbackName: String? = null, fallbackArt: String? = null) {
+        val gen = ++generation
+        content.removeAllViews()
+        content.addView(label("Loading artist…", 16f, white50).apply {
+            setPadding(0, dp(28), 0, 0)
+        })
+        executor.execute {
+            var page: YtmArtistPage? = null
+            var err: String? = null
+            try {
+                page = YtmApi.artistPage(artistId)
+            } catch (t: Throwable) {
+                err = shortErr(t)
+            }
+            runOnUiThread {
+                if (gen != generation) return@runOnUiThread
+                content.removeAllViews()
+                val p = page
+                if (p == null) {
+                    content.addView(label(fallbackName ?: "Artist", 30f, Color.WHITE, boldTf))
+                    content.addView(errorLine("YouTube unavailable: $err"))
+                    return@runOnUiThread
+                }
+                val banner = FrameLayout(this).apply {
+                    background = GradientDrawable().apply {
+                        setColor(Color.rgb(20, 20, 23))
+                        cornerRadius = dp(16).toFloat()
+                    }
+                    clipToOutline = true
+                }
+                val bannerLp = LinearLayout.LayoutParams(-1, dp(232))
+                bannerLp.topMargin = dp(10)
+                banner.layoutParams = bannerLp
+                val img = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+                ArtworkLoader.load(p.artworkLarge ?: fallbackArt ?: p.artworkSmall, img)
+                banner.addView(img, FrameLayout.LayoutParams(-1, -1))
+                val shade = View(this).apply {
+                    background = GradientDrawable(
+                        GradientDrawable.Orientation.TOP_BOTTOM,
+                        intArrayOf(Color.TRANSPARENT, Color.argb(199, 0, 0, 0))
+                    )
+                }
+                banner.addView(shade, FrameLayout.LayoutParams(-1, -1))
+                val labels = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(16), 0, dp(16), dp(13))
+                }
+                labels.addView(label(p.name, 27f, Color.WHITE, boldTf).apply {
+                    maxLines = 2
+                    ellipsize = TextUtils.TruncateAt.END
+                })
+                val subs = p.subscribers
+                if (!subs.isNullOrEmpty()) {
+                    labels.addView(
+                        label(
+                            if (subs.contains("subscriber", ignoreCase = true)) subs else "$subs subscribers",
+                            13.5f, white75
+                        )
+                    )
+                }
+                banner.addView(labels, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
+                content.addView(banner)
+                if (p.topSongs.isNotEmpty()) {
+                    content.addView(sectionTitle("Top Songs"))
+                    addRows(p.topSongs, withHairlines = true, queueContext = p.topSongs)
+                }
+                if (p.singles.isNotEmpty()) {
+                    content.addView(sectionTitle("Singles & EPs"))
+                    content.addView(albumCardRow(p.singles))
+                }
+                if (p.albums.isNotEmpty()) {
+                    content.addView(sectionTitle("Albums"))
+                    content.addView(albumCardRow(p.albums))
+                }
+                if (p.related.isNotEmpty()) {
+                    content.addView(sectionTitle("Fans Might Also Like"))
+                    content.addView(artistCircleRow(p.related))
+                }
+                if (p.topSongs.isEmpty() && p.singles.isEmpty() && p.albums.isEmpty() && p.related.isEmpty()) {
+                    content.addView(label("Nothing here yet.", 15f, white50).apply {
+                        setPadding(0, dp(18), 0, 0)
+                    })
+                }
+            }
+        }
+    }
+
+    private fun showAlbum(ref: YtmAlbumRef) {
+        val gen = ++generation
+        content.removeAllViews()
+        content.addView(label("Loading album…", 16f, white50).apply {
+            setPadding(0, dp(28), 0, 0)
+        })
+        executor.execute {
+            var page: YtmAlbumPage? = null
+            var err: String? = null
+            try {
+                page = YtmApi.albumPage(ref)
+            } catch (t: Throwable) {
+                err = shortErr(t)
+            }
+            runOnUiThread {
+                if (gen != generation) return@runOnUiThread
+                content.removeAllViews()
+                val p = page
+                if (p == null) {
+                    content.addView(label(ref.title, 26f, Color.WHITE, boldTf))
+                    content.addView(errorLine("YouTube unavailable: $err"))
+                    return@runOnUiThread
+                }
+                val head = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    gravity = Gravity.CENTER_HORIZONTAL
+                }
+                val art = ImageView(this).apply {
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                    roundedClip(this, 12)
+                    elevation = dp(18).toFloat()
+                }
+                ArtworkLoader.load(p.artworkLarge ?: ref.artworkSmall, art)
+                val artLp = LinearLayout.LayoutParams(dp(200), dp(200))
+                artLp.topMargin = dp(14)
+                head.addView(art, artLp)
+                head.addView(label(p.title, 20f, Color.WHITE, boldTf).apply {
+                    gravity = Gravity.CENTER
+                    maxLines = 2
+                    ellipsize = TextUtils.TruncateAt.END
+                    val lp = LinearLayout.LayoutParams(-1, -2)
+                    lp.topMargin = dp(16)
+                    layoutParams = lp
+                })
+                if (p.artist.isNotEmpty()) {
+                    val artistTv = label(p.artist, 17f, accent, mediumTf).apply {
+                        gravity = Gravity.CENTER
+                    }
+                    if (p.artistId != null) {
+                        artistTv.setOnClickListener { showArtist(p.artistId, p.artist, null) }
+                    }
+                    head.addView(artistTv)
+                }
+                if (!p.year.isNullOrEmpty()) {
+                    head.addView(label(p.year, 13f, white50).apply { gravity = Gravity.CENTER })
+                }
+                content.addView(head)
+                if (p.tracks.isNotEmpty()) {
+                    val playAll = label("Play", 15f, Color.WHITE, boldTf).apply {
+                        gravity = Gravity.CENTER
+                        background = GradientDrawable().apply {
+                            setColor(accent)
+                            cornerRadius = dp(999).toFloat()
+                        }
+                        setOnClickListener {
+                            queue = p.tracks
+                            play(p.tracks.first())
+                        }
+                    }
+                    val playLp = LinearLayout.LayoutParams(dp(132), dp(40))
+                    playLp.gravity = Gravity.CENTER_HORIZONTAL
+                    playLp.topMargin = dp(18)
+                    playLp.bottomMargin = dp(6)
+                    content.addView(playAll, playLp)
+                    addRows(p.tracks, withHairlines = true, queueContext = p.tracks)
+                } else {
+                    content.addView(label("No tracks listed for this album.", 15f, white50).apply {
+                        setPadding(0, dp(18), 0, 0)
+                    })
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------- now playing
@@ -747,6 +1227,14 @@ class MainActivity : Activity() {
         npArtist = label("", 20f, white55).apply {
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
+            isClickable = true
+            setOnClickListener {
+                val t = current
+                if (t?.artistId != null) {
+                    hideNowPlaying()
+                    showArtist(t.artistId, t.artist, t.artworkLarge)
+                }
+            }
         }
         metaText.addView(npTitle)
         metaText.addView(npArtist)
@@ -847,11 +1335,15 @@ class MainActivity : Activity() {
         val airBtn = icon(R.drawable.ic_airplay, white75).apply {
             setOnClickListener { Toast.makeText(this@MainActivity, "Casting is not available in this build", Toast.LENGTH_SHORT).show() }
         }
+        val radioBtn = icon(R.drawable.ic_radio, white75).apply {
+            setOnClickListener { startRadio() }
+        }
         val queueBtn = icon(R.drawable.ic_queue, white75).apply {
             setOnClickListener { hideNowPlaying() }
         }
         bottomRow.addView(lyricsBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
         bottomRow.addView(airBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
+        bottomRow.addView(radioBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
         bottomRow.addView(queueBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
         inner.addView(bottomRow)
 
@@ -1019,6 +1511,50 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * "Start radio" from Now Playing: builds a YouTube Music radio queue
+     * around the current track. The playing track is NOT interrupted —
+     * it stays as queue head and the radio tracks become what's next.
+     * Radio needs a YouTube seed (the automix is keyed by video id).
+     */
+    private fun startRadio() {
+        val seed = current ?: return
+        if (seed.source != SOURCE_YOUTUBE) {
+            Toast.makeText(this, "Radio is available for YouTube tracks", Toast.LENGTH_SHORT).show()
+            return
+        }
+        Toast.makeText(this, "Starting radio…", Toast.LENGTH_SHORT).show()
+        val token = playToken
+        executor.execute {
+            var list: List<Track> = emptyList()
+            var err: String? = null
+            try {
+                list = YtmApi.radio(seed.id)
+            } catch (t: Throwable) {
+                err = shortErr(t)
+            }
+            runOnUiThread {
+                if (token != playToken) return@runOnUiThread
+                if (err != null) {
+                    Toast.makeText(this@MainActivity, "Radio unavailable: $err", Toast.LENGTH_LONG).show()
+                    return@runOnUiThread
+                }
+                val rest = list.filterNot { it.id == seed.id && it.source == seed.source }
+                if (rest.isEmpty()) {
+                    Toast.makeText(this@MainActivity, "Radio unavailable right now.", Toast.LENGTH_SHORT).show()
+                    return@runOnUiThread
+                }
+                queue = listOf(seed) + rest
+                queueIndex = 0
+                Toast.makeText(
+                    this@MainActivity,
+                    "Radio on · ${queue.size} tracks queued",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+
     private fun togglePlayback() {
         val active = player ?: return
         try {
@@ -1074,7 +1610,8 @@ class MainActivity : Activity() {
                     o.optInt("duration"),
                     o.optString("artworkSmall", null)?.takeIf { it.isNotEmpty() },
                     o.optString("artworkLarge", null)?.takeIf { it.isNotEmpty() },
-                    o.optString("source", SOURCE_AUDIUS)
+                    o.optString("source", SOURCE_AUDIUS),
+                    o.optString("artistId", null)?.takeIf { it.isNotEmpty() }
                 )
             }
         } catch (_: Exception) {
@@ -1083,7 +1620,7 @@ class MainActivity : Activity() {
     }
 
     private fun saveRecent(track: Track) {
-        recentTracks.removeAll { it.id == track.id }
+        recentTracks.removeAll { it.id == track.id && it.source == track.source }
         recentTracks.add(0, track)
         while (recentTracks.size > 10) recentTracks.removeAt(recentTracks.size - 1)
         val arr = JSONArray()
@@ -1094,6 +1631,7 @@ class MainActivity : Activity() {
                 put("artist", t.artist)
                 put("duration", t.duration)
                 put("source", t.source)
+                put("artistId", t.artistId ?: JSONObject.NULL)
                 put("artworkSmall", t.artworkSmall ?: JSONObject.NULL)
                 put("artworkLarge", t.artworkLarge ?: JSONObject.NULL)
             })
@@ -1122,6 +1660,7 @@ class MainActivity : Activity() {
                     val lp = mini.layoutParams as LinearLayout.LayoutParams
                     lp.height = dp(if (checked) 48 else 58)
                     mini.layoutParams = lp
+                    bottomBar.post { fitContentPadding() }
                 }
             }
         }
