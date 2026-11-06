@@ -60,6 +60,24 @@ data class YtmCharts(
     val artists: List<YtmArtistRef>
 )
 
+/** A playlist card from a mood/genre category page. [id] is the raw
+ *  browseId (usually "VL…") — browse it as-is. */
+data class YtmPlaylistRef(
+    val id: String,
+    val title: String,
+    val subtitle: String = "",
+    val artworkSmall: String? = null,
+    val artworkLarge: String? = null
+)
+
+/** One entry of the Moods & Genres index: a display name plus the
+ *  browse params that open its category page. */
+data class YtmMoodCategory(
+    val name: String,
+    val params: String,
+    val group: String = ""
+)
+
 /**
  * YouTube Music catalog over the raw Innertube API (music.youtube.com
  * youtubei/v1), the same unauthenticated WEB_REMIX client shape
@@ -691,6 +709,122 @@ object YtmApi {
             throw RuntimeException("charts response had no usable sections")
         }
         return YtmCharts(songs, artists)
+    }
+
+    // ------------------------------------------------------------ moods & genres
+
+    /**
+     * The Moods & Genres index (FEmusic_moods_and_genres). Category
+     * entries are navigation buttons (grid sections) or cards whose
+     * browse endpoints carry the category params. Throws when the
+     * response yields nothing usable, so the caller can fall back
+     * honestly instead of rendering an empty browse page.
+     */
+    fun moodCategories(): List<YtmMoodCategory> {
+        val resp = post("browse", JSONObject().put("browseId", "FEmusic_moods_and_genres"))
+        val out = ArrayList<YtmMoodCategory>()
+        fun add(name: String, params: String?, group: String) {
+            val n = name.trim()
+            if (n.isEmpty() || params.isNullOrEmpty()) return
+            if (out.any { it.params == params }) return
+            out.add(YtmMoodCategory(n, params, group))
+        }
+        fun buttonCategory(item: JSONObject, group: String) {
+            val btn = item.obj("musicNavigationButtonRenderer") ?: return
+            val name = textOf(btn.obj("buttonText"))
+            val ep = dig(btn, "clickCommand", "browseEndpoint")
+            add(name, ep?.optString("params")?.takeIf { it.isNotEmpty() }, group)
+        }
+        fun cardCategory(item: JSONObject, group: String) {
+            val two = item.obj("musicTwoRowItemRenderer") ?: return
+            val d = parseTwoRowItem(two) ?: return
+            var ep = dig(two, "navigationEndpoint", "browseEndpoint")
+            if (ep == null) {
+                val run = two.obj("title")?.arr("runs")?.optJSONObject(0)
+                ep = dig(run, "navigationEndpoint", "browseEndpoint")
+            }
+            add(d.title, ep?.optString("params")?.takeIf { it.isNotEmpty() }, group)
+        }
+        for (section in browseSections(resp)) {
+            val grid = section.obj("gridRenderer")
+            if (grid != null) {
+                val group = dig(grid, "header", "gridHeaderRenderer", "title")
+                    ?.let { textOf(it) } ?: ""
+                val items = grid.arr("items") ?: JSONArray()
+                for (i in 0 until items.length()) {
+                    items.optJSONObject(i)?.let { buttonCategory(it, group) }
+                }
+                continue
+            }
+            if (section.has("musicCarouselShelfRenderer")) {
+                val group = carouselTitle(section)
+                carouselItems(section).forEach { cardCategory(it, group) }
+            }
+        }
+        if (out.isEmpty()) {
+            // Fallback: the buttons can also live outside grid
+            // sections on some rollouts — collect them directly.
+            val buttons = ArrayList<JSONObject>()
+            collectByKey(resp, "musicNavigationButtonRenderer", buttons)
+            buttons.forEach { btn ->
+                val wrap = JSONObject().put("musicNavigationButtonRenderer", btn)
+                buttonCategory(wrap, "")
+            }
+        }
+        if (out.isEmpty()) throw RuntimeException("moods response had no categories")
+        return out
+    }
+
+    /**
+     * Playlists of one mood/genre category page. The page's own
+     * browseId is fixed; the category travels in `params`.
+     */
+    fun moodPlaylists(category: YtmMoodCategory, limit: Int = 30): List<YtmPlaylistRef> {
+        val body = JSONObject()
+            .put("browseId", "FEmusic_moods_and_genres_category")
+            .put("params", category.params)
+        val resp = post("browse", body)
+        val out = ArrayList<YtmPlaylistRef>()
+        fun addCard(item: JSONObject) {
+            val two = item.obj("musicTwoRowItemRenderer") ?: return
+            val d = parseTwoRowItem(two) ?: return
+            val bid = d.browseId ?: return
+            if (out.any { it.id == bid }) return
+            out.add(YtmPlaylistRef(bid, d.title, d.subtitleText, d.artworkSmall, d.artworkLarge))
+        }
+        for (section in browseSections(resp)) {
+            if (section.has("musicCarouselShelfRenderer")) {
+                carouselItems(section).forEach { addCard(it) }
+            }
+            val grid = section.obj("gridRenderer")
+            if (grid != null) {
+                val items = grid.arr("items") ?: JSONArray()
+                for (i in 0 until items.length()) {
+                    items.optJSONObject(i)?.let { addCard(it) }
+                }
+            }
+            if (out.size >= limit) break
+        }
+        if (out.isEmpty()) throw RuntimeException("category page had no playlists")
+        return out.take(limit)
+    }
+
+    /**
+     * Tracks of an arbitrary playlist browseId (mood playlists,
+     * chart playlists). Unlike [playlistTracks], the id is browsed
+     * exactly as given — mood browseIds arrive fully formed ("VL…").
+     */
+    fun browsePlaylistTracks(browseId: String, limit: Int = 60): List<Track> {
+        val resp = post("browse", JSONObject().put("browseId", browseId))
+        val out = ArrayList<Track>()
+        for (section in browseSections(resp)) {
+            for (item in shelfItems(section)) {
+                parseListItem(item)?.toTrack()?.let { out.add(it) }
+                if (out.size >= limit) return out
+            }
+        }
+        if (out.isEmpty()) throw RuntimeException("playlist response had no tracks")
+        return out
     }
 
     // ------------------------------------------------------------ stream resolution
