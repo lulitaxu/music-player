@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>arzxsh — iOS-look mockups</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-font-smoothing:antialiased; }
+  body { background:#1a1a1c; font-family:-apple-system,"SF Pro Display","SF Pro Text","Helvetica Neue",Helvetica,Arial,sans-serif; display:flex; gap:48px; padding:48px; }
+  .phone { width:393px; height:852px; background:#000; color:#fff; border-radius:56px; overflow:hidden; position:relative; flex:none; box-shadow:0 30px 80px rgba(0,0,0,.6); }
+  .statusbar { height:54px; display:flex; align-items:center; justify-content:space-between; padding:10px 34px 0 38px; font-size:15px; font-weight:600; letter-spacing:.2px; position:relative; z-index:5; }
+  .statusbar .icons { display:flex; gap:7px; align-items:center; }
+  .pill-cam { position:absolute; top:12px; left:50%; transform:translateX(-50%); width:112px; height:30px; background:#000; border-radius:20px; border:1px solid rgba(255,255,255,.06); }
+  /* ---------- shared bits ---------- */
+  .accent { color:#fc3c44; }
+  .hairline { height:1px; background:rgba(255,255,255,.09); margin-left:84px; }
+  /* ---------- tab bar (liquid glass) ---------- */
+  .tabbar { position:absolute; left:14px; right:14px; bottom:14px; height:64px; border-radius:999px;
+    background:rgba(30,30,32,.55); backdrop-filter:blur(26px) saturate(190%); -webkit-backdrop-filter:blur(26px) saturate(190%);
+    border:1px solid rgba(255,255,255,.14); box-shadow:0 12px 34px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.14);
+    display:flex; align-items:center; justify-content:space-around; padding:0 8px; z-index:20; }
+  .tab { display:flex; flex-direction:column; align-items:center; gap:2px; font-size:10px; font-weight:500; color:rgba(255,255,255,.55); width:62px; padding:7px 0 5px; border-radius:999px; }
+  .tab svg { width:23px; height:23px; }
+  .tab.active { color:#fff; background:rgba(255,255,255,.13); box-shadow:inset 0 1px 0 rgba(255,255,255,.16); }
+  .tab.active svg { color:#fc3c44; }
+  /* ---------- mini player ---------- */
+  .mini { position:absolute; left:14px; right:14px; bottom:88px; height:58px; border-radius:16px;
+    background:rgba(38,38,40,.62); backdrop-filter:blur(26px) saturate(190%); -webkit-backdrop-filter:blur(26px) saturate(190%);
+    border:1px solid rgba(255,255,255,.12); box-shadow:0 10px 28px rgba(0,0,0,.45);
+    display:flex; align-items:center; gap:11px; padding:0 12px 0 8px; z-index:19; }
+  .mini img { width:42px; height:42px; border-radius:8px; object-fit:cover; }
+  .mini .mt { flex:1; min-width:0; }
+  .mini .mt b { display:block; font-size:14.5px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .mini .mt span { display:block; font-size:13px; color:rgba(255,255,255,.55); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .mini .mb { display:flex; gap:20px; align-items:center; color:#fff; }
+  .mini .mb svg { width:26px; height:26px; }
+  /* ---------- screen 1: listen now / tracks ---------- */
+  .s1 .head { padding:8px 22px 0; display:flex; align-items:flex-start; justify-content:space-between; }
+  .s1 h1 { font-size:32px; font-weight:800; letter-spacing:-.4px; }
+  .s1 .avatar { width:34px; height:34px; border-radius:50%; background:linear-gradient(135deg,#fc3c44,#7d2ae8); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:14px; margin-top:4px; }
+  .featured { margin:16px 22px 4px; position:relative; border-radius:16px; overflow:hidden; height:196px; }
+  .featured img { width:100%; height:100%; object-fit:cover; display:block; }
+  .featured .shade { position:absolute; inset:0; background:linear-gradient(to top, rgba(0,0,0,.72) 0%, rgba(0,0,0,0) 55%); }
+  .featured .fl { position:absolute; left:16px; right:16px; bottom:13px; }
+  .featured .fk { font-size:11px; font-weight:700; letter-spacing:1.2px; color:rgba(255,255,255,.75); text-transform:uppercase; }
+  .featured .ft { font-size:20px; font-weight:700; line-height:1.15; margin-top:2px; }
+  .s1 h2 { font-size:21px; font-weight:800; letter-spacing:-.3px; padding:20px 22px 6px; }
+  .row { display:flex; align-items:center; gap:13px; padding:8px 22px 8px 22px; }
+  .row img { width:52px; height:52px; border-radius:9px; object-fit:cover; flex:none; }
+  .row .rt { flex:1; min-width:0; }
+  .row .rt b { display:block; font-size:16px; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; letter-spacing:-.1px; }
+  .row .rt span { display:block; font-size:14.5px; color:rgba(255,255,255,.5); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:1px; }
+  .row .eq { display:flex; gap:2.5px; align-items:flex-end; height:16px; }
+  .row .eq i { width:3.5px; background:#fc3c44; border-radius:2px; display:block; }
+  .row .dots { color:rgba(255,255,255,.45); }
+  /* ---------- screen 2: now playing ---------- */
+  .s2 .bg { position:absolute; inset:0; }
+  .s2 .bg img { width:100%; height:100%; object-fit:cover; filter:blur(60px) saturate(160%) brightness(.5); transform:scale(1.4); }
+  .s2 .bgshade { position:absolute; inset:0; background:linear-gradient(to bottom, rgba(0,0,0,.15), rgba(0,0,0,.45)); }
+  .s2 .inner { position:relative; z-index:4; padding:0 30px; }
+  .grab { width:38px; height:5px; border-radius:3px; background:rgba(255,255,255,.35); margin:8px auto 30px; }
+  .np-art { width:333px; height:333px; border-radius:14px; object-fit:cover; box-shadow:0 24px 60px rgba(0,0,0,.55); display:block; }
+  .np-meta { display:flex; align-items:center; justify-content:space-between; margin-top:26px; }
+  .np-meta b { font-size:21.5px; font-weight:700; letter-spacing:-.2px; display:block; }
+  .np-meta span { font-size:20px; color:rgba(255,255,255,.55); display:block; margin-top:1px; }
+  .np-heart { color:#fc3c44; }
+  .scrub { margin-top:20px; }
+  .scrub .bar { height:26px; position:relative; display:flex; align-items:center; }
+  .scrub .track { height:5.5px; border-radius:3px; background:rgba(255,255,255,.22); width:100%; position:relative; }
+  .scrub .fill { position:absolute; left:0; top:0; bottom:0; width:31%; border-radius:3px; background:rgba(255,255,255,.92); }
+  .scrub .knob { position:absolute; left:31%; top:50%; transform:translate(-50%,-50%); width:14px; height:14px; border-radius:50%; background:#fff; box-shadow:0 2px 8px rgba(0,0,0,.4); }
+  .scrub .times { display:flex; justify-content:space-between; font-size:12.5px; color:rgba(255,255,255,.55); font-variant-numeric:tabular-nums; margin-top:2px; }
+  .controls { display:flex; align-items:center; justify-content:space-between; margin-top:22px; padding:0 14px; color:#fff; }
+  .controls .big svg { width:64px; height:64px; }
+  .controls .side svg { width:42px; height:42px; }
+  .vol { display:flex; align-items:center; gap:12px; margin-top:28px; color:rgba(255,255,255,.5); }
+  .vol .vtrack { flex:1; height:5.5px; border-radius:3px; background:rgba(255,255,255,.22); position:relative; }
+  .vol .vfill { position:absolute; left:0; top:0; bottom:0; width:58%; background:rgba(255,255,255,.92); border-radius:3px; }
+  .np-bottom { display:flex; justify-content:space-between; margin-top:30px; padding:0 22px; color:rgba(255,255,255,.75); }
+  /* ---------- screen 3: search ---------- */
+  .s3 .head { padding:8px 22px 0; display:flex; align-items:flex-start; justify-content:space-between; }
+  .s3 h1 { font-size:32px; font-weight:800; letter-spacing:-.4px; }
+  .s3 .avatar { width:34px; height:34px; border-radius:50%; background:linear-gradient(135deg,#fc3c44,#7d2ae8); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:14px; margin-top:4px; }
+  .searchfield { margin:14px 22px 0; height:38px; border-radius:11px; background:rgba(255,255,255,.11); display:flex; align-items:center; gap:7px; padding:0 11px; color:rgba(255,255,255,.5); font-size:16px; }
+  .s3 h2 { font-size:21px; font-weight:800; letter-spacing:-.3px; padding:24px 22px 12px; }
+  .recent { padding:0 22px; }
+  .recent .rrow { display:flex; align-items:center; gap:12px; padding:9px 0; }
+  .recent img { width:46px; height:46px; border-radius:8px; object-fit:cover; }
+  .recent b { font-size:16px; font-weight:500; display:block; }
+  .recent span { font-size:14px; color:rgba(255,255,255,.5); display:block; }
+  .cats { display:grid; grid-template-columns:1fr 1fr; gap:13px; padding:0 22px; }
+  .cat { height:104px; border-radius:13px; position:relative; overflow:hidden; }
+  .cat img { width:100%; height:100%; object-fit:cover; display:block; }
+  .cat .cshade { position:absolute; inset:0; }
+  .cat b { position:absolute; left:13px; bottom:10px; font-size:16.5px; font-weight:700; text-shadow:0 1px 6px rgba(0,0,0,.45); }
+</style>
+</head>
+<body>
+
+<!-- ============ SCREEN 1 : LISTEN NOW ============ -->
+<section class="phone s1" id="s1">
+  <div class="statusbar"><span>8:34</span><div class="pill-cam"></div>
+    <span class="icons">
+      <svg width="17" height="11" viewBox="0 0 17 11" fill="#fff"><rect x="0" y="7" width="3" height="4" rx="1"/><rect x="4.5" y="5" width="3" height="6" rx="1"/><rect x="9" y="2.5" width="3" height="8.5" rx="1"/><rect x="13.5" y="0" width="3" height="11" rx="1"/></svg>
+      <svg width="25" height="12" viewBox="0 0 25 12"><rect x="0.5" y="0.5" width="21" height="11" rx="3.5" fill="none" stroke="rgba(255,255,255,.4)"/><rect x="2.5" y="2.5" width="14" height="7" rx="2" fill="#fff"/><path d="M23.5 4v4a2.2 2.2 0 0 0 0-4z" fill="rgba(255,255,255,.4)"/></svg>
+    </span></div>
+  <div class="head"><h1>Listen Now</h1><div class="avatar">A</div></div>
+  <div class="featured">
+    <img src="art/nowplaying.jpg" alt="">
+    <div class="shade"></div>
+    <div class="fl"><div class="fk">Featured mix</div><div class="ft">Whatsaheart~whxre<br>dctrj</div></div>
+  </div>
+  <h2>Recently Played</h2>
+  <div class="row"><img src="art/neon.jpg"><div class="rt"><b>140 Mix (Audius Exclusive)</b><span>iLLPeTiLL</span></div>
+    <span class="eq"><i style="height:9px"></i><i style="height:15px"></i><i style="height:6px"></i><i style="height:12px"></i></span></div>
+  <div class="hairline"></div>
+  <div class="row"><img src="art/bass.jpg"><div class="rt"><b>Bass Go Boom ft. Magic &amp; Bird</b><span>LOUDWERX</span></div>
+    <svg class="dots" width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></div>
+  <div class="hairline"></div>
+  <div class="row"><img src="art/bootleg.jpg"><div class="rt"><b>Deadly Combo [DISKADE AND OHNOITSDOUG BOOTLEG]</b><span>DISKADE</span></div>
+    <svg class="dots" width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></div>
+  <div class="hairline"></div>
+  <div class="row"><img src="art/dawn.jpg"><div class="rt"><b>herewithme (False Dawn Remix)</b><span>Trianglory</span></div>
+    <svg class="dots" width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></div>
+  <div class="hairline"></div>
+  <div class="row"><img src="art/elastic.jpg"><div class="rt"><b>Elastic Illusions</b><span>ShrivL</span></div>
+    <svg class="dots" width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></div>
+
+  <div class="mini"><img src="art/nowplaying.jpg"><div class="mt"><b>Whatsaheart~whxre</b><span>dctrj</span></div>
+    <div class="mb">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13l11-6.5z"/></svg>
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 5.5v13l8.5-6.5zM16 5.5v13l2.5-1.9v-9.2z" transform="translate(-1.5 0)"/></svg>
+    </div></div>
+  <nav class="tabbar">
+    <div class="tab active"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 3l9 8h-3v9h-4v-6H10v6H6v-9H3z"/></svg>Home</div>
+    <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.8-3.8" stroke-linecap="round"/></svg>Search</div>
+    <div class="tab"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M9 18.5a3 3 0 1 1-2-2.8V5l11-2.2V15a3 3 0 1 1-2-2.8V6L9 7.8z"/></svg>Library</div>
+    <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11m0 0l-4.5-4.5M12 15l4.5-4.5M5 20h14"/></svg>Downloads</div>
+    <div class="tab"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 8.5A3.5 3.5 0 1 0 12 15.5 3.5 3.5 0 0 0 12 8.5zm9 5.7v-4.4l-2.4-.5a7 7 0 0 0-.7-1.7l1.3-2.1-3.1-3.1-2.1 1.3a7 7 0 0 0-1.7-.7L11.8 1h-4.4l-.5 2.4a7 7 0 0 0-1.7.7L3.1 2.8 0 5.9l1.3 2.1a7 7 0 0 0-.7 1.7L-1.8 10.2v4.4l2.4.5c.2.6.4 1.2.7 1.7L0 18.9l3.1 3.1 2.1-1.3c.5.3 1.1.5 1.7.7l.5 2.4h4.4l.5-2.4a7 7 0 0 0 1.7-.7l2.1 1.3 3.1-3.1-1.3-2.1c.3-.5.5-1.1.7-1.7z" transform="translate(1.8 0) scale(0.92)"/></svg>Settings</div>
+  </nav>
+</section>
+
+<!-- ============ SCREEN 2 : NOW PLAYING ============ -->
+<section class="phone s2" id="s2">
+  <div class="bg"><img src="art/nowplaying.jpg"></div><div class="bgshade"></div>
+  <div class="statusbar"><span>8:34</span><div class="pill-cam"></div>
+    <span class="icons">
+      <svg width="17" height="11" viewBox="0 0 17 11" fill="#fff"><rect x="0" y="7" width="3" height="4" rx="1"/><rect x="4.5" y="5" width="3" height="6" rx="1"/><rect x="9" y="2.5" width="3" height="8.5" rx="1"/><rect x="13.5" y="0" width="3" height="11" rx="1"/></svg>
+      <svg width="25" height="12" viewBox="0 0 25 12"><rect x="0.5" y="0.5" width="21" height="11" rx="3.5" fill="none" stroke="rgba(255,255,255,.4)"/><rect x="2.5" y="2.5" width="14" height="7" rx="2" fill="#fff"/><path d="M23.5 4v4a2.2 2.2 0 0 0 0-4z" fill="rgba(255,255,255,.4)"/></svg>
+    </span></div>
+  <div class="inner">
+    <div class="grab"></div>
+    <img class="np-art" src="art/nowplaying.jpg">
+    <div class="np-meta"><div><b>Whatsaheart~whxre</b><span>dctrj</span></div>
+      <svg class="np-heart" width="27" height="27" viewBox="0 0 24 24" fill="currentColor"><path d="M12 20.7C6 16.9 2.5 13.4 2.5 9.6 2.5 6.9 4.6 5 7 5c1.9 0 3.9 1.2 5 3 1.1-1.8 3.1-3 5-3 2.4 0 4.5 1.9 4.5 4.6 0 3.8-3.5 7.3-9.5 11.1z"/></svg></div>
+    <div class="scrub"><div class="bar"><div class="track"><div class="fill"></div></div><div class="knob"></div></div>
+      <div class="times"><span>1:12</span><span>-2:48</span></div></div>
+    <div class="controls">
+      <span class="side"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 6.8v10.4L16.5 12zM17.5 6.8v10.4h2V6.8z" transform="scale(-1 1) translate(-26.5 0)"/></svg></span>
+      <span class="big"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4.2" height="14" rx="1.6"/><rect x="13.8" y="5" width="4.2" height="14" rx="1.6"/></svg></span>
+      <span class="side"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 6.8v10.4L16.5 12zM17.5 6.8v10.4h2V6.8z"/></svg></span>
+    </div>
+    <div class="vol">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor"><path d="M4 9.5v5h3.5L12 18.5v-13L7.5 9.5z"/></svg>
+      <div class="vtrack"><div class="vfill"></div></div>
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="currentColor"><path d="M4 9.5v5h3.5L12 18.5v-13L7.5 9.5zM15.5 9a4.2 4.2 0 0 1 0 6M18 6.5a8 8 0 0 1 0 11"/></svg>
+    </div>
+    <div class="np-bottom">
+      <svg width="25" height="25" viewBox="0 0 24 24" fill="currentColor"><path d="M5 6.5h9M5 11h13M5 15.5h9" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/><circle cx="18.6" cy="6.5" r="1.6"/><circle cx="10.6" cy="15.5" r="1.6"/></svg>
+      <svg width="25" height="25" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 4l7.5 8.5h-4V20h-7v-7.5h-4z" fill="currentColor" stroke="none" transform="translate(0 -1)"/><circle cx="12" cy="19.6" r="1.7" fill="currentColor" stroke="none"/></svg>
+      <svg width="25" height="25" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 7h14M5 12h14M5 17h9"/></svg>
+    </div>
+  </div>
+</section>
+
+<!-- ============ SCREEN 3 : SEARCH ============ -->
+<section class="phone s3" id="s3">
+  <div class="statusbar"><span>8:34</span><div class="pill-cam"></div>
+    <span class="icons">
+      <svg width="17" height="11" viewBox="0 0 17 11" fill="#fff"><rect x="0" y="7" width="3" height="4" rx="1"/><rect x="4.5" y="5" width="3" height="6" rx="1"/><rect x="9" y="2.5" width="3" height="8.5" rx="1"/><rect x="13.5" y="0" width="3" height="11" rx="1"/></svg>
+      <svg width="25" height="12" viewBox="0 0 25 12"><rect x="0.5" y="0.5" width="21" height="11" rx="3.5" fill="none" stroke="rgba(255,255,255,.4)"/><rect x="2.5" y="2.5" width="14" height="7" rx="2" fill="#fff"/><path d="M23.5 4v4a2.2 2.2 0 0 0 0-4z" fill="rgba(255,255,255,.4)"/></svg>
+    </span></div>
+  <div class="head"><h1>Search</h1><div class="avatar">A</div></div>
+  <div class="searchfield">
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.8-3.8" stroke-linecap="round"/></svg>
+    Artists, Songs, Lyrics and More</div>
+  <h2>Recent Searches</h2>
+  <div class="recent">
+    <div class="rrow"><img src="art/loko.jpg"><div><b>Loko (Radio Edit)</b><span>Space Fear</span></div></div>
+    <div class="rrow"><img src="art/sync.jpg"><div><b>Sync or Die</b><span>Lutez</span></div></div>
+  </div>
+  <h2>Browse Categories</h2>
+  <div class="cats">
+    <div class="cat"><img src="art/bass.jpg"><div class="cshade" style="background:linear-gradient(200deg, rgba(252,60,68,.28), rgba(0,0,0,.35))"></div><b>Bass</b></div>
+    <div class="cat"><img src="art/rave.jpg"><div class="cshade" style="background:linear-gradient(200deg, rgba(125,42,232,.30), rgba(0,0,0,.35))"></div><b>Electronic</b></div>
+    <div class="cat"><img src="art/neon.jpg"><div class="cshade" style="background:linear-gradient(200deg, rgba(10,132,255,.28), rgba(0,0,0,.35))"></div><b>Mixes</b></div>
+    <div class="cat"><img src="art/dawn.jpg"><div class="cshade" style="background:linear-gradient(200deg, rgba(255,159,10,.28), rgba(0,0,0,.35))"></div><b>Radio</b></div>
+  </div>
+  <div class="mini"><img src="art/nowplaying.jpg"><div class="mt"><b>Whatsaheart~whxre</b><span>dctrj</span></div>
+    <div class="mb">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13l11-6.5z"/></svg>
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 5.5v13l8.5-6.5zM16 5.5v13l2.5-1.9v-9.2z" transform="translate(-1.5 0)"/></svg>
+    </div></div>
+  <nav class="tabbar">
+    <div class="tab"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 3l9 8h-3v9h-4v-6H10v6H6v-9H3z"/></svg>Home</div>
+    <div class="tab active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.8-3.8" stroke-linecap="round"/></svg>Search</div>
+    <div class="tab"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M9 18.5a3 3 0 1 1-2-2.8V5l11-2.2V15a3 3 0 1 1-2-2.8V6L9 7.8z"/></svg>Library</div>
+    <div class="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11m0 0l-4.5-4.5M12 15l4.5-4.5M5 20h14"/></svg>Downloads</div>
+    <div class="tab"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 8.5A3.5 3.5 0 1 0 12 15.5 3.5 3.5 0 0 0 12 8.5zm9 5.7v-4.4l-2.4-.5a7 7 0 0 0-.7-1.7l1.3-2.1-3.1-3.1-2.1 1.3a7 7 0 0 0-1.7-.7L11.8 1h-4.4l-.5 2.4a7 7 0 0 0-1.7.7L3.1 2.8 0 5.9l1.3 2.1a7 7 0 0 0-.7 1.7L-1.8 10.2v4.4l2.4.5c.2.6.4 1.2.7 1.7L0 18.9l3.1 3.1 2.1-1.3c.5.3 1.1.5 1.7.7l.5 2.4h4.4l.5-2.4a7 7 0 0 0 1.7-.7l2.1 1.3 3.1-3.1-1.3-2.1c.3-.5.5-1.1.7-1.7z" transform="translate(1.8 0) scale(0.92)"/></svg>Settings</div>
+  </nav>
+</section>
+
+</body>
+</html>
