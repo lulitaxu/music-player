@@ -11,6 +11,7 @@ import android.graphics.drawable.GradientDrawable
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaPlayer
+import android.media.audiofx.AudioEffect
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -55,10 +56,30 @@ private object ArtworkLoader {
     private val cache = LruCache<String, Bitmap>(64)
     private val pool = Executors.newFixedThreadPool(3)
 
-    fun load(url: String?, into: ImageView) {
+    /** Bytes currently held by the in-memory artwork cache. */
+    fun cacheBytes(): Long = cache.snapshot().values.sumOf { it.byteCount.toLong() }
+
+    /** Drops every cached bitmap (Settings → Clear cache). */
+    fun clearCache() {
+        cache.evictAll()
+    }
+
+    fun load(url: String?, into: ImageView) = load(url, into, null)
+
+    /**
+     * Loads [url]; on failure tries [fallbackUrl] before giving up.
+     * (v4 loaded exactly one URL: when the small YouTube thumbnail
+     * failed, the mini player rendered an empty box even though the
+     * large artwork was right there.)
+     */
+    fun load(url: String?, into: ImageView, fallbackUrl: String?) {
         if (url.isNullOrEmpty()) {
-            into.tag = null
-            into.setImageDrawable(null)
+            if (!fallbackUrl.isNullOrEmpty() && fallbackUrl != url) {
+                load(fallbackUrl, into, null)
+            } else {
+                into.tag = null
+                into.setImageDrawable(null)
+            }
             return
         }
         into.tag = url
@@ -69,10 +90,16 @@ private object ArtworkLoader {
         }
         into.setImageDrawable(null)
         pool.execute {
-            val bmp = download(url)
-            if (bmp != null) cache.put(url, bmp)
+            var bmp = download(url)
+            if (bmp != null) {
+                cache.put(url, bmp)
+            } else if (!fallbackUrl.isNullOrEmpty() && fallbackUrl != url) {
+                bmp = download(fallbackUrl)
+                if (bmp != null) cache.put(url, bmp)
+            }
+            val result = bmp
             into.post {
-                if (bmp != null && into.tag == url) into.setImageBitmap(bmp)
+                if (result != null && into.tag == url) into.setImageBitmap(result)
             }
         }
     }
@@ -105,6 +132,9 @@ private object ArtworkLoader {
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             connectTimeout = 10_000
             readTimeout = 10_000
+            // Some artwork CDNs refuse the default Java user agent;
+            // identify the app like every other request it makes.
+            setRequestProperty("User-Agent", "arzxsh (Android)")
         }
         if (conn.responseCode !in 200..299) null
         else conn.inputStream.use { BitmapFactory.decodeStream(it) }
@@ -193,6 +223,10 @@ class MainActivity : Activity() {
     private lateinit var npDownloadBtn: ImageView
     private lateinit var npDownloadProgress: ProgressBar
     private lateinit var npSleepLabel: TextView
+    private lateinit var npError: TextView
+    /** One-shot Now Playing notice (e.g. the Audius fallback line),
+     *  shown when the next stream successfully prepares. */
+    private var pendingNpNotice: String? = null
     private val manualIndices = mutableSetOf<Int>()
     private var sleepAfterTrack = false
     private var artWasPlaying = false
@@ -261,10 +295,14 @@ class MainActivity : Activity() {
         bottomBar = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         // ---- glass mini player ----
+        // Fill is near-opaque on purpose: the bars float over a
+        // full-screen ScrollView, and at glass alpha (~60%) list rows
+        // scrolling underneath stayed visible THROUGH the bars (v4
+        // on-device bug). The stroke highlight keeps the glass read.
         mini = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = glassBg(16f, Color.argb(158, 38, 38, 40), Color.argb(31, 255, 255, 255))
+            background = glassBg(16f, Color.argb(243, 38, 38, 40), Color.argb(31, 255, 255, 255))
             setPadding(dp(8), dp(8), dp(12), dp(8))
             elevation = dp(10).toFloat()
             setOnClickListener { if (current != null) showNowPlaying() }
@@ -284,15 +322,20 @@ class MainActivity : Activity() {
         miniText.addView(miniArtist)
         mini.addView(miniText, LinearLayout.LayoutParams(0, -2, 1f))
         miniPlayButton = icon(R.drawable.ic_play, Color.WHITE).apply {
+            contentDescription = "Play"
             setOnClickListener { togglePlayback() }
         }
         mini.addView(miniPlayButton, LinearLayout.LayoutParams(dp(38), dp(38)))
         miniNextButton = icon(R.drawable.ic_next, Color.WHITE).apply {
+            contentDescription = "Next track"
             setOnClickListener { playNext() }
         }
         mini.addView(miniNextButton, LinearLayout.LayoutParams(dp(38), dp(38)))
         visualizerView = visualizer().apply {
-            visibility = if (getPreferences(MODE_PRIVATE).getBoolean("setting_Visualizer", true)) View.VISIBLE else View.GONE
+            // State comes from updateVisualizerState() (setting AND
+            // actual playback); starting hidden avoids showing "playing"
+            // bars before anything has ever played.
+            visibility = View.GONE
         }
         mini.addView(visualizerView)
         // Swipe left/right on the mini player skips tracks (iOS 26.1
@@ -329,7 +372,7 @@ class MainActivity : Activity() {
         val nav = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            background = glassBg(999f, Color.argb(140, 30, 30, 32), Color.argb(36, 255, 255, 255))
+            background = glassBg(999f, Color.argb(243, 30, 30, 32), Color.argb(36, 255, 255, 255))
             setPadding(dp(8), 0, dp(8), 0)
             elevation = dp(12).toFloat()
         }
@@ -344,6 +387,7 @@ class MainActivity : Activity() {
             val box = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER
+                contentDescription = name
                 setPadding(0, dp(7), 0, dp(5))
                 setOnClickListener {
                     setActiveTab(name)
@@ -367,18 +411,30 @@ class MainActivity : Activity() {
         buildMenuOverlay(root)
         setContentView(root)
         setActiveTab("Home")
+        // Re-fit on EVERY bar layout, not one posted runnable: the v4
+        // post{} could fire before the bars were measured (height 0,
+        // guard kept the stale default), and later height changes
+        // (compact mini-player) were only covered if a post happened
+        // to land after layout. A layout listener cannot miss.
+        bottomBar.viewTreeObserver.addOnGlobalLayoutListener { fitContentPadding() }
         bottomBar.post { fitContentPadding() }
     }
+
+    private var lastFitPadding = -1
 
     /**
      * Sizes the scroll content's bottom inset from the MEASURED floating
      * bars (mini player + tab bar) plus breathing room, so the last rows
      * can always scroll fully clear of both bars on any device. (v3 used
-     * a fixed guess and rows ended up hidden underneath.)
+     * a fixed guess and rows ended up hidden underneath.) Guarded
+     * against re-applying the same value, which would loop layouts.
      */
     private fun fitContentPadding() {
-        if (::bottomBar.isInitialized && ::content.isInitialized && bottomBar.height > 0) {
-            content.setPadding(dp(22), dp(10), dp(22), bottomBar.height + dp(28))
+        if (!::bottomBar.isInitialized || !::content.isInitialized) return
+        val target = bottomBar.height + dp(28)
+        if (bottomBar.height > 0 && target != lastFitPadding) {
+            lastFitPadding = target
+            content.setPadding(dp(22), dp(10), dp(22), target)
         }
     }
 
@@ -482,7 +538,9 @@ class MainActivity : Activity() {
                     tracks.clear()
                     tracks.addAll(audius)
                 }
-                val featured = audius?.firstOrNull() ?: charts?.songs?.firstOrNull()
+                // Featured prefers YouTube Music (the primary source);
+                // Audius headlines only when charts are unavailable.
+                val featured = charts?.songs?.firstOrNull() ?: audius?.firstOrNull()
                 if (featured != null) {
                     val context = if (featured.source == SOURCE_YOUTUBE) {
                         charts?.songs ?: listOf(featured)
@@ -548,7 +606,7 @@ class MainActivity : Activity() {
         lp.topMargin = dp(16)
         card.layoutParams = lp
         val img = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
-        ArtworkLoader.load(track.artworkLarge ?: track.artworkSmall, img)
+        ArtworkLoader.load(largeArt(track), img, track.artworkSmall)
         card.addView(img, FrameLayout.LayoutParams(-1, -1))
         val shade = View(this).apply {
             background = GradientDrawable(
@@ -622,11 +680,13 @@ class MainActivity : Activity() {
                 } catch (t: Throwable) {
                     ytAlbumsErr = shortErr(t)
                 }
-                // One merged song list (Audius first, then YouTube
-                // Music) so next/previous playback flows across sources.
+                // One merged song list, YouTube Music FIRST (it is
+                // the primary source now), Audius after — both fully
+                // present and playable, and next/previous playback
+                // flows across sources.
                 val found = mutableListOf<Track>()
-                audius?.let { found.addAll(it) }
                 found.addAll(ytSongs)
+                audius?.let { found.addAll(it) }
                 runOnUiThread {
                     if (gen != generation) return@runOnUiThread
                     resultsBox.removeAllViews()
@@ -664,6 +724,11 @@ class MainActivity : Activity() {
                     )
                     if (errors.isNotEmpty()) {
                         resultsBox.addView(errorLine("YouTube unavailable: " + errors.joinToString(" · ")))
+                    }
+                    if (ytErr != null && !audius.isNullOrEmpty()) {
+                        // Search-level fallback, stated on screen:
+                        // YouTube failed, Audius is carrying the search.
+                        resultsBox.addView(statusLine("YouTube songs unavailable — showing Audius results instead."))
                     }
                     if (ytNote != null) {
                         resultsBox.addView(statusLine("YouTube: $ytNote"))
@@ -826,18 +891,199 @@ class MainActivity : Activity() {
 
     // ---------------------------------------------------------------- settings / empty
 
+    /** Small-caps group header, the reference apps' settings shape. */
+    private fun settingsGroupHeader(text: String): TextView {
+        val tv = label(text.uppercase(), 12.5f, white50, boldTf).apply { letterSpacing = 0.12f }
+        val lp = LinearLayout.LayoutParams(-1, -2)
+        lp.topMargin = dp(26)
+        lp.bottomMargin = dp(4)
+        tv.layoutParams = lp
+        return tv
+    }
+
+    /** Tappable settings row: title + optional subtitle + chevron. */
+    private fun settingsRow(
+        title: String,
+        subtitle: String?,
+        titleColor: Int = Color.WHITE,
+        onClick: () -> Unit
+    ): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(11), 0, dp(11))
+            rippleRect()
+            isClickable = true
+            setOnClickListener { onClick() }
+        }
+        val text = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        text.addView(label(title, 15.5f, titleColor))
+        if (subtitle != null) text.addView(label(subtitle, 13f, white50))
+        row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
+        row.addView(label("›", 22f, white50))
+        return row
+    }
+
+    private fun fmtBytes(bytes: Long): String = when {
+        bytes >= 1024 * 1024 -> "%.1f MB".format(bytes / (1024.0 * 1024.0))
+        bytes >= 1024 -> "${bytes / 1024} KB"
+        else -> "$bytes B"
+    }
+
+    private fun setStreamQuality(q: String) {
+        getPreferences(MODE_PRIVATE).edit().putString("stream_quality", q).apply()
+        val name = when (q) {
+            "data" -> "Data saver"
+            "high" -> "High"
+            else -> "Normal"
+        }
+        Toast.makeText(this, "Streaming quality: $name", Toast.LENGTH_SHORT).show()
+        showSettings()
+    }
+
+    /**
+     * Opens the device's system audio-effects panel (equalizer) for
+     * the player's audio session. Some devices ship no panel at all;
+     * that case gets an honest message, not a dead row.
+     */
+    private fun openEqualizer() {
+        val sessionId = try {
+            player?.audioSessionId
+        } catch (_: Exception) {
+            null
+        } ?: 0
+        val intent = Intent(AudioEffect.ACTION_DISPLAY_AUDIO_EFFECT_CONTROL_PANEL).apply {
+            putExtra(AudioEffect.EXTRA_AUDIO_SESSION, sessionId)
+            putExtra(AudioEffect.EXTRA_PACKAGE_NAME, packageName)
+            putExtra(AudioEffect.EXTRA_CONTENT_TYPE, AudioEffect.CONTENT_TYPE_MUSIC)
+        }
+        try {
+            startActivity(intent)
+        } catch (_: Exception) {
+            Toast.makeText(this, "No system equalizer available on this device", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun showLicenses() {
+        generation++
+        beginScreen("Licenses", showAvatar = false)
+        fun block(title: String, body: String, first: Boolean) {
+            val h = label(title, 17f, Color.WHITE, boldTf)
+            val hLp = LinearLayout.LayoutParams(-1, -2)
+            if (!first) hLp.topMargin = dp(24)
+            h.layoutParams = hLp
+            content.addView(h)
+            content.addView(label(body, 14f, white55))
+        }
+        block(
+            "NewPipe Extractor",
+            "Copyright (C) 2015-2026 the NewPipe team and contributors.\n" +
+                "Licensed under the GNU General Public License v3.0 (GPL-3.0). " +
+                "This app uses it to resolve YouTube streams on-device; no part of it is a server.\n" +
+                "Source: github.com/TeamNewPipe/NewPipeExtractor\n" +
+                "Full license text: gnu.org/licenses/gpl-3.0",
+            first = true
+        )
+        block(
+            "Rhino (Mozilla)",
+            "JavaScript engine bundled with NewPipe Extractor.\n" +
+                "Licensed under the Mozilla Public License 2.0 (MPL-2.0).\n" +
+                "Source: github.com/mozilla/rhino",
+            first = false
+        )
+        block(
+            "Trademarks",
+            "YouTube and YouTube Music are trademarks of Google LLC. " +
+                "Audius is a trademark of Audius, Inc. arzxsh is not affiliated with or endorsed by either.",
+            first = false
+        )
+    }
+
+    /**
+     * Full settings surface, grouped like the reference apps
+     * (Playback / Audio / Downloads & storage / Appearance / About).
+     * Every row works; rows whose behavior cannot be implemented for
+     * real (volume normalization — no per-track loudness metadata
+     * exists from either source) are omitted, not faked.
+     */
     private fun showSettings() {
         generation++
         beginScreen("Settings", showAvatar = false)
-        content.addView(sectionTitle("About"))
-        content.addView(label("Version 0.2.0", 15f, Color.WHITE))
-        content.addView(label("Streams via Audius and YouTube. Metadata via MusicBrainz.", 15f, white50))
-        content.addView(label("Lyrics: Not available yet", 15f, white50))
-        content.addView(label("No DRM bypass, ever.", 15f, white50))
-        content.addView(sectionTitle("Built-in player features"))
+
+        content.addView(settingsGroupHeader("Playback"))
+        val qualityName = when (streamQuality()) {
+            "data" -> "Data saver"
+            "high" -> "High"
+            else -> "Normal"
+        }
+        val qualitySub = if (dataSaverOn()) {
+            "Data saver mode is on — the lowest stream quality is used"
+        } else {
+            "$qualityName · steers YouTube stream selection"
+        }
+        content.addView(settingsRow("Streaming quality", qualitySub) {
+            showMenu(
+                "Streaming quality", listOf(
+                    "Data saver" to { setStreamQuality("data") },
+                    "Normal" to { setStreamQuality("normal") },
+                    "High" to { setStreamQuality("high") }
+                )
+            )
+        })
+        content.addView(setting("Data saver", false) { showSettings() })
+        content.addView(setting("Autoplay", true))
+
+        content.addView(settingsGroupHeader("Audio"))
+        content.addView(settingsRow("Equalizer", "Opens the system audio effects panel") {
+            openEqualizer()
+        })
+
+        content.addView(settingsGroupHeader("Downloads & storage"))
+        val dlCount = Downloads.entries(this).size
+        val dlBytes = Downloads.storageBytes(this)
+        content.addView(settingsRow("Downloads", "$dlCount tracks · ${fmtBytes(dlBytes)} on this device") {
+            setActiveTab("Downloads")
+            showDownloads()
+        })
+        if (dlCount > 0) {
+            content.addView(settingsRow("Remove all downloads", "Frees ${fmtBytes(dlBytes)}", accent) {
+                showMenu(
+                    "Remove all downloaded tracks?", listOf(
+                        "Remove all" to {
+                            Downloads.removeAll(this@MainActivity)
+                            Toast.makeText(this@MainActivity, "Downloads removed", Toast.LENGTH_SHORT).show()
+                            showSettings()
+                        },
+                        "Cancel" to {}
+                    )
+                )
+            })
+        }
+        content.addView(settingsRow("Artwork cache", "${fmtBytes(ArtworkLoader.cacheBytes())} in memory") {
+            ArtworkLoader.clearCache()
+            Toast.makeText(this@MainActivity, "Artwork cache cleared", Toast.LENGTH_SHORT).show()
+            showSettings()
+        })
+
+        content.addView(settingsGroupHeader("Appearance & behavior"))
         content.addView(setting("Visualizer", true))
         content.addView(setting("Compact mini-player", false))
-        content.addView(label("Power-user controls are built into arzxsh instead of installed as add-ons.", 14f, white50))
+        content.addView(setting("Reduce motion", false))
+
+        content.addView(settingsGroupHeader("About"))
+        // Read from the build, never hardcoded (v4 shipped a stale
+        // literal "Version 0.2.0" long after the app had moved on).
+        val ver = try {
+            packageManager.getPackageInfo(packageName, 0).versionName
+        } catch (_: Exception) {
+            null
+        } ?: "?"
+        content.addView(label("Version $ver", 15f, Color.WHITE))
+        content.addView(label("arzxsh by Arafat Arzu", 15f, white50))
+        content.addView(label("Sources · Audius · YouTube Music", 15f, white50))
+        content.addView(label("Lyrics: Not available yet", 15f, white50))
+        content.addView(label("No DRM bypass, ever.", 15f, white50))
+        content.addView(settingsRow("Open-source licenses", null) { showLicenses() })
     }
 
     private fun showEmpty(title: String, heading: String, message: String) {
@@ -909,29 +1155,19 @@ class MainActivity : Activity() {
         }
         text.addView(artistLabel)
         row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
-        if (track.source == SOURCE_YOUTUBE) {
-            // Filled accent pill: the YouTube marker must be unmissable
-            // (v3's 9sp translucent chip effectively was invisible).
-            val badge = label("YT", 10.5f, Color.WHITE, boldTf).apply {
-                gravity = Gravity.CENTER
-                background = GradientDrawable().apply {
-                    setColor(accent)
-                    cornerRadius = dp(5).toFloat()
-                }
-                setPadding(dp(7), dp(3), dp(7), dp(3))
-            }
-            val badgeLp = LinearLayout.LayoutParams(-2, -2)
-            badgeLp.marginStart = dp(8)
-            badgeLp.marginEnd = dp(2)
-            row.addView(badge, badgeLp)
-        }
+        // No source badges in rows (product decision, 2026-11-06):
+        // Track.source is still tracked internally for playback
+        // resolution, radio and downloads, just never displayed.
         if (Downloads.isDownloaded(this, track)) {
             val doneIcon = icon(R.drawable.ic_downloaded, accent)
             val dLp = LinearLayout.LayoutParams(dp(19), dp(19))
             dLp.marginStart = dp(8)
             row.addView(doneIcon, dLp)
         }
-        if (track.id == current?.id && track.source == current?.source) {
+        val isCurrent = track.id == current?.id && track.source == current?.source
+        if (isCurrent && isPlayingSafe()) {
+            // Playing indicator only while actually playing — the same
+            // single source of truth as the mini player.
             row.addView(visualizer())
         } else {
             val moreIcon = icon(R.drawable.ic_more, Color.argb(115, 255, 255, 255)).apply {
@@ -1413,10 +1649,21 @@ class MainActivity : Activity() {
         metaText.addView(npArtist)
         meta.addView(metaText, LinearLayout.LayoutParams(0, -2, 1f))
         npHeart = icon(R.drawable.ic_heart_outline, white75).apply {
+            contentDescription = "Favorite"
             setOnClickListener { toggleFavorite() }
         }
         meta.addView(npHeart, LinearLayout.LayoutParams(dp(38), dp(38)))
         inner.addView(meta)
+
+        // Playback failure surface: when a track cannot play, the real
+        // reason (resolver outcomes, player error codes) is printed
+        // here and stays on screen, instead of only flashing a generic
+        // toast (v4's Dai Dai screenshot: toast, 0:00, no diagnosis).
+        npError = label("", 13f, accent).apply {
+            visibility = View.GONE
+            setPadding(0, dp(8), 0, 0)
+        }
+        inner.addView(npError, LinearLayout.LayoutParams(-1, -2))
 
         npSeek = styledSeek(R.drawable.seek_thumb).apply {
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
@@ -1464,7 +1711,10 @@ class MainActivity : Activity() {
         // Spotify state treatment for the v4 deviation (spec §2.1/§3):
         // active = accent glyph + a dot beneath it; repeat-one adds the
         // "1" worked into the glyph.
-        npShuffleBtn = icon(R.drawable.ic_shuffle, white55).apply { setOnClickListener { toggleShuffle() } }
+        npShuffleBtn = icon(R.drawable.ic_shuffle, white55).apply {
+            contentDescription = "Shuffle"
+            setOnClickListener { toggleShuffle() }
+        }
         npShuffleDot = dotView()
         val shuffleBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1474,10 +1724,22 @@ class MainActivity : Activity() {
         val shDotLp = LinearLayout.LayoutParams(dp(4), dp(4))
         shDotLp.topMargin = dp(3)
         shuffleBox.addView(npShuffleDot, shDotLp)
-        val prevBtn = icon(R.drawable.ic_skip_prev, Color.WHITE).apply { setOnClickListener { playPrevious() } }
-        npPlayButton = icon(R.drawable.ic_play, Color.WHITE).apply { setOnClickListener { togglePlayback() } }
-        val nextBtn = icon(R.drawable.ic_skip_next, Color.WHITE).apply { setOnClickListener { playNext() } }
-        npRepeatBtn = icon(R.drawable.ic_repeat, white55).apply { setOnClickListener { toggleRepeat() } }
+        val prevBtn = icon(R.drawable.ic_skip_prev, Color.WHITE).apply {
+            contentDescription = "Previous track"
+            setOnClickListener { playPrevious() }
+        }
+        npPlayButton = icon(R.drawable.ic_play, Color.WHITE).apply {
+            contentDescription = "Play"
+            setOnClickListener { togglePlayback() }
+        }
+        val nextBtn = icon(R.drawable.ic_skip_next, Color.WHITE).apply {
+            contentDescription = "Next track"
+            setOnClickListener { playNext() }
+        }
+        npRepeatBtn = icon(R.drawable.ic_repeat, white55).apply {
+            contentDescription = "Repeat"
+            setOnClickListener { toggleRepeat() }
+        }
         npRepeatDot = dotView()
         val repeatBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1536,12 +1798,15 @@ class MainActivity : Activity() {
         bottomLp.topMargin = dp(24)
         bottomRow.layoutParams = bottomLp
         val lyricsBtn = icon(R.drawable.ic_lyrics, white75).apply {
+            contentDescription = "Lyrics"
             setOnClickListener { Toast.makeText(this@MainActivity, "Lyrics: Not available yet", Toast.LENGTH_SHORT).show() }
         }
         val queueBtn = icon(R.drawable.ic_queue, white75).apply {
+            contentDescription = "Queue"
             setOnClickListener { showQueue() }
         }
         npDownloadBtn = icon(R.drawable.ic_download, white75).apply {
+            contentDescription = "Download"
             setOnClickListener { downloadCurrent() }
         }
         npDownloadProgress = ProgressBar(this).apply {
@@ -1549,10 +1814,18 @@ class MainActivity : Activity() {
             visibility = View.GONE
             indeterminateTintList = ColorStateList.valueOf(accent)
         }
+        // Sleep gets its own recognizable glyph (crescent moon) instead
+        // of living only inside the overflow menu.
+        val sleepBtn = icon(R.drawable.ic_sleep, white75).apply {
+            contentDescription = "Sleep timer"
+            setOnClickListener { showSleepMenu() }
+        }
         val shareBtn = icon(R.drawable.ic_share, white75).apply {
+            contentDescription = "Share"
             setOnClickListener { shareTrack(current) }
         }
         val moreBtn = icon(R.drawable.ic_more, white75).apply {
+            contentDescription = "More options"
             setOnClickListener { showNpMenu() }
         }
         bottomRow.addView(lyricsBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
@@ -1563,6 +1836,7 @@ class MainActivity : Activity() {
         downloadSlot.addView(npDownloadBtn, FrameLayout.LayoutParams(dp(32), dp(32), Gravity.CENTER))
         downloadSlot.addView(npDownloadProgress, FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER))
         bottomRow.addView(downloadSlot, LinearLayout.LayoutParams(0, dp(32), 1f))
+        bottomRow.addView(sleepBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
         bottomRow.addView(shareBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
         bottomRow.addView(moreBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
         inner.addView(bottomRow)
@@ -1585,6 +1859,10 @@ class MainActivity : Activity() {
             npVolume.progress = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
         } catch (_: Exception) {
         }
+        if (reduceMotion()) {
+            nowPlaying.translationY = 0f
+            return
+        }
         // Slide up from the mini player instead of a hard cut; the
         // transform is composited, so it stays smooth on mid-range GPUs.
         val h = nowPlaying.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
@@ -1594,6 +1872,11 @@ class MainActivity : Activity() {
     }
 
     private fun hideNowPlaying() {
+        if (reduceMotion()) {
+            nowPlaying.visibility = View.GONE
+            nowPlaying.translationY = 0f
+            return
+        }
         val h = nowPlaying.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
         nowPlaying.animate().translationY(h.toFloat()).setDuration(230)
             .setInterpolator(AccelerateInterpolator())
@@ -1667,6 +1950,7 @@ class MainActivity : Activity() {
         }
         current = track
         saveRecent(track)
+        clearPlaybackError()
         refreshPlaybackUi()
         val token = ++playToken
         // A downloaded copy always wins: instant start, works offline.
@@ -1677,28 +1961,140 @@ class MainActivity : Activity() {
         }
         if (track.source == SOURCE_YOUTUBE) {
             // Stop the previous track now; the direct stream URL is
-            // resolved on-device in the background, then handed to the
-            // same player path as every other source.
+            // resolved on-device in the background (Innertube primary,
+            // NewPipe fallback), then handed to the same player path
+            // as every other source. A failure PRINTS both resolvers'
+            // outcomes on Now Playing — no more generic silence.
             player?.release()
             player = null
+            refreshPlaybackUi()
+            val quality = effectiveQuality()
             executor.execute {
-                val url = try {
-                    YoutubeSource.resolveAudioUrl(track.id)
-                } catch (_: Exception) {
-                    null
-                }
+                val resolved = StreamResolver.resolveYoutube(track.id, quality)
                 runOnUiThread {
                     if (token != playToken) return@runOnUiThread
-                    if (url == null) {
-                        Toast.makeText(this@MainActivity, "This track could not be played.", Toast.LENGTH_SHORT).show()
+                    if (resolved.url == null) {
+                        // Active fallback (Audius is the standing
+                        // second source): try the same song on Audius
+                        // before declaring failure.
+                        tryAudiusFallback(track, resolved.report, token)
                     } else {
-                        startPlayback(url)
+                        startPlayback(resolved.url)
                     }
                 }
             }
         } else {
             startPlayback("https://api.audius.co/v1/tracks/${track.id}/stream?app_name=arzxsh")
         }
+    }
+
+    /** Lowercase alphanumeric form for cross-source song matching. */
+    private fun normalizeForMatch(s: String): String {
+        var x = s.lowercase()
+        x = x.replace(Regex("\\(.*?\\)|\\[.*?\\]"), " ")
+        x = x.replace(
+            Regex("\\b(official|video|audio|lyrics|lyric|hd|mv|music|topic|vevo)\\b"),
+            " "
+        )
+        x = x.replace(Regex("[^a-z0-9 ]"), " ")
+        return x.replace(Regex("\\s+"), " ").trim()
+    }
+
+    /**
+     * Conservative same-song test for the Audius fallback: only an
+     * obvious match qualifies — an exact normalized title, or a
+     * strongly containing title, in both cases backed by artist
+     * evidence (in the candidate's artist field or its title). A loose
+     * match is worse than an honest error, so near-misses lose.
+     */
+    private fun audiusMatchFor(yt: Track, candidates: List<Track>): Track? {
+        val ytTitle = normalizeForMatch(yt.title)
+        val ytArtist = normalizeForMatch(yt.artist)
+        if (ytTitle.isEmpty()) return null
+        var best: Track? = null
+        var bestScore = -1
+        for (c in candidates) {
+            val ct = normalizeForMatch(c.title)
+            if (ct.isEmpty()) continue
+            val ratio = minOf(ct.length, ytTitle.length).toDouble() /
+                maxOf(ct.length, ytTitle.length).coerceAtLeast(1)
+            val titleScore = when {
+                ct == ytTitle -> 3
+                (ct.contains(ytTitle) || ytTitle.contains(ct)) && ratio >= 0.7 -> 2
+                else -> 0
+            }
+            if (titleScore == 0) continue
+            val ca = normalizeForMatch(c.artist)
+            val artistHit = ytArtist.isNotEmpty() &&
+                ((ca.isNotEmpty() && (ca.contains(ytArtist) || ytArtist.contains(ca))) ||
+                    ct.contains(ytArtist))
+            val plausible = artistHit || (titleScore == 3 && ytArtist.isEmpty())
+            if (!plausible) continue
+            val score = titleScore * 10 + if (artistHit) 5 else 0
+            if (score > bestScore) {
+                bestScore = score
+                best = c
+            }
+        }
+        return best
+    }
+
+    /**
+     * When a YouTube track fails BOTH stream resolvers, search Audius
+     * for the same song; on a plausible match, swap it into the queue
+     * slot and play it, telling the user plainly. No match → the
+     * printed resolver report stands as the diagnosis.
+     */
+    private fun tryAudiusFallback(ytTrack: Track, report: String, token: Int) {
+        executor.execute {
+            var match: Track? = null
+            try {
+                val q = URLEncoder.encode(
+                    listOf(ytTrack.title, ytTrack.artist).filter { it.isNotBlank() }.joinToString(" "),
+                    "UTF-8"
+                )
+                val candidates = fetch("/tracks/search?query=$q&limit=10") ?: emptyList()
+                match = audiusMatchFor(ytTrack, candidates)
+            } catch (_: Throwable) {
+                match = null
+            }
+            val found = match
+            runOnUiThread {
+                if (token != playToken) return@runOnUiThread
+                if (found == null) {
+                    showPlaybackError("Couldn't play this track — $report")
+                    refreshPlaybackUi()
+                    Toast.makeText(this@MainActivity, "This track could not be played.", Toast.LENGTH_SHORT).show()
+                    return@runOnUiThread
+                }
+                val idx = queue.indexOfFirst { it.id == ytTrack.id && it.source == ytTrack.source }
+                if (idx >= 0) {
+                    val q2 = queue.toMutableList()
+                    q2[idx] = found
+                    queue = q2
+                }
+                pendingNpNotice = "YouTube failed — playing the Audius version."
+                Toast.makeText(
+                    this@MainActivity,
+                    "YouTube failed — playing the Audius version.",
+                    Toast.LENGTH_LONG
+                ).show()
+                play(found)
+            }
+        }
+    }
+
+    /** Prints a playback failure on Now Playing and keeps it there. */
+    private fun showPlaybackError(text: String) {
+        if (!::npError.isInitialized) return
+        npError.text = text
+        npError.visibility = View.VISIBLE
+    }
+
+    private fun clearPlaybackError() {
+        if (!::npError.isInitialized) return
+        npError.text = ""
+        npError.visibility = View.GONE
     }
 
     /** Shared player setup for every source: [stream] is a direct audio URL. */
@@ -1708,11 +2104,27 @@ class MainActivity : Activity() {
             setAudioAttributes(AudioAttributes.Builder().setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
             setDataSource(stream)
             setOnPreparedListener {
+                val notice = pendingNpNotice
+                if (notice != null) {
+                    pendingNpNotice = null
+                    showPlaybackError(notice)
+                } else {
+                    clearPlaybackError()
+                }
                 it.start()
                 refreshPlaybackUi()
             }
             setOnCompletionListener { handleCompletion() }
-            setOnErrorListener { _, _, _ ->
+            setOnErrorListener { _, what, extra ->
+                // The player rejected the stream: say WHAT failed, with
+                // the MediaPlayer codes, on Now Playing (and the toast).
+                val t = current
+                val src = when (t?.source) {
+                    SOURCE_YOUTUBE -> "YouTube stream"
+                    SOURCE_AUDIUS -> "Audius stream"
+                    else -> "stream"
+                }
+                showPlaybackError("Player error playing $src (what=$what, extra=$extra). The resolved URL was rejected.")
                 refreshPlaybackUi()
                 Toast.makeText(this@MainActivity, "This track could not be played.", Toast.LENGTH_SHORT).show()
                 true
@@ -1807,7 +2219,54 @@ class MainActivity : Activity() {
             play(queue[playOrder[0]])
             return
         }
+        // End of the queue: Autoplay continues with more like this
+        // (radio for YouTube, trending for Audius) when enabled.
+        if (autoplayOn()) {
+            continueAutoplay()
+            return
+        }
         refreshPlaybackUi()
+    }
+
+    /**
+     * Autoplay continuation at the end of a queue. YouTube queues grow
+     * a radio around the last track; Audius queues continue with
+     * trending tracks not already in the queue. Failures are announced
+     * and playback simply stops — nothing is faked.
+     */
+    private fun continueAutoplay() {
+        val t = current ?: return
+        val token = playToken
+        executor.execute {
+            var more: List<Track> = emptyList()
+            var err: String? = null
+            try {
+                more = if (t.source == SOURCE_YOUTUBE) {
+                    YtmApi.radio(t.id)
+                } else {
+                    fetch("/tracks/trending?limit=25")
+                        ?: throw RuntimeException("trending unavailable")
+                }
+            } catch (e: Throwable) {
+                err = shortErr(e)
+            }
+            runOnUiThread {
+                if (token != playToken) return@runOnUiThread
+                val existing = queue.map { "${it.source}_${it.id}" }.toHashSet()
+                val fresh = more.filterNot { "${it.source}_${it.id}" in existing }
+                if (err != null) {
+                    Toast.makeText(this@MainActivity, "Autoplay unavailable: $err", Toast.LENGTH_LONG).show()
+                    refreshPlaybackUi()
+                    return@runOnUiThread
+                }
+                if (fresh.isEmpty()) {
+                    refreshPlaybackUi()
+                    return@runOnUiThread
+                }
+                setQueue(queue + fresh)
+                play(fresh.first())
+            }
+        }
     }
 
     private fun playNext() {
@@ -1945,7 +2404,7 @@ class MainActivity : Activity() {
         } catch (_: IllegalStateException) {
         }
         // Small scale pop on the glyph swap (spec §13.4), transform-only.
-        if (::npPlayButton.isInitialized && nowPlaying.visibility == View.VISIBLE) {
+        if (!reduceMotion() && ::npPlayButton.isInitialized && nowPlaying.visibility == View.VISIBLE) {
             npPlayButton.animate().scaleX(0.88f).scaleY(0.88f).setDuration(70)
                 .withEndAction {
                     npPlayButton.animate().scaleX(1f).scaleY(1f).setDuration(140).start()
@@ -1965,34 +2424,77 @@ class MainActivity : Activity() {
         val t = current
         val playing = isPlayingSafe()
         miniPlayButton.setImageResource(if (playing) R.drawable.ic_pause else R.drawable.ic_play)
+        miniPlayButton.contentDescription = if (playing) "Pause" else "Play"
         if (::npPlayButton.isInitialized) {
             npPlayButton.setImageResource(if (playing) R.drawable.ic_pause else R.drawable.ic_play)
+            npPlayButton.contentDescription = if (playing) "Pause" else "Play"
         }
+        updateVisualizerState()
         refreshTransportStates()
         refreshDownloadButton()
         // Apple signature detail (spec §13.3): the artwork breathes —
         // slightly smaller while paused, full size while playing.
+        // Skipped entirely under Reduce motion.
         if (::npArtwork.isInitialized && playing != artWasPlaying) {
             artWasPlaying = playing
-            val s = if (playing) 1f else 0.92f
-            npArtwork.animate().scaleX(s).scaleY(s).setDuration(260)
-                .setInterpolator(DecelerateInterpolator()).start()
+            if (!reduceMotion()) {
+                val s = if (playing) 1f else 0.92f
+                npArtwork.animate().scaleX(s).scaleY(s).setDuration(260)
+                    .setInterpolator(DecelerateInterpolator()).start()
+            }
         }
         if (t == null) return
         miniTitle.text = t.title
         miniArtist.text = t.artist
-        ArtworkLoader.load(t.artworkSmall ?: t.artworkLarge, miniArtwork)
+        // Small first, large as the fallback: a failed small thumbnail
+        // must not leave the mini player artwork blank (v4 bug).
+        ArtworkLoader.load(t.artworkSmall, miniArtwork, t.artworkLarge)
         if (::npTitle.isInitialized) {
             npTitle.text = t.title
             npArtist.text = t.artist
-            ArtworkLoader.load(t.artworkLarge ?: t.artworkSmall, npArtwork)
-            ArtworkLoader.loadBlurred(t.artworkLarge ?: t.artworkSmall, npBackdrop)
+            val big = largeArt(t)
+            ArtworkLoader.load(big, npArtwork, t.artworkSmall)
+            ArtworkLoader.loadBlurred(big, npBackdrop)
             updateHeart()
             npSeek.progress = 0
             npElapsed.text = "0:00"
             npRemaining.text = "-" + fmt(t.duration * 1000)
         }
     }
+
+    /**
+     * The mini player's equalizer has ONE source of truth: it shows
+     * only when the Visualizer setting is on AND audio is actually
+     * playing. (v4 drove it from the setting alone, so the bars
+     * "played" next to a pause-state play button.)
+     */
+    private fun updateVisualizerState() {
+        if (!::visualizerView.isInitialized) return
+        val on = getPreferences(MODE_PRIVATE).getBoolean("setting_Visualizer", true)
+        visualizerView.visibility = if (on && isPlayingSafe()) View.VISIBLE else View.GONE
+    }
+
+    // ------------------------------------------------------------ user settings (single read points)
+
+    private fun streamQuality(): String =
+        getPreferences(MODE_PRIVATE).getString("stream_quality", "normal") ?: "normal"
+
+    private fun dataSaverOn(): Boolean =
+        getPreferences(MODE_PRIVATE).getBoolean("setting_Data saver", false)
+
+    /** The quality the resolver actually uses: Data saver wins. */
+    private fun effectiveQuality(): String = if (dataSaverOn()) "data" else streamQuality()
+
+    private fun autoplayOn(): Boolean =
+        getPreferences(MODE_PRIVATE).getBoolean("setting_Autoplay", true)
+
+    private fun reduceMotion(): Boolean =
+        getPreferences(MODE_PRIVATE).getBoolean("setting_Reduce motion", false)
+
+    /** Artwork URL for large surfaces; Data saver downgrades to the
+     *  small rendition instead of prefetching full-size art. */
+    private fun largeArt(t: Track): String? =
+        if (dataSaverOn()) t.artworkSmall ?: t.artworkLarge else t.artworkLarge ?: t.artworkSmall
 
     // ---------------------------------------------------------------- menus, queue screen, sleep timer, downloads
 
@@ -2052,6 +2554,11 @@ class MainActivity : Activity() {
             menuList.addView(row)
         }
         menuOverlay.visibility = View.VISIBLE
+        if (reduceMotion()) {
+            menuOverlay.alpha = 1f
+            menuPanel.translationY = 0f
+            return
+        }
         menuOverlay.alpha = 0f
         menuOverlay.animate().alpha(1f).setDuration(150).start()
         menuPanel.translationY = dp(28).toFloat()
@@ -2258,10 +2765,11 @@ class MainActivity : Activity() {
         if (!downloading.add(Downloads.key(track))) return
         refreshDownloadButton()
         Toast.makeText(this, "Downloading ${track.title}…", Toast.LENGTH_SHORT).show()
+        val quality = effectiveQuality()
         executor.execute {
             var err: String? = null
             try {
-                Downloads.downloadSync(this@MainActivity, track)
+                Downloads.downloadSync(this@MainActivity, track, quality)
             } catch (e: Throwable) {
                 err = shortErr(e)
             }
@@ -2461,7 +2969,7 @@ class MainActivity : Activity() {
             ellipsize = TextUtils.TruncateAt.END
         })
         row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
-        if (isCurrent) row.addView(visualizer())
+        if (isCurrent && isPlayingSafe()) row.addView(visualizer())
         return row
     }
 
@@ -2509,7 +3017,7 @@ class MainActivity : Activity() {
 
     // ---------------------------------------------------------------- helpers kept from the original UI
 
-    private fun setting(name: String, default: Boolean): Switch {
+    private fun setting(name: String, default: Boolean, onChange: ((Boolean) -> Unit)? = null): Switch {
         val key = "setting_$name"
         return Switch(this).apply {
             text = name
@@ -2522,14 +3030,15 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, checked ->
                 getPreferences(MODE_PRIVATE).edit().putBoolean(key, checked).apply()
                 if (name == "Visualizer") {
-                    visualizerView.visibility = if (checked) View.VISIBLE else View.GONE
+                    updateVisualizerState()
                 }
                 if (name == "Compact mini-player") {
                     val lp = mini.layoutParams as LinearLayout.LayoutParams
                     lp.height = dp(if (checked) 48 else 58)
                     mini.layoutParams = lp
-                    bottomBar.post { fitContentPadding() }
+                    // The layout listener re-fits the content inset.
                 }
+                onChange?.invoke(checked)
             }
         }
     }
@@ -2580,7 +3089,18 @@ class MainActivity : Activity() {
         content.removeAllViews()
         val head = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.TOP
+            gravity = Gravity.CENTER_VERTICAL
+            // The avatar must never be cut by the row's bounds (below).
+            clipChildren = false
+            if (showAvatar) {
+                // Root cause of the clipped avatar (v4 screenshots):
+                // the row's height was driven by the TITLE's text
+                // metrics — at smaller font scales the 32sp title
+                // measures ~31dp, less than the avatar's 34dp + margin
+                // footprint — and the row clipped the circle's bottom.
+                // The row now guarantees room for the full circle.
+                minimumHeight = dp(44)
+            }
         }
         head.addView(label(title, 32f, Color.WHITE, boldTf).apply {
             letterSpacing = -0.01f
@@ -2593,14 +3113,21 @@ class MainActivity : Activity() {
                     intArrayOf(accent, purple)
                 ).apply { shape = GradientDrawable.OVAL }
             }
+            // No top margin (vertical centering handles placement);
+            // the end side keeps the content's standard 22dp inset via
+            // the content padding, aligned with every other row.
             val aLp = LinearLayout.LayoutParams(dp(34), dp(34))
-            aLp.topMargin = dp(4)
+            aLp.marginStart = dp(10)
             head.addView(avatar, aLp)
         }
         content.addView(head)
         // Cheap 150ms fade so tab switches don't hard-cut.
-        content.alpha = 0f
-        content.animate().alpha(1f).setDuration(150).start()
+        if (reduceMotion()) {
+            content.alpha = 1f
+        } else {
+            content.alpha = 0f
+            content.animate().alpha(1f).setDuration(150).start()
+        }
     }
 
     private fun sectionTitle(text: String): TextView {
