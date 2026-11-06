@@ -521,14 +521,18 @@ class MainActivity : Activity() {
         beginScreen("Listen Now", showAvatar = true)
         val loading = label("Loading…", 16f, white50)
         content.addView(loading)
+        val mode = sourceMode()
         executor.execute {
             val audius = fetch("/tracks/trending?limit=25")
             var charts: YtmCharts? = null
             var chartsErr: String? = null
-            try {
-                charts = YtmApi.charts()
-            } catch (t: Throwable) {
-                chartsErr = shortErr(t)
+            // Audius mode fires no YouTube calls at all.
+            if (mode != "audius") {
+                try {
+                    charts = YtmApi.charts()
+                } catch (t: Throwable) {
+                    chartsErr = shortErr(t)
+                }
             }
             runOnUiThread {
                 if (gen != generation) return@runOnUiThread
@@ -540,7 +544,11 @@ class MainActivity : Activity() {
                 }
                 // Featured prefers YouTube Music (the primary source);
                 // Audius headlines only when charts are unavailable.
-                val featured = charts?.songs?.firstOrNull() ?: audius?.firstOrNull()
+                val featured = if (mode == "audius") {
+            audius?.firstOrNull() ?: charts?.songs?.firstOrNull()
+        } else {
+            charts?.songs?.firstOrNull() ?: audius?.firstOrNull()
+        }
                 if (featured != null) {
                     val context = if (featured.source == SOURCE_YOUTUBE) {
                         charts?.songs ?: listOf(featured)
@@ -576,7 +584,12 @@ class MainActivity : Activity() {
                     content.addView(artistCircleRow(charts.artists.take(10)))
                     any = true
                 }
-                if (audius != null && audius.size > 1) {
+                // In YouTube Music mode the Audius section is the
+                // fallback: it appears only when the charts failed
+                // or came back empty. Audius/Both modes always show it.
+                val showAudiusSection = mode != "youtube" ||
+                    charts == null || charts.songs.isEmpty()
+                if (showAudiusSection && audius != null && audius.size > 1) {
                     content.addView(sectionTitle("Trending on Audius"))
                     val rest = audius.drop(1).take(12)
                     addRows(rest, withHairlines = true, queueContext = rest)
@@ -651,6 +664,7 @@ class MainActivity : Activity() {
             resultsBox.visibility = View.VISIBLE
             resultsBox.removeAllViews()
             resultsBox.addView(label("Searching catalogs…", 14f, white50))
+            val mode = sourceMode()
             executor.execute {
                 val audius = fetch("/tracks/search?query=${URLEncoder.encode(q, "UTF-8")}&limit=25")
                 // Every YouTube call is separately guarded and its
@@ -659,7 +673,8 @@ class MainActivity : Activity() {
                 var ytSongs: List<Track> = emptyList()
                 var ytNote: String? = null
                 var ytErr: String? = null
-                try {
+                // Audius mode fires NO YouTube calls at all.
+                if (mode != "audius") try {
                     val r = YoutubeSource.searchSongs(q)
                     ytSongs = r.tracks
                     ytNote = r.note
@@ -668,14 +683,14 @@ class MainActivity : Activity() {
                 }
                 var ytArtists: List<YtmArtistRef> = emptyList()
                 var ytArtistsErr: String? = null
-                try {
+                if (mode != "audius") try {
                     ytArtists = YtmApi.searchArtists(q)
                 } catch (t: Throwable) {
                     ytArtistsErr = shortErr(t)
                 }
                 var ytAlbums: List<YtmAlbumRef> = emptyList()
                 var ytAlbumsErr: String? = null
-                try {
+                if (mode != "audius") try {
                     ytAlbums = YtmApi.searchAlbums(q)
                 } catch (t: Throwable) {
                     ytAlbumsErr = shortErr(t)
@@ -684,9 +699,22 @@ class MainActivity : Activity() {
                 // the primary source now), Audius after — both fully
                 // present and playable, and next/previous playback
                 // flows across sources.
+                // Composition follows the source mode: YouTube
+                // Music leads; Audius-only in Audius mode; in
+                // YouTube mode Audius appears only as the fallback
+                // when YouTube songs failed or came back empty.
                 val found = mutableListOf<Track>()
-                found.addAll(ytSongs)
-                audius?.let { found.addAll(it) }
+                when (mode) {
+                    "audius" -> audius?.let { found.addAll(it) }
+                    "youtube" -> {
+                        if (ytSongs.isNotEmpty()) found.addAll(ytSongs)
+                        else audius?.let { found.addAll(it) }
+                    }
+                    else -> {
+                        found.addAll(ytSongs)
+                        audius?.let { found.addAll(it) }
+                    }
+                }
                 runOnUiThread {
                     if (gen != generation) return@runOnUiThread
                     resultsBox.removeAllViews()
@@ -725,15 +753,19 @@ class MainActivity : Activity() {
                     if (errors.isNotEmpty()) {
                         resultsBox.addView(errorLine("YouTube unavailable: " + errors.joinToString(" · ")))
                     }
-                    if (ytErr != null && !audius.isNullOrEmpty()) {
+                    if (mode == "youtube" && ytSongs.isEmpty() && !audius.isNullOrEmpty()) {
                         // Search-level fallback, stated on screen:
-                        // YouTube failed, Audius is carrying the search.
+                        // YouTube failed or came back empty, so
+                        // Audius is carrying this search.
                         resultsBox.addView(statusLine("YouTube songs unavailable — showing Audius results instead."))
+                    }
+                    if (mode == "audius") {
+                        resultsBox.addView(statusLine("Source: Audius only — YouTube Music is off."))
                     }
                     if (ytNote != null) {
                         resultsBox.addView(statusLine("YouTube: $ytNote"))
                     }
-                    if (errors.isEmpty() && ytNote == null) {
+                    if (mode != "audius" && errors.isEmpty() && ytNote == null) {
                         resultsBox.addView(
                             statusLine(
                                 "YouTube Music: ${ytSongs.size} songs · ${ytArtists.size} artists · ${ytAlbums.size} albums"
@@ -774,6 +806,54 @@ class MainActivity : Activity() {
             }
         }
         field.addView(input, LinearLayout.LayoutParams(0, -1, 1f))
+
+        // Source selector: the same three states as Settings →
+        // Music source, two-way synced through the one preference.
+        // Glass pill track, accent fill on the active segment.
+        val segRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = glassBg(999f, Color.argb(28, 255, 255, 255), Color.argb(20, 255, 255, 255))
+            setPadding(dp(3), dp(3), dp(3), dp(3))
+        }
+        val segLp = LinearLayout.LayoutParams(-1, dp(40))
+        segLp.topMargin = dp(12)
+        segRow.layoutParams = segLp
+        val segViews = ArrayList<Pair<String, TextView>>()
+        fun renderSegs() {
+            val active = sourceMode()
+            segViews.forEach { (mode, tv) ->
+                val selected = mode == active
+                tv.background = if (selected) {
+                    GradientDrawable().apply {
+                        setColor(accent)
+                        cornerRadius = dp(999).toFloat()
+                    }
+                } else null
+                tv.setTextColor(if (selected) Color.WHITE else white55)
+            }
+        }
+        listOf(
+            "youtube" to "YouTube Music",
+            "audius" to "Audius",
+            "both" to "Both"
+        ).forEach { (mode, name) ->
+            val tv = label(name, 13f, white55, mediumTf).apply {
+                gravity = Gravity.CENTER
+                isClickable = true
+                setOnClickListener {
+                    if (sourceMode() != mode) {
+                        setSourceMode(mode)
+                        renderSegs()
+                        val q = input.text?.toString().orEmpty()
+                        if (q.isNotBlank()) runSearch(q)
+                    }
+                }
+            }
+            segRow.addView(tv, LinearLayout.LayoutParams(0, -1, 1f))
+            segViews += mode to tv
+        }
+        renderSegs()
+        content.addView(segRow)
         content.addView(field)
 
         resultsBox = LinearLayout(this).apply {
@@ -1011,6 +1091,21 @@ class MainActivity : Activity() {
         beginScreen("Settings", showAvatar = false)
 
         content.addView(settingsGroupHeader("Playback"))
+        content.addView(
+            settingsRow(
+                "Music source",
+                sourceModeName(sourceMode()) + " · search, home and playback follow this"
+            ) {
+                showMenu(
+                    "Music source",
+                    listOf(
+                        "YouTube Music" to { setSourceMode("youtube"); showSettings() },
+                        "Audius" to { setSourceMode("audius"); showSettings() },
+                        "Both" to { setSourceMode("both"); showSettings() }
+                    )
+                )
+            }
+        )
         val qualityName = when (streamQuality()) {
             "data" -> "Data saver"
             "high" -> "High"
@@ -1976,8 +2071,20 @@ class MainActivity : Activity() {
                     if (resolved.url == null) {
                         // Active fallback (Audius is the standing
                         // second source): try the same song on Audius
-                        // before declaring failure.
-                        tryAudiusFallback(track, resolved.report, token)
+                        // before declaring failure. Applies in
+                        // YouTube Music and Both modes only; in Audius
+                        // mode the printed resolver report stands.
+                        if (sourceMode() != "audius") {
+                            tryAudiusFallback(track, resolved.report, token)
+                        } else {
+                            showPlaybackError("Couldn't play this track — ${resolved.report}")
+                            refreshPlaybackUi()
+                            Toast.makeText(
+                                this@MainActivity,
+                                "This track could not be played.",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
                     } else {
                         startPlayback(resolved.url)
                     }
@@ -2475,6 +2582,26 @@ class MainActivity : Activity() {
     }
 
     // ------------------------------------------------------------ user settings (single read points)
+
+    /**
+     * Active music source: "youtube" (primary, Audius only as the
+     * automatic fallback), "audius" (Audius only — no YouTube calls
+     * at all), or "both" (merged, YouTube first). Set from Settings
+     * or the Search screen's segmented control; both stay in sync
+     * because both read/write this one preference.
+     */
+    private fun sourceMode(): String =
+        getPreferences(MODE_PRIVATE).getString("source_mode", "youtube") ?: "youtube"
+
+    private fun setSourceMode(mode: String) {
+        getPreferences(MODE_PRIVATE).edit().putString("source_mode", mode).apply()
+    }
+
+    private fun sourceModeName(mode: String): String = when (mode) {
+        "audius" -> "Audius"
+        "both" -> "Both"
+        else -> "YouTube Music"
+    }
 
     private fun streamQuality(): String =
         getPreferences(MODE_PRIVATE).getString("stream_quality", "normal") ?: "normal"
