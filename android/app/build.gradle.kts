@@ -66,4 +66,7 @@ kotlin {
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
+    // On-device YouTube Music search + stream extraction (no backend).
+    // GPL-3.0, fine for this personal build.
+    implementation("com.github.teamnewpipe:NewPipeExtractor:v0.26.5")
 }
