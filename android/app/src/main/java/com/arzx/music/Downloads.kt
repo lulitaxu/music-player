@@ -10,9 +10,10 @@ import java.net.URL
 /**
  * Offline download store: audio files in the app's private files dir
  * plus a small JSON index in SharedPreferences. Works for both sources —
- * Audius via its stream URL, YouTube via the on-device resolved stream
- * URL ([YoutubeSource.resolveAudioUrl]). Downloaded files are an in-app
- * offline cache only; nothing is exported to shared storage.
+ * Audius via its stream URL, YouTube via the shared on-device resolver
+ * ([StreamResolver], the same chain playback uses). Downloaded files
+ * are an in-app offline cache only; nothing is exported to shared
+ * storage.
  * All functions do disk/network work: background thread only, except
  * [entries]/[localFile]/[isDownloaded] which are cheap index reads.
  */
@@ -63,11 +64,22 @@ object Downloads {
 
     fun isDownloaded(ctx: Context, track: Track): Boolean = localFile(ctx, track) != null
 
+    /** Total bytes the download store currently occupies on disk. */
+    fun storageBytes(ctx: Context): Long =
+        entries(ctx).sumOf { File(dir(ctx), it.fileName).length() }
+
+    /** Deletes every downloaded file and clears the index. */
+    fun removeAll(ctx: Context) {
+        entries(ctx).forEach { File(dir(ctx), it.fileName).delete() }
+        dir(ctx).listFiles()?.forEach { if (it.name.endsWith(".part")) it.delete() }
+        writeAll(ctx, emptyList())
+    }
+
     /** Downloads the track's audio into the store. Throws on failure. */
-    fun downloadSync(ctx: Context, track: Track): Entry {
+    fun downloadSync(ctx: Context, track: Track, quality: String = "normal"): Entry {
         val url = if (track.source == SOURCE_YOUTUBE) {
-            YoutubeSource.resolveAudioUrl(track.id)
-                ?: throw RuntimeException("no playable stream exposed")
+            val resolved = StreamResolver.resolveYoutube(track.id, quality)
+            resolved.url ?: throw RuntimeException("stream resolution failed: ${resolved.report}")
         } else {
             "https://api.audius.co/v1/tracks/${track.id}/stream?app_name=arzxsh"
         }
