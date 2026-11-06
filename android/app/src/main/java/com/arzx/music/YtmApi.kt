@@ -693,6 +693,191 @@ object YtmApi {
         return YtmCharts(songs, artists)
     }
 
+    // ------------------------------------------------------------ stream resolution
+
+    /** Outcome of one Innertube stream resolution: a direct audio URL
+     *  when one was exposed, plus a per-client report either way. The
+     *  report is user-visible diagnostics, not a log line. */
+    data class YtmStreamResult(val url: String?, val report: String)
+
+    private class PlayerClient(
+        val label: String,
+        val clientName: String,
+        val version: String,
+        val key: String,
+        val nameHeader: String,
+        val ua: String,
+        val extra: Map<String, Any>
+    )
+
+    // Embedded public client identities, the same ones yt-dlp and
+    // ytmusicapi ship in their public source; not user credentials.
+    // Order matters: ANDROID_MUSIC and IOS are the contexts most
+    // likely to return direct (non-ciphered) audio format URLs.
+    private val PLAYER_CLIENTS = listOf(
+        PlayerClient(
+            "ANDROID_MUSIC", "ANDROID_MUSIC", "5.27.51",
+            "AIzaSyAOghZGza2MQSZkY_zfZ370N-PUdXEo8kM", "21",
+            "com.google.android.apps.youtube.music/5.27.51 (Linux; U; Android 11) gzip",
+            mapOf("androidSdkVersion" to 30)
+        ),
+        PlayerClient(
+            "IOS", "IOS", "19.29.1",
+            "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc", "5",
+            "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)",
+            mapOf(
+                "deviceModel" to "iPhone16,2",
+                "osName" to "iPhone",
+                "osVersion" to "17.5.1.21F90"
+            )
+        ),
+        PlayerClient(
+            "ANDROID", "ANDROID", "19.29.37",
+            "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w", "3",
+            "com.google.android.youtube/19.29.37 (Linux; U; Android 11) gzip",
+            mapOf("androidSdkVersion" to 30)
+        )
+    )
+
+    private fun shortErr(t: Throwable): String {
+        val msg = t.message?.replace('\n', ' ')?.trim().orEmpty()
+        val cls = t.javaClass.simpleName
+        return if (msg.isEmpty()) cls else "$cls: ${msg.take(120)}"
+    }
+
+    /** One POST to youtubei/v1/player for an embedded client. */
+    private fun postPlayer(client: PlayerClient, videoId: String): JSONObject {
+        val clientJson = JSONObject()
+            .put("clientName", client.clientName)
+            .put("clientVersion", client.version)
+            .put("hl", "en")
+            .put("gl", "US")
+        client.extra.forEach { (k, v) -> clientJson.put(k, v) }
+        val body = JSONObject()
+            .put("context", JSONObject().put("client", clientJson))
+            .put("videoId", videoId)
+            .put(
+                "playbackContext", JSONObject().put(
+                    "contentPlaybackContext", JSONObject()
+                        .put("vis", 0)
+                        .put("splay", false)
+                        .put("lactMilliseconds", "-1")
+                )
+            )
+            .put("racyCheckOk", true)
+            .put("contentCheckOk", true)
+        val conn = (URL("https://youtubei.googleapis.com/youtubei/v1/player?key=${client.key}&alt=json")
+            .openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = 15_000
+            readTimeout = 15_000
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("User-Agent", client.ua)
+            setRequestProperty("X-YouTube-Client-Name", client.nameHeader)
+            setRequestProperty("X-YouTube-Client-Version", client.version)
+            visitorId()?.let { setRequestProperty("X-Goog-Visitor-Id", it) }
+            setRequestProperty("Accept-Encoding", "gzip")
+        }
+        conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val text = stream?.let { readBody(conn, it) } ?: ""
+        if (code !in 200..299) throw RuntimeException("player HTTP $code")
+        return JSONObject(text)
+    }
+
+    private class StreamCandidate(val bitrate: Int, val url: String, val progressive: Boolean)
+
+    /**
+     * Picks a DIRECT audio stream URL out of a player response.
+     * Returns (url, note): url null means this client exposed nothing
+     * directly playable, and the note says why (not playable, or every
+     * audio format was signature-ciphered — reported, never forged).
+     * DASH/HLS manifest URLs are never selected: the app hands the URL
+     * straight to MediaPlayer.
+     */
+    private fun pickStream(resp: JSONObject, quality: String): Pair<String?, String> {
+        val status = resp.optJSONObject("playabilityStatus")
+        val st = status?.optString("status")?.takeIf { it.isNotEmpty() } ?: "NO_STATUS"
+        if (st != "OK") {
+            val reason = status?.optString("reason")?.takeIf { it.isNotEmpty() }
+            return null to if (reason != null) "$st ($reason)" else st
+        }
+        val sd = resp.optJSONObject("streamingData") ?: return null to "no streamingData"
+        val candidates = ArrayList<StreamCandidate>()
+        var ciphered = 0
+        fun scan(arr: JSONArray?, progressive: Boolean) {
+            if (arr == null) return
+            for (i in 0 until arr.length()) {
+                val f = arr.optJSONObject(i) ?: continue
+                val mime = f.optString("mimeType")
+                if (!progressive && !mime.startsWith("audio/")) continue
+                val url = f.optString("url").takeIf { it.isNotEmpty() }
+                if (url != null) {
+                    candidates.add(StreamCandidate(f.optInt("bitrate"), url, progressive))
+                } else if (f.has("signatureCipher") || f.has("cipher")) {
+                    ciphered++
+                }
+            }
+        }
+        scan(sd.optJSONArray("adaptiveFormats"), progressive = false)
+        if (candidates.isEmpty()) {
+            // Progressive (muxed) formats as a backup: still a plain
+            // file URL MediaPlayer can play, just not audio-only.
+            scan(sd.optJSONArray("formats"), progressive = true)
+        }
+        if (candidates.isEmpty()) {
+            return null to if (ciphered > 0) {
+                "ciphered-only ($ciphered formats, no direct URL)"
+            } else {
+                "no playable formats exposed"
+            }
+        }
+        val audioOnly = candidates.filter { !it.progressive }
+        val pool = if (audioOnly.isNotEmpty()) audioOnly else candidates
+        val picked = when (quality) {
+            "data" -> pool.minByOrNull { it.bitrate }
+            "normal" -> pool.filter { it.bitrate <= 160_000 }.maxByOrNull { it.bitrate }
+                ?: pool.minByOrNull { it.bitrate }
+            else -> pool.maxByOrNull { it.bitrate }
+        } ?: return null to "no playable formats exposed"
+        return picked.url to "OK"
+    }
+
+    /**
+     * Resolves a direct audio stream URL for [videoId] through the
+     * Innertube player endpoint, walking the client-context chain.
+     * [quality] is "data" (lowest bitrate), "normal" (best ≤160kbps)
+     * or "high" (best available). Stops at the first client that
+     * exposes a direct URL; the report names every attempt otherwise.
+     */
+    fun resolveStream(videoId: String, quality: String = "normal"): YtmStreamResult {
+        val attempts = ArrayList<String>()
+        for (client in PLAYER_CLIENTS) {
+            try {
+                val (url, note) = pickStream(postPlayer(client, videoId), quality)
+                if (url != null) return YtmStreamResult(url, "${client.label} OK")
+                attempts += "${client.label}: $note"
+            } catch (t: Throwable) {
+                attempts += "${client.label}: ${shortErr(t)}"
+            }
+        }
+        // Last resort: the WEB_REMIX context the catalog calls use.
+        try {
+            val body = JSONObject()
+                .put("videoId", videoId)
+                .put("racyCheckOk", true)
+                .put("contentCheckOk", true)
+            val (url, note) = pickStream(post("player", body), quality)
+            if (url != null) return YtmStreamResult(url, "WEB_REMIX OK")
+            attempts += "WEB_REMIX: $note"
+        } catch (t: Throwable) {
+            attempts += "WEB_REMIX: ${shortErr(t)}"
+        }
+        return YtmStreamResult(null, attempts.joinToString(" · "))
+    }
+
     // ------------------------------------------------------------ radio
 
     /**
