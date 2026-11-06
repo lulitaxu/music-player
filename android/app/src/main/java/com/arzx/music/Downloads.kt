@@ -20,6 +20,22 @@ import java.net.URL
 object Downloads {
     data class Entry(val track: Track, val fileName: String)
 
+    /**
+     * Vault state for a track that is NOT (yet) fully downloaded.
+     * Downloaded-ness itself is derived from the file index — a
+     * state row only exists for queued / downloading / paused /
+     * failed tracks, so it can never claim "downloaded" falsely.
+     */
+    data class Status(val state: String, val progress: Int, val error: String?)
+
+    const val ST_QUEUED = "queued"
+    const val ST_DOWNLOADING = "downloading"
+    const val ST_PAUSED = "paused"
+    const val ST_FAILED = "failed"
+
+    /** Thrown by [downloadSync] when the caller's stop flag fires. */
+    class StoppedException : RuntimeException("stopped")
+
     private const val PREFS = "arzxsh_downloads"
 
     @Volatile
@@ -72,16 +88,36 @@ object Downloads {
     fun removeAll(ctx: Context) {
         entries(ctx).forEach { File(dir(ctx), it.fileName).delete() }
         dir(ctx).listFiles()?.forEach { if (it.name.endsWith(".part")) it.delete() }
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .remove("states").remove("state_tracks").apply()
         writeAll(ctx, emptyList())
     }
 
-    /** Downloads the track's audio into the store. Throws on failure. */
-    fun downloadSync(ctx: Context, track: Track, quality: String = "normal"): Entry {
-        val url = if (track.source == SOURCE_YOUTUBE) {
-            val resolved = StreamResolver.resolveYoutube(track.id, quality)
-            resolved.url ?: throw RuntimeException("stream resolution failed: ${resolved.report}")
-        } else {
-            "https://api.audius.co/v1/tracks/${track.id}/stream?app_name=arzxsh"
+    /**
+     * Downloads the track's audio into the store. Throws on failure.
+     * [onProgress] receives 0–100 when the server reports a length
+     * (invoked sparsely, on percent steps). [shouldContinue] is
+     * polled during the transfer; returning false aborts with
+     * [StoppedException] and removes the partial file (a paused
+     * download restarts from zero on resume — the state label says
+     * "Paused", it never pretends a resume offset exists).
+     * Local tracks are their own file already and cannot be
+     * "downloaded" — asking throws, honestly.
+     */
+    fun downloadSync(
+        ctx: Context,
+        track: Track,
+        quality: String = "normal",
+        shouldContinue: () -> Boolean = { true },
+        onProgress: (Int) -> Unit = {}
+    ): Entry {
+        val url = when (track.source) {
+            SOURCE_YOUTUBE -> {
+                val resolved = StreamResolver.resolveYoutube(track.id, quality)
+                resolved.url ?: throw RuntimeException("stream resolution failed: ${resolved.report}")
+            }
+            SOURCE_LOCAL -> throw RuntimeException("already on this device")
+            else -> "https://api.audius.co/v1/tracks/${track.id}/stream?app_name=arzxsh"
         }
         val ext = url.substringBefore("?").substringAfterLast('.', "").lowercase()
             .takeIf { it in setOf("m4a", "mp3", "opus", "webm", "aac", "ogg") } ?: "m4a"
@@ -94,8 +130,27 @@ object Downloads {
         }
         try {
             if (conn.responseCode !in 200..299) throw RuntimeException("HTTP ${conn.responseCode}")
+            val total = conn.contentLengthLong
             conn.inputStream.use { input ->
-                tmp.outputStream().use { out -> input.copyTo(out) }
+                tmp.outputStream().use { out ->
+                    val buf = ByteArray(64 * 1024)
+                    var read = 0L
+                    var lastPct = -1
+                    while (true) {
+                        if (!shouldContinue()) throw StoppedException()
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        out.write(buf, 0, n)
+                        read += n
+                        if (total > 0) {
+                            val pct = (read * 100 / total).toInt().coerceIn(0, 99)
+                            if (pct != lastPct) {
+                                lastPct = pct
+                                onProgress(pct)
+                            }
+                        }
+                    }
+                }
             }
         } catch (t: Throwable) {
             tmp.delete()
@@ -105,6 +160,7 @@ object Downloads {
             tmp.delete()
             throw RuntimeException("empty download")
         }
+        onProgress(100)
         val dest = File(dir(ctx), fileName)
         if (!tmp.renameTo(dest)) {
             tmp.copyTo(dest, overwrite = true)
@@ -112,6 +168,7 @@ object Downloads {
         }
         val entry = Entry(track, fileName)
         writeAll(ctx, entries(ctx).filter { key(it.track) != key(track) } + entry)
+        clearStatus(ctx, key(track))
         return entry
     }
 
@@ -119,7 +176,134 @@ object Downloads {
         val all = entries(ctx)
         val entry = all.firstOrNull { key(it.track) == key(track) } ?: return
         File(dir(ctx), entry.fileName).delete()
+        clearStatus(ctx, key(track))
         writeAll(ctx, all.filter { key(it.track) != key(track) })
+    }
+
+    // ------------------------------------------------------------ vault states
+
+    private fun statusMap(ctx: Context): LinkedHashMap<String, Status> {
+        val out = LinkedHashMap<String, Status>()
+        val raw = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString("states", null) ?: return out
+        try {
+            val o = JSONObject(raw)
+            val keys = o.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val s = o.getJSONObject(k)
+                out[k] = Status(
+                    s.getString("state"),
+                    s.optInt("progress"),
+                    s.optString("error", null)?.takeIf { it.isNotEmpty() }
+                )
+            }
+        } catch (_: Exception) {
+        }
+        return out
+    }
+
+    /** Track metadata for state rows, so the Downloads tab can
+     *  render a failed/paused track without the file index. */
+    private fun statusTrackMap(ctx: Context): Map<String, Track> {
+        val raw = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString("state_tracks", null) ?: return emptyMap()
+        return try {
+            val o = JSONObject(raw)
+            val out = HashMap<String, Track>()
+            val keys = o.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                trackFromJson(o.getJSONObject(k))?.let { out[k] = it }
+            }
+            out
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    fun setStatus(ctx: Context, track: Track, state: String, progress: Int = 0, error: String? = null) {
+        val map = statusMap(ctx)
+        map[key(track)] = Status(state, progress, error)
+        val tracks = statusTrackMap(ctx).toMutableMap()
+        tracks[key(track)] = track
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val o = JSONObject()
+        map.forEach { (k, s) ->
+            o.put(k, JSONObject().apply {
+                put("state", s.state)
+                put("progress", s.progress)
+                put("error", s.error ?: JSONObject.NULL)
+            })
+        }
+        val to = JSONObject()
+        tracks.forEach { (k, t) -> to.put(k, trackToJson(t)) }
+        prefs.edit()
+            .putString("states", o.toString())
+            .putString("state_tracks", to.toString())
+            .apply()
+    }
+
+    fun clearStatus(ctx: Context, key: String) {
+        val map = statusMap(ctx)
+        if (map.remove(key) == null) return
+        val tracks = statusTrackMap(ctx).toMutableMap()
+        tracks.remove(key)
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val o = JSONObject()
+        map.forEach { (k, s) ->
+            o.put(k, JSONObject().apply {
+                put("state", s.state)
+                put("progress", s.progress)
+                put("error", s.error ?: JSONObject.NULL)
+            })
+        }
+        val to = JSONObject()
+        tracks.forEach { (k, t) -> to.put(k, trackToJson(t)) }
+        prefs.edit()
+            .putString("states", o.toString())
+            .putString("state_tracks", to.toString())
+            .apply()
+    }
+
+    /** Status for a track not in the downloaded index, else null. */
+    fun statusOf(ctx: Context, track: Track): Status? =
+        statusMap(ctx)[key(track)]
+
+    /** All non-downloaded vault rows: (track, status), failed first. */
+    fun pendingRows(ctx: Context): List<Pair<Track, Status>> {
+        val tracks = statusTrackMap(ctx)
+        val downloaded = entries(ctx).map { key(it.track) }.toHashSet()
+        return statusMap(ctx).entries
+            .filter { it.key !in downloaded }
+            .mapNotNull { (k, s) -> tracks[k]?.let { it to s } }
+            .sortedBy {
+                when (it.second.state) {
+                    ST_FAILED -> 0
+                    ST_DOWNLOADING -> 1
+                    ST_QUEUED -> 2
+                    else -> 3
+                }
+            }
+    }
+
+    /**
+     * Startup reconciliation: a state left at queued/downloading by
+     * a dead process means the transfer was interrupted. Mark it
+     * failed with the reason — never let it pose as in-progress or
+     * (worse) downloaded.
+     */
+    fun reconcileOnStart(ctx: Context) {
+        val tracks = statusTrackMap(ctx)
+        statusMap(ctx).forEach { (k, s) ->
+            if (s.state == ST_QUEUED || s.state == ST_DOWNLOADING) {
+                tracks[k]?.let { t ->
+                    setStatus(ctx, t, ST_FAILED, s.progress, "Interrupted before it finished")
+                }
+            }
+        }
+        // Orphaned partial files from a killed process.
+        dir(ctx).listFiles()?.forEach { if (it.name.endsWith(".part")) it.delete() }
     }
 
     private fun writeAll(ctx: Context, list: List<Entry>) {
