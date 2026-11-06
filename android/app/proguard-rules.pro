@@ -6,3 +6,10 @@
 -keep class org.mozilla.javascript.** { *; }
 -keep class org.mozilla.classfile.ClassFileWriter
 -dontwarn org.mozilla.javascript.tools.**
+## Rhino also references desktop-JDK APIs that do not exist on Android
+## (JavaBeans introspection, JSR-223 scripting, dynalink). Those code
+## paths are never exercised on Android; silence R8's missing-class
+## errors for them.
+-dontwarn java.beans.**
+-dontwarn javax.script.**
+-dontwarn jdk.dynalink.**
