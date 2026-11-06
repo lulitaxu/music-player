@@ -10,8 +10,10 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioAttributes
 import android.media.AudioManager
+import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
 import android.media.audiofx.AudioEffect
+import android.provider.OpenableColumns
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -33,6 +35,7 @@ import java.util.concurrent.Executors
 
 const val SOURCE_AUDIUS = "audius"
 const val SOURCE_YOUTUBE = "youtube"
+const val SOURCE_LOCAL = "local"
 
 data class Track(
     val id: String,
@@ -129,6 +132,12 @@ private object ArtworkLoader {
     }
 
     private fun download(url: String): Bitmap? = try {
+        if (url.startsWith("file:")) {
+            // Local artwork extracted at import time lives on disk.
+            java.io.FileInputStream(java.io.File(java.net.URI(url))).use {
+                BitmapFactory.decodeStream(it)
+            }
+        } else {
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             connectTimeout = 10_000
             readTimeout = 10_000
@@ -138,6 +147,7 @@ private object ArtworkLoader {
         }
         if (conn.responseCode !in 200..299) null
         else conn.inputStream.use { BitmapFactory.decodeStream(it) }
+        }
     } catch (_: Exception) {
         null
     }
@@ -229,7 +239,67 @@ class MainActivity : Activity() {
     private var pendingNpNotice: String? = null
     private val manualIndices = mutableSetOf<Int>()
     private var sleepAfterTrack = false
+    private var sleepAfterQueue = false
     private var artWasPlaying = false
+
+    // ---- v5: crossfade (dual player) ----
+    /** The outgoing player while a crossfade runs; null otherwise. */
+    private var outPlayer: MediaPlayer? = null
+    /** Track the CURRENT [player] instance is playing (for the
+     *  repeat-one no-fade rule and crossfade bookkeeping). */
+    private var activePlayerTrack: Track? = null
+    private var fadeStep = 0
+    private var fadeTotalSteps = 0
+    private val crossfadeTick = object : Runnable {
+        override fun run() {
+            val out = outPlayer
+            val cur = player
+            if (out == null || cur == null) return
+            fadeStep++
+            try {
+                val t = (fadeStep.toFloat() / fadeTotalSteps).coerceIn(0f, 1f)
+                out.setVolume(1f - t, 1f - t)
+                cur.setVolume(t, t)
+                if (fadeStep < fadeTotalSteps) {
+                    handler.postDelayed(this, 100)
+                } else {
+                    finishCrossfadeNow()
+                }
+            } catch (_: Exception) {
+                finishCrossfadeNow()
+            }
+        }
+    }
+
+    // ---- v5: downloads vault glue ----
+    /** key -> "pause" | "remove": how an in-flight download should end. */
+    private val dlStopModes = mutableMapOf<String, String>()
+    /** Progress views of the visible Downloads rows, by track key. */
+    private val dlProgressViews = mutableMapOf<String, Pair<ProgressBar, TextView>>()
+
+    // ---- v5: listening stats accumulation ----
+    private var sessionListenedMs = 0L
+    private var lastTickMs = 0L
+
+    // ---- v5: lyrics overlay ----
+    private lateinit var lyricsOverlay: FrameLayout
+    private lateinit var lyricsScroll: ScrollView
+    private lateinit var lyricsList: LinearLayout
+    private lateinit var lyricsTitle: TextView
+    private lateinit var lyricsStatus: TextView
+    private var lyricsSyncedLines: List<LyriTimber> = emptyList()
+    private var lyricsLineViews: List<TextView> = emptyList()
+    private var lyricsActiveLine = -2
+    /** Downloads.key() of the track the overlay currently shows. */
+    private var lyricsKey: String? = null
+    /** True while a lyrics fetch is in flight (double-tap guard). */
+    private var lyricsLoading = false
+
+    /** Activity-result code for the local-file document picker. */
+    private val reqImport = 4205
+
+    /** Which full-screen section is showing (for live row refresh). */
+    private var visibleScreen = "home"
 
     private lateinit var menuOverlay: FrameLayout
     private lateinit var menuPanel: LinearLayout
@@ -263,20 +333,73 @@ class MainActivity : Activity() {
 
     private val ticker = object : Runnable {
         override fun run() {
+            accumulateListening()
             updateProgress()
+            updateLyricsHighlight()
             handler.postDelayed(this, 500)
         }
+    }
+
+    /**
+     * Listening-time accumulation for the stats screen: while audio
+     * is really playing, add the elapsed wall time since the last
+     * tick. Flush to the store in ~5s chunks (and at every play()
+     * and on destroy) so the total survives process death.
+     */
+    private fun accumulateListening() {
+        val now = System.currentTimeMillis()
+        if (lastTickMs == 0L) {
+            lastTickMs = now
+            return
+        }
+        val delta = now - lastTickMs
+        lastTickMs = now
+        if (delta in 1..2000 && isPlayingSafe()) {
+            sessionListenedMs += delta
+            if (sessionListenedMs >= 5000) flushListened()
+        }
+    }
+
+    private fun flushListened() {
+        if (sessionListenedMs <= 0) return
+        PlayHistory.addListened(this, sessionListenedMs)
+        sessionListenedMs = 0
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         recentTracks.addAll(loadRecents())
+        // Any download left "downloading" by a dead process was in
+        // fact interrupted: the vault says so, on the record.
+        Downloads.reconcileOnStart(this)
+        backfillFavorites()
         window.statusBarColor = Color.BLACK
         window.navigationBarColor = Color.BLACK
         showShell()
         showHome()
         handler.post(ticker)
+    }
+
+    /**
+     * One-time rescue of pre-v5 likes: v4.1 stored favorites as bare
+     * `fav_<id>` booleans with no track metadata. Where the track
+     * can be found again (recents, downloads, local files), lift it
+     * into the Liked Songs store so it shows up in the list.
+     */
+    private fun backfillFavorites() {
+        val prefs = getPreferences(MODE_PRIVATE)
+        val legacyIds = prefs.all.keys
+            .filter { it.startsWith("fav_") && prefs.getBoolean(it, false) }
+            .map { it.removePrefix("fav_") }
+        if (legacyIds.isEmpty()) return
+        val pool = HashMap<String, Track>()
+        recentTracks.forEach { pool[it.id] = it }
+        Downloads.entries(this).forEach { pool[it.track.id] = it.track }
+        LocalTracks.all(this).forEach { pool[it.id] = it }
+        legacyIds.forEach { id ->
+            pool[id]?.let { t -> if (!Favorites.contains(this, t)) Favorites.add(this, t) }
+        }
     }
 
     // ---------------------------------------------------------------- shell
@@ -379,7 +502,7 @@ class MainActivity : Activity() {
         val tabs = listOf(
             Triple("Home", R.drawable.ic_home, Runnable { showHome() }),
             Triple("Search", R.drawable.ic_search, Runnable { showSearch() }),
-            Triple("Library", R.drawable.ic_library, Runnable { showEmpty("Library", "Your library is empty", "Imported files and playlists will appear here.") }),
+            Triple("Library", R.drawable.ic_library, Runnable { showLibrary() }),
             Triple("Downloads", R.drawable.ic_download, Runnable { showDownloads() }),
             Triple("Settings", R.drawable.ic_settings, Runnable { showSettings() })
         )
@@ -408,6 +531,7 @@ class MainActivity : Activity() {
 
         buildNowPlaying(root)
         buildQueueOverlay(root)
+        buildLyricsOverlay(root)
         buildMenuOverlay(root)
         setContentView(root)
         setActiveTab("Home")
@@ -583,6 +707,52 @@ class MainActivity : Activity() {
                     content.addView(sectionTitle("Top Artists"))
                     content.addView(artistCircleRow(charts.artists.take(10)))
                     any = true
+                }
+                // Made for You: an on-device mix — YouTube Music radio
+                // seeded by his most-played YouTube track, labeled as
+                // generated here. No seed (nothing played yet, or
+                // Audius mode) → the section simply doesn't exist.
+                if (mode != "audius") {
+                    val seed = PlayHistory.topTracks(this@MainActivity, 20)
+                        .firstOrNull { it.first.source == SOURCE_YOUTUBE }?.first
+                    if (seed != null) {
+                        content.addView(sectionTitle("Made for You"))
+                        val mixBox = LinearLayout(this@MainActivity).apply {
+                            orientation = LinearLayout.VERTICAL
+                        }
+                        mixBox.addView(statusLine("Generating from your top plays…"))
+                        content.addView(mixBox)
+                        any = true
+                        executor.execute {
+                            var mix: List<Track>? = null
+                            var mixErr: String? = null
+                            try {
+                                mix = YtmApi.radio(seed.id)
+                            } catch (t: Throwable) {
+                                mixErr = shortErr(t)
+                            }
+                            runOnUiThread {
+                                if (gen != generation) return@runOnUiThread
+                                mixBox.removeAllViews()
+                                val m = mix
+                                if (m == null || m.isEmpty()) {
+                                    mixBox.addView(
+                                        statusLine("Mix unavailable: ${mixErr ?: "empty radio"}")
+                                    )
+                                } else {
+                                    mixBox.addView(
+                                        statusLine(
+                                            "Generated on this device · radio from “${seed.title}” by ${seed.artist}"
+                                        )
+                                    )
+                                    addRows(
+                                        m.take(15), mixBox,
+                                        withHairlines = true, queueContext = m
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
                 // In YouTube Music mode the Audius section is the
                 // fallback: it appears only when the charts failed
@@ -893,6 +1063,79 @@ class MainActivity : Activity() {
             }
             browseBox.addView(rowLayout)
         }
+        // Honest label: the four cards above run a SEARCH for their
+        // term. Real catalog browsing lives in Moods & Genres below.
+        browseBox.addView(statusLine("These four cards run a search."))
+        browseBox.addView(sectionTitle("Moods & Genres"))
+        val moodsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        browseBox.addView(moodsBox)
+        if (sourceMode() == "audius") {
+            moodsBox.addView(
+                label("Moods live on YouTube Music — switch the source above to browse them.", 14.5f, white50)
+            )
+        } else {
+            moodsBox.addView(label("Loading moods…", 14.5f, white50))
+            executor.execute {
+                var cats: List<YtmMoodCategory>? = null
+                var err: String? = null
+                try {
+                    cats = YtmApi.moodCategories()
+                } catch (t: Throwable) {
+                    err = shortErr(t)
+                }
+                runOnUiThread {
+                    if (gen != generation) return@runOnUiThread
+                    moodsBox.removeAllViews()
+                    val list = cats
+                    if (list == null || list.isEmpty()) {
+                        moodsBox.addView(errorLine("Moods unavailable: ${err ?: "empty response"}"))
+                    } else {
+                        var lastGroup: String? = null
+                        var chipRow: LinearLayout? = null
+                        var inRow = 0
+                        list.forEach { cat ->
+                            if (cat.group != lastGroup) {
+                                lastGroup = cat.group
+                                chipRow = null
+                                inRow = 0
+                                if (cat.group.isNotEmpty()) {
+                                    moodsBox.addView(label(cat.group, 15f, Color.WHITE, boldTf).apply {
+                                        val lp = LinearLayout.LayoutParams(-1, -2)
+                                        lp.topMargin = dp(16)
+                                        lp.bottomMargin = dp(8)
+                                        layoutParams = lp
+                                    })
+                                }
+                            }
+                            if (chipRow == null || inRow >= 2) {
+                                chipRow = LinearLayout(this).apply {
+                                    orientation = LinearLayout.HORIZONTAL
+                                    setPadding(0, 0, 0, dp(10))
+                                }
+                                moodsBox.addView(chipRow)
+                                inRow = 0
+                            }
+                            val chip = label(cat.name, 14f, Color.WHITE, mediumTf).apply {
+                                gravity = Gravity.CENTER
+                                background = glassBg(
+                                    999f, Color.argb(28, 255, 255, 255),
+                                    Color.argb(20, 255, 255, 255)
+                                )
+                                setPadding(dp(10), dp(10), dp(10), dp(10))
+                                maxLines = 1
+                                ellipsize = TextUtils.TruncateAt.END
+                                isClickable = true
+                                setOnClickListener { showMoodPlaylists(cat) }
+                            }
+                            val cLp = LinearLayout.LayoutParams(0, -2, 1f)
+                            if (inRow == 0) cLp.marginEnd = dp(10)
+                            chipRow.addView(chip, cLp)
+                            inRow++
+                        }
+                    }
+                }
+            }
+        }
         content.addView(browseBox)
 
         if (tracks.isEmpty()) {
@@ -1008,6 +1251,49 @@ class MainActivity : Activity() {
         bytes >= 1024 * 1024 -> "%.1f MB".format(bytes / (1024.0 * 1024.0))
         bytes >= 1024 -> "${bytes / 1024} KB"
         else -> "$bytes B"
+    }
+
+    /** Crossfade length picker: a real 0–12s slider (0 = off, the
+     *  default). Writes the same "crossfade_seconds" pref the player
+     *  reads on every transition, so changes apply to the next track
+     *  change with no restart. */
+    private fun showCrossfadeSheet() {
+        val current = crossfadeSec()
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(8), dp(24), 0)
+        }
+        val value = label(
+            if (current == 0) "Off" else "$current seconds", 16f, Color.WHITE, mediumTf
+        )
+        box.addView(value)
+        val seek = SeekBar(this).apply {
+            max = 12
+            progress = current
+            progressTintList = ColorStateList.valueOf(accent)
+            thumbTintList = ColorStateList.valueOf(accent)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                    value.text = if (progress == 0) "Off" else "$progress seconds"
+                    getPreferences(MODE_PRIVATE).edit()
+                        .putInt("crossfade_seconds", progress).apply()
+                }
+
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+        }
+        val sLp = LinearLayout.LayoutParams(-1, -2)
+        sLp.topMargin = dp(10)
+        box.addView(seek, sLp)
+        box.addView(
+            label("Applies when one track flows into the next. Repeat One never fades.", 13f, white50)
+        )
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Crossfade")
+            .setView(box)
+            .setPositiveButton("Done") { _, _ -> showSettings() }
+            .show()
     }
 
     private fun setStreamQuality(q: String) {
@@ -1127,6 +1413,13 @@ class MainActivity : Activity() {
         })
         content.addView(setting("Data saver", false) { showSettings() })
         content.addView(setting("Autoplay", true))
+        val cfSec = crossfadeSec()
+        content.addView(
+            settingsRow(
+                "Crossfade",
+                if (cfSec == 0) "Off · tracks hard-cut, as before" else "$cfSec seconds between tracks"
+            ) { showCrossfadeSheet() }
+        )
 
         content.addView(settingsGroupHeader("Audio"))
         content.addView(settingsRow("Equalizer", "Opens the system audio effects panel") {
@@ -1159,6 +1452,11 @@ class MainActivity : Activity() {
             Toast.makeText(this@MainActivity, "Artwork cache cleared", Toast.LENGTH_SHORT).show()
             showSettings()
         })
+        content.addView(settingsRow("Lyrics cache", "${fmtBytes(Lyrics.cacheBytes(this))} on this device") {
+            Lyrics.clearCache(this@MainActivity)
+            Toast.makeText(this@MainActivity, "Lyrics cache cleared", Toast.LENGTH_SHORT).show()
+            showSettings()
+        })
 
         content.addView(settingsGroupHeader("Appearance & behavior"))
         content.addView(setting("Visualizer", true))
@@ -1175,8 +1473,8 @@ class MainActivity : Activity() {
         } ?: "?"
         content.addView(label("Version $ver", 15f, Color.WHITE))
         content.addView(label("arzxsh by Arafat Arzu", 15f, white50))
-        content.addView(label("Sources · Audius · YouTube Music", 15f, white50))
-        content.addView(label("Lyrics: Not available yet", 15f, white50))
+        content.addView(label("Sources · YouTube Music · Audius · On-device files", 15f, white50))
+        content.addView(label("Lyrics · LRCLIB / lyrics.ovh when available", 15f, white50))
         content.addView(label("No DRM bypass, ever.", 15f, white50))
         content.addView(settingsRow("Open-source licenses", null) { showLicenses() })
     }
@@ -1210,7 +1508,13 @@ class MainActivity : Activity() {
         return v
     }
 
-    private fun addTrackRow(track: Track, target: LinearLayout, queueContext: List<Track>? = null) {
+    private fun addTrackRow(
+        track: Track,
+        target: LinearLayout,
+        queueContext: List<Track>? = null,
+        menuOverride: (() -> Unit)? = null
+    ) {
+        val openMenu = { if (menuOverride != null) menuOverride() else showTrackMenu(track) }
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1221,7 +1525,7 @@ class MainActivity : Activity() {
                 play(track)
             }
             setOnLongClickListener {
-                showTrackMenu(track)
+                openMenu()
                 true
             }
         }
@@ -1264,9 +1568,18 @@ class MainActivity : Activity() {
             // Playing indicator only while actually playing — the same
             // single source of truth as the mini player.
             row.addView(visualizer())
+        } else if (downloading.contains(Downloads.key(track))) {
+            // In-flight download: a spinner stands in for the ⋯ menu
+            // (the menu stays reachable by long-press). Static at
+            // render time; the Downloads tab carries live progress.
+            val spin = ProgressBar(this).apply {
+                isIndeterminate = true
+                indeterminateTintList = ColorStateList.valueOf(accent)
+            }
+            row.addView(spin, LinearLayout.LayoutParams(dp(22), dp(22)))
         } else {
             val moreIcon = icon(R.drawable.ic_more, Color.argb(115, 255, 255, 255)).apply {
-                setOnClickListener { showTrackMenu(track) }
+                setOnClickListener { openMenu() }
             }
             row.addView(moreIcon, LinearLayout.LayoutParams(dp(28), dp(28)))
         }
@@ -1672,6 +1985,162 @@ class MainActivity : Activity() {
         }
     }
 
+    // ------------------------------------------------- moods & remote playlists
+
+    /** Playlists inside one mood/genre category (real browse via
+     *  FEmusic_moods_and_genres_category, not a search). */
+    private fun showMoodPlaylists(cat: YtmMoodCategory) {
+        val gen = ++generation
+        beginScreen(cat.name, showAvatar = false)
+        val loading = label("Loading playlists…", 16f, white50).apply {
+            setPadding(0, dp(20), 0, 0)
+        }
+        content.addView(loading)
+        executor.execute {
+            var list: List<YtmPlaylistRef>? = null
+            var err: String? = null
+            try {
+                list = YtmApi.moodPlaylists(cat)
+            } catch (t: Throwable) {
+                err = shortErr(t)
+            }
+            runOnUiThread {
+                if (gen != generation) return@runOnUiThread
+                content.removeView(loading)
+                val l = list
+                if (l == null) {
+                    content.addView(errorLine("YouTube unavailable: $err"))
+                    return@runOnUiThread
+                }
+                l.forEachIndexed { i, ref ->
+                    if (i > 0) content.addView(hairline())
+                    content.addView(ytmPlaylistRow(ref))
+                }
+            }
+        }
+    }
+
+    private fun ytmPlaylistRow(ref: YtmPlaylistRef): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+            rippleRect()
+            setOnClickListener { showYtmPlaylist(ref) }
+        }
+        val img = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            roundedClip(this, 9)
+        }
+        ArtworkLoader.load(ref.artworkSmall ?: ref.artworkLarge, img)
+        row.addView(img, LinearLayout.LayoutParams(dp(52), dp(52)))
+        val text = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(13), 0, dp(8), 0)
+        }
+        text.addView(label(ref.title, 16f, Color.WHITE, mediumTf).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        if (ref.subtitle.isNotEmpty()) {
+            text.addView(label(ref.subtitle, 14.5f, white50).apply {
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            })
+        }
+        row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
+        return row
+    }
+
+    /** A remote (YouTube Music) playlist page: artwork header,
+     *  Play + Shuffle, full playable track list — same shape as the
+     *  album page. */
+    private fun showYtmPlaylist(ref: YtmPlaylistRef) {
+        val gen = ++generation
+        visibleScreen = "YtmPlaylist"
+        content.removeAllViews()
+        content.addView(label("Loading playlist…", 16f, white50).apply {
+            setPadding(0, dp(28), 0, 0)
+        })
+        executor.execute {
+            var list: List<Track>? = null
+            var err: String? = null
+            try {
+                list = YtmApi.browsePlaylistTracks(ref.id)
+            } catch (t: Throwable) {
+                err = shortErr(t)
+            }
+            runOnUiThread {
+                if (gen != generation) return@runOnUiThread
+                content.removeAllViews()
+                val tracks = list
+                if (tracks == null) {
+                    content.addView(label(ref.title, 26f, Color.WHITE, boldTf))
+                    content.addView(errorLine("YouTube unavailable: $err"))
+                    return@runOnUiThread
+                }
+                val head = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    gravity = Gravity.CENTER_HORIZONTAL
+                }
+                val art = ImageView(this).apply {
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                    roundedClip(this, 12)
+                    elevation = dp(18).toFloat()
+                }
+                ArtworkLoader.load(ref.artworkLarge ?: ref.artworkSmall, art)
+                val artLp = LinearLayout.LayoutParams(dp(200), dp(200))
+                artLp.topMargin = dp(14)
+                head.addView(art, artLp)
+                head.addView(label(ref.title, 20f, Color.WHITE, boldTf).apply {
+                    gravity = Gravity.CENTER
+                    maxLines = 2
+                    ellipsize = TextUtils.TruncateAt.END
+                    val lp = LinearLayout.LayoutParams(-1, -2)
+                    lp.topMargin = dp(16)
+                    layoutParams = lp
+                })
+                if (ref.subtitle.isNotEmpty()) {
+                    head.addView(label(ref.subtitle, 13.5f, white50).apply {
+                        gravity = Gravity.CENTER
+                    })
+                }
+                head.addView(label("${tracks.size} tracks", 13f, white50).apply {
+                    gravity = Gravity.CENTER
+                })
+                content.addView(head)
+                val actions = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER
+                }
+                val aLp = LinearLayout.LayoutParams(-1, -2)
+                aLp.topMargin = dp(18)
+                aLp.bottomMargin = dp(6)
+                actions.layoutParams = aLp
+                val shuffleBtn = icon(R.drawable.ic_shuffle, Color.WHITE).apply {
+                    background = glassBg(999f, Color.argb(28, 255, 255, 255), Color.argb(20, 255, 255, 255))
+                    setPadding(dp(10), dp(10), dp(10), dp(10))
+                    setOnClickListener {
+                        shuffleOn = true
+                        setQueue(tracks)
+                        refreshTransportStates()
+                        play(tracks[playOrder.firstOrNull() ?: 0])
+                    }
+                }
+                actions.addView(shuffleBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
+                val playAll = pillButton("Play", filled = true) {
+                    setQueue(tracks)
+                    play(tracks.first())
+                }
+                val playLp = LinearLayout.LayoutParams(dp(132), dp(40))
+                playLp.setMargins(dp(14), 0, dp(14), 0)
+                actions.addView(playAll, playLp)
+                content.addView(actions)
+                addRows(tracks, withHairlines = true, queueContext = tracks)
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- now playing
 
     private fun buildNowPlaying(root: FrameLayout) {
@@ -1894,7 +2363,7 @@ class MainActivity : Activity() {
         bottomRow.layoutParams = bottomLp
         val lyricsBtn = icon(R.drawable.ic_lyrics, white75).apply {
             contentDescription = "Lyrics"
-            setOnClickListener { Toast.makeText(this@MainActivity, "Lyrics: Not available yet", Toast.LENGTH_SHORT).show() }
+            setOnClickListener { showLyrics() }
         }
         val queueBtn = icon(R.drawable.ic_queue, white75).apply {
             contentDescription = "Queue"
@@ -2012,18 +2481,32 @@ class MainActivity : Activity() {
         return "%d:%02d".format(s / 60, s % 60)
     }
 
+    /**
+     * Favorite state has two generations: the v5 Liked Songs store
+     * (full tracks) and the v4.1 `fav_<id>` boolean. A track counts
+     * as liked when EITHER says so; toggling writes both, so the
+     * heart, the store and old state can never disagree.
+     */
+    private fun isFavorite(t: Track): Boolean =
+        Favorites.contains(this, t) ||
+            getPreferences(MODE_PRIVATE).getBoolean("fav_${t.id}", false)
+
     private fun toggleFavorite() {
         val t = current ?: return
-        val key = "fav_${t.id}"
         val prefs = getPreferences(MODE_PRIVATE)
-        val now = !prefs.getBoolean(key, false)
-        prefs.edit().putBoolean(key, now).apply()
+        val now = !isFavorite(t)
+        if (now) {
+            Favorites.add(this, t)
+        } else {
+            Favorites.remove(this, t)
+        }
+        prefs.edit().putBoolean("fav_${t.id}", now).apply()
         updateHeart()
     }
 
     private fun updateHeart() {
         val t = current ?: return
-        val fav = getPreferences(MODE_PRIVATE).getBoolean("fav_${t.id}", false)
+        val fav = isFavorite(t)
         if (fav) {
             npHeart.setImageResource(R.drawable.ic_heart)
             npHeart.setColorFilter(accent)
@@ -2045,9 +2528,30 @@ class MainActivity : Activity() {
         }
         current = track
         saveRecent(track)
+        // Stats: every play() is a play event (replays included);
+        // bank any accumulated listening time first.
+        flushListened()
+        PlayHistory.record(this, track)
         clearPlaybackError()
         refreshPlaybackUi()
         val token = ++playToken
+        // The outgoing player must never fire completion/error into
+        // the NEW track's session (it would advance the queue or
+        // print a stale error). Detach its listeners up front; what
+        // happens to the instance itself is decided per path below.
+        player?.let { old ->
+            try {
+                old.setOnCompletionListener(null)
+                old.setOnErrorListener(null)
+                old.setOnPreparedListener(null)
+            } catch (_: Exception) {
+            }
+        }
+        // Local files play from their content URI, offline, always.
+        if (track.source == SOURCE_LOCAL) {
+            startPlaybackUri(android.net.Uri.parse(track.id))
+            return
+        }
         // A downloaded copy always wins: instant start, works offline.
         val local = Downloads.localFile(this, track)
         if (local != null) {
@@ -2060,9 +2564,15 @@ class MainActivity : Activity() {
             // NewPipe fallback), then handed to the same player path
             // as every other source. A failure PRINTS both resolvers'
             // outcomes on Now Playing — no more generic silence.
-            player?.release()
-            player = null
-            refreshPlaybackUi()
+            // With crossfade on, the old track keeps playing through
+            // the resolution and is faded out by startPlayback —
+            // releasing here would make every YouTube transition a
+            // hard cut with a silent gap.
+            if (crossfadeSec() <= 0) {
+                player?.release()
+                player = null
+                refreshPlaybackUi()
+            }
             val quality = effectiveQuality()
             executor.execute {
                 val resolved = StreamResolver.resolveYoutube(track.id, quality)
@@ -2204,12 +2714,51 @@ class MainActivity : Activity() {
         npError.visibility = View.GONE
     }
 
-    /** Shared player setup for every source: [stream] is a direct audio URL. */
-    private fun startPlayback(stream: String) {
-        player?.release()
-        player = MediaPlayer().apply {
+    /** Crossfade length from Settings, in seconds (0 = off, the
+     *  default — with 0 every transition behaves exactly as v4.1). */
+    private fun crossfadeSec(): Int =
+        getPreferences(MODE_PRIVATE).getInt("crossfade_seconds", 0).coerceIn(0, 12)
+
+    /** Shared player setup for every source: [stream] is a direct
+     *  audio URL or file path. */
+    private fun startPlayback(stream: String) = startPlaybackInternal(stream, null)
+
+    /** Player setup for a content:// data source (local files). */
+    private fun startPlaybackUri(uri: android.net.Uri) = startPlaybackInternal(null, uri)
+
+    /**
+     * Dual-player start. The previous player is released on prepare
+     * (v4.1 behavior) EXCEPT when crossfade applies: crossfade is on,
+     * the old player is actually playing, and the new track is a
+     * DIFFERENT track (repeat-one restarts never fade into
+     * themselves). Then the old player becomes [outPlayer], the new
+     * one starts silent, and [crossfadeTick] swaps their volumes
+     * over the configured seconds. Any failure anywhere falls back
+     * to the hard cut — crossfade must never break playback.
+     */
+    private fun startPlaybackInternal(stream: String?, uri: android.net.Uri?) {
+        val old = player
+        val forTrack = current
+        val fadeMs = crossfadeSec() * 1000
+        val sameTrack = forTrack != null && activePlayerTrack != null &&
+            forTrack.id == activePlayerTrack?.id && forTrack.source == activePlayerTrack?.source
+        val canFade = fadeMs > 0 && old != null && !sameTrack && try {
+            old.isPlaying
+        } catch (_: Exception) {
+            false
+        }
+        val np = MediaPlayer()
+        player = np
+        activePlayerTrack = forTrack
+        np.apply {
             setAudioAttributes(AudioAttributes.Builder().setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
-            setDataSource(stream)
+            try {
+                if (uri != null) setDataSource(applicationContext, uri) else setDataSource(stream!!)
+            } catch (e: Exception) {
+                showPlaybackError("Player error: ${shortErr(e)}")
+                refreshPlaybackUi()
+                return
+            }
             setOnPreparedListener {
                 val notice = pendingNpNotice
                 if (notice != null) {
@@ -2218,17 +2767,42 @@ class MainActivity : Activity() {
                 } else {
                     clearPlaybackError()
                 }
-                it.start()
+                if (canFade && old != null) {
+                    try {
+                        np.setVolume(0f, 0f)
+                        np.start()
+                        beginCrossfade(old, fadeMs)
+                    } catch (_: Exception) {
+                        try { old.release() } catch (_: Exception) {}
+                        try {
+                            np.setVolume(1f, 1f)
+                            if (!np.isPlaying) np.start()
+                        } catch (_: Exception) {
+                        }
+                    }
+                } else {
+                    if (old != null && old !== np) {
+                        try { old.release() } catch (_: Exception) {}
+                    }
+                    try { it.start() } catch (_: Exception) {}
+                }
                 refreshPlaybackUi()
             }
-            setOnCompletionListener { handleCompletion() }
+            setOnCompletionListener {
+                // Only the ACTIVE player's end counts (an outgoing
+                // crossfade player has its listeners detached anyway;
+                // this guard is the second lock on that door).
+                if (player === np) handleCompletion()
+            }
             setOnErrorListener { _, what, extra ->
+                if (player !== np) return@setOnErrorListener true
                 // The player rejected the stream: say WHAT failed, with
                 // the MediaPlayer codes, on Now Playing (and the toast).
                 val t = current
                 val src = when (t?.source) {
                     SOURCE_YOUTUBE -> "YouTube stream"
                     SOURCE_AUDIUS -> "Audius stream"
+                    SOURCE_LOCAL -> "local file"
                     else -> "stream"
                 }
                 showPlaybackError("Player error playing $src (what=$what, extra=$extra). The resolved URL was rejected.")
@@ -2238,6 +2812,31 @@ class MainActivity : Activity() {
             }
             prepareAsync()
         }
+    }
+
+    private fun beginCrossfade(old: MediaPlayer, fadeMs: Int) {
+        // Retire any previous outgoing player first.
+        outPlayer?.let { prev ->
+            if (prev !== old) {
+                try { prev.release() } catch (_: Exception) {}
+            }
+        }
+        handler.removeCallbacks(crossfadeTick)
+        outPlayer = old
+        fadeStep = 0
+        fadeTotalSteps = (fadeMs / 100).coerceAtLeast(1)
+        handler.postDelayed(crossfadeTick, 100)
+    }
+
+    /** Ends a running crossfade immediately: outgoing player
+     *  released, active player restored to full volume. */
+    private fun finishCrossfadeNow() {
+        handler.removeCallbacks(crossfadeTick)
+        outPlayer?.let {
+            try { it.release() } catch (_: Exception) {}
+        }
+        outPlayer = null
+        try { player?.setVolume(1f, 1f) } catch (_: Exception) {}
     }
 
     // ------------------------------------------------------------ queue order, shuffle, repeat
@@ -2324,6 +2923,15 @@ class MainActivity : Activity() {
         }
         if (repeatMode == 1 && playOrder.isNotEmpty()) {
             play(queue[playOrder[0]])
+            return
+        }
+        // "End of queue" sleep timer: the queue ran out (no next
+        // track, no repeat-all wrap), so stop here instead of
+        // letting Autoplay extend the session forever.
+        if (sleepAfterQueue) {
+            sleepAfterQueue = false
+            fadeOutAndPause()
+            updateSleepLabel()
             return
         }
         // End of the queue: Autoplay continues with more like this
@@ -2501,6 +3109,9 @@ class MainActivity : Activity() {
     }
 
     private fun togglePlayback() {
+        // A tap mid-crossfade settles the fade instantly, so pause /
+        // resume always acts on ONE player at full volume.
+        if (outPlayer != null) finishCrossfadeNow()
         val active = player ?: return
         try {
             if (active.isPlaying) {
@@ -2706,6 +3317,7 @@ class MainActivity : Activity() {
         val items = mutableListOf<Pair<String, () -> Unit>>()
         items += "Play Next" to { playNextInsert(t) }
         items += "Add to Queue" to { appendToQueue(t) }
+        items += "Add to Playlist" to { showAddToPlaylist(t) }
         if (t.artistId != null) {
             items += "Go to Artist" to {
                 hideNowPlaying()
@@ -2729,22 +3341,59 @@ class MainActivity : Activity() {
         val title = when {
             sleepDeadline > now -> "Sleep timer · " + fmt((sleepDeadline - now).toInt()) + " left"
             sleepAfterTrack -> "Sleep timer · ends after this track"
+            sleepAfterQueue -> "Sleep timer · ends at the end of the queue"
             else -> "Sleep Timer"
         }
         val items = mutableListOf<Pair<String, () -> Unit>>()
         for (m in listOf(5, 10, 15, 30, 45, 60)) {
             items += (if (m == 60) "1 hour" else "$m minutes") to { setSleepTimer(m) }
         }
+        items += "Custom…" to { showCustomSleepDialog() }
         items += "End of track" to { setSleepEndOfTrack() }
-        if (sleepDeadline > now || sleepAfterTrack) {
+        items += "End of queue" to { setSleepEndOfQueue() }
+        if (sleepDeadline > now || sleepAfterTrack || sleepAfterQueue) {
             items += "Turn off timer" to { setSleepTimer(0) }
         }
         showMenu(title, items)
     }
 
+    private fun setSleepEndOfQueue() {
+        handler.removeCallbacks(sleepFire)
+        sleepDeadline = 0L
+        sleepAfterTrack = false
+        sleepAfterQueue = true
+        updateSleepLabel()
+        Toast.makeText(this, "Your sleep timer is set.", Toast.LENGTH_SHORT).show()
+    }
+
+    /** Custom sleep duration via a plain numeric input dialog. */
+    private fun showCustomSleepDialog() {
+        val input = EditText(this).apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            hint = "Minutes"
+            setTextColor(Color.WHITE)
+            setHintTextColor(white50)
+            setPadding(dp(20), dp(12), dp(20), dp(12))
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Sleep timer — custom")
+            .setView(input)
+            .setPositiveButton("Set") { _, _ ->
+                val mins = input.text?.toString()?.trim()?.toIntOrNull()
+                if (mins != null && mins > 0) {
+                    setSleepTimer(mins)
+                } else {
+                    Toast.makeText(this, "Enter a number of minutes", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun setSleepTimer(minutes: Int) {
         handler.removeCallbacks(sleepFire)
         sleepAfterTrack = false
+        sleepAfterQueue = false
         if (minutes <= 0) {
             sleepDeadline = 0L
             Toast.makeText(this, "Sleep timer off", Toast.LENGTH_SHORT).show()
@@ -2761,15 +3410,24 @@ class MainActivity : Activity() {
     private fun setSleepEndOfTrack() {
         handler.removeCallbacks(sleepFire)
         sleepDeadline = 0L
+        sleepAfterQueue = false
         sleepAfterTrack = true
         updateSleepLabel()
         Toast.makeText(this, "Your sleep timer is set.", Toast.LENGTH_SHORT).show()
     }
 
     /** Sleep-timer expiry fades the volume out over ~2s, then pauses
-     *  (spec §6), instead of hard-cutting. */
+     *  (spec §6), instead of hard-cutting. A crossfade's outgoing
+     *  player is silenced and released too — sleep wins over fade. */
     private fun fadeOutAndPause() {
         val p = player ?: return
+        val out = outPlayer
+        if (out != null) {
+            handler.removeCallbacks(crossfadeTick)
+            try { out.release() } catch (_: Exception) {}
+            outPlayer = null
+            try { p.setVolume(1f, 1f) } catch (_: Exception) {}
+        }
         try {
             if (!p.isPlaying) return
         } catch (_: IllegalStateException) {
@@ -2804,6 +3462,11 @@ class MainActivity : Activity() {
             npSleepLabel.visibility = View.VISIBLE
             return
         }
+        if (sleepAfterQueue) {
+            npSleepLabel.text = "Sleep timer · ends at the end of the queue"
+            npSleepLabel.visibility = View.VISIBLE
+            return
+        }
         val remaining = sleepDeadline - System.currentTimeMillis()
         if (sleepDeadline > 0 && remaining > 0) {
             npSleepLabel.text = "Sleep timer · " + fmt(remaining.toInt())
@@ -2819,13 +3482,14 @@ class MainActivity : Activity() {
         val items = mutableListOf<Pair<String, () -> Unit>>()
         items += "Play Next" to { playNextInsert(track) }
         items += "Add to Queue" to { appendToQueue(track) }
+        items += "Add to Playlist" to { showAddToPlaylist(track) }
         if (Downloads.isDownloaded(this, track)) {
             items += "Remove Download" to {
                 Downloads.remove(this, track)
                 Toast.makeText(this, "Download removed", Toast.LENGTH_SHORT).show()
                 refreshPlaybackUi()
             }
-        } else {
+        } else if (track.source != SOURCE_LOCAL) {
             items += "Download" to { startDownload(track) }
         }
         if (track.artistId != null) {
@@ -2840,6 +3504,505 @@ class MainActivity : Activity() {
         }
         val header = if (track.artist.isNotEmpty()) "${track.title}\n${track.artist}" else track.title
         showMenu(header, items)
+    }
+
+    // ------------------------------------------------------------ playlists UI
+
+    /** Playlist picker: every playlist plus "New Playlist…". */
+    private fun showAddToPlaylist(track: Track) {
+        val items = mutableListOf<Pair<String, () -> Unit>>()
+        Playlists.all(this).forEach { p ->
+            items += p.name to {
+                if (Playlists.addTrack(this, p.id, track)) {
+                    Toast.makeText(this, "Added to ${p.name}", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this, "Already in ${p.name}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        items += "New Playlist…" to {
+            showNameDialog("New Playlist", "") { name ->
+                val p = Playlists.create(this, name)
+                Playlists.addTrack(this, p.id, track)
+                Toast.makeText(this, "Added to ${p.name}", Toast.LENGTH_SHORT).show()
+            }
+        }
+        showMenu("Add to Playlist", items)
+    }
+
+    /** One-text-field dialog (playlist create/rename). */
+    private fun showNameDialog(title: String, initial: String, onSubmit: (String) -> Unit) {
+        val input = EditText(this).apply {
+            setText(initial)
+            hint = "Playlist name"
+            setTextColor(Color.WHITE)
+            setHintTextColor(white50)
+            setSingleLine(true)
+            setPadding(dp(20), dp(12), dp(20), dp(12))
+            if (initial.isNotEmpty()) setSelection(initial.length)
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(input)
+            .setPositiveButton("Save") { _, _ ->
+                val name = input.text?.toString()?.trim().orEmpty()
+                if (name.isNotEmpty()) onSubmit(name)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showLibrary() {
+        visibleScreen = "Library"
+        generation++
+        beginScreen("Library", showAvatar = false)
+
+        content.addView(sectionTitle("Playlists"))
+        val playlists = Playlists.all(this)
+        if (playlists.isEmpty()) {
+            content.addView(label("No playlists yet. Use a track's ⋯ menu to start one.", 14.5f, white50))
+        } else {
+            playlists.forEachIndexed { i, p ->
+                if (i > 0) content.addView(hairline())
+                content.addView(playlistRow(p))
+            }
+        }
+        content.addView(
+            settingsRow("New Playlist", null) {
+                showNameDialog("New Playlist", "") { name ->
+                    Playlists.create(this, name)
+                    showLibrary()
+                }
+            }
+        )
+
+        content.addView(sectionTitle("Your Music"))
+        val likedCount = Favorites.liked(this).size
+        content.addView(settingsRow("Liked Songs", "$likedCount liked") { showLiked() })
+        val histCount = PlayHistory.totalPlays(this)
+        content.addView(settingsRow("Listening History", "$histCount plays recorded") { showHistory() })
+        content.addView(settingsRow("Your Listening", "Top tracks, artists and time") { showStats() })
+
+        content.addView(sectionTitle("On This Device"))
+        val locals = LocalTracks.all(this)
+        if (locals.isNotEmpty()) {
+            val list = locals
+            content.addView(sectionTitle("${list.size} imported"))
+            addRows(list, withHairlines = true, queueContext = list)
+        }
+        content.addView(
+            settingsRow("Import Music Files", "Links to files — nothing is copied") {
+                launchImport()
+            }
+        )
+        content.addView(
+            label(
+                "MP3, AAC/M4A, FLAC, WAV, OGG and other formats this device can decode. " +
+                    "If a file is moved or deleted, it stops working here too.",
+                13f, white50
+            )
+        )
+    }
+
+    // ------------------------------------------------------------ local file import
+
+    /**
+     * System document picker (multi-select audio). Files are LINKED,
+     * never copied: the persisted read permission keeps the content
+     * URI playable across restarts, and deleting the file in a file
+     * manager removes it here too — the Library copy says so.
+     */
+    private fun launchImport() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            type = "audio/*"
+            addCategory(Intent.CATEGORY_OPENABLE)
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        }
+        try {
+            startActivityForResult(intent, reqImport)
+        } catch (_: Exception) {
+            Toast.makeText(this, "No file picker available on this device", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != reqImport || resultCode != RESULT_OK || data == null) return
+        val uris = ArrayList<android.net.Uri>()
+        val clip = data.clipData
+        if (clip != null) {
+            for (i in 0 until clip.itemCount) uris.add(clip.getItemAt(i).uri)
+        } else {
+            data.data?.let { uris.add(it) }
+        }
+        if (uris.isEmpty()) return
+        Toast.makeText(this, "Importing ${uris.size} file(s)…", Toast.LENGTH_SHORT).show()
+        executor.execute {
+            val imported = ArrayList<Track>()
+            for (uri in uris) {
+                try {
+                    contentResolver.takePersistableUriPermission(
+                        uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                } catch (_: Exception) {
+                    // Some providers grant non-persistable access; the
+                    // track still imports for this session.
+                }
+                extractLocalTrack(uri)?.let { imported.add(it) }
+            }
+            val added = if (imported.isNotEmpty()) LocalTracks.addAll(this@MainActivity, imported) else 0
+            runOnUiThread {
+                when {
+                    added > 0 -> Toast.makeText(
+                        this@MainActivity, "Imported $added file(s)", Toast.LENGTH_SHORT
+                    ).show()
+                    imported.isNotEmpty() -> Toast.makeText(
+                        this@MainActivity, "Already imported", Toast.LENGTH_SHORT
+                    ).show()
+                    else -> Toast.makeText(
+                        this@MainActivity, "Couldn't read those files", Toast.LENGTH_LONG
+                    ).show()
+                }
+                if (visibleScreen == "Library") showLibrary()
+            }
+        }
+    }
+
+    /** Reads title/artist/duration + embedded artwork via
+     *  MediaMetadataRetriever; artwork is written once into
+     *  filesDir/local_art and referenced as a file:// URL (the
+     *  ArtworkLoader decodes file: URLs from disk). */
+    private fun extractLocalTrack(uri: android.net.Uri): Track? {
+        val mmr = MediaMetadataRetriever()
+        return try {
+            mmr.setDataSource(this, uri)
+            var title = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)
+                ?.trim().orEmpty()
+            var artist = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST)
+                ?.trim().orEmpty()
+            val durMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: 0L
+            if (title.isEmpty()) {
+                title = displayName(uri)?.substringBeforeLast('.')?.takeIf { it.isNotBlank() }
+                    ?: "Unknown title"
+            }
+            if (artist.isEmpty()) artist = "Unknown artist"
+            var artPath: String? = null
+            val pic = mmr.embeddedPicture
+            if (pic != null) {
+                try {
+                    val dir = java.io.File(filesDir, "local_art").apply { mkdirs() }
+                    val f = java.io.File(
+                        dir, Integer.toHexString(uri.toString().hashCode()) + ".jpg"
+                    )
+                    if (!f.exists()) f.writeBytes(pic)
+                    artPath = android.net.Uri.fromFile(f).toString()
+                } catch (_: Exception) {
+                    artPath = null
+                }
+            }
+            Track(
+                uri.toString(), title, artist, (durMs / 1000).toInt(),
+                artPath, artPath, SOURCE_LOCAL, null
+            )
+        } catch (_: Exception) {
+            null
+        } finally {
+            try {
+                mmr.release()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun displayName(uri: android.net.Uri): String? = try {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun playlistRow(p: Playlist): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+            rippleRect()
+            setOnClickListener { showPlaylist(p.id) }
+            setOnLongClickListener {
+                showPlaylistMenu(p)
+                true
+            }
+        }
+        val img = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            roundedClip(this, 9)
+        }
+        val first = p.tracks.firstOrNull()
+        ArtworkLoader.load(first?.artworkSmall ?: first?.artworkLarge, img)
+        row.addView(img, LinearLayout.LayoutParams(dp(52), dp(52)))
+        val text = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(13), 0, dp(8), 0)
+        }
+        text.addView(label(p.name, 16f, Color.WHITE, mediumTf).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        val totalSec = p.tracks.sumOf { it.duration }
+        val sub = buildString {
+            append("${p.tracks.size} tracks")
+            if (totalSec > 0) append(" · ").append(fmt(totalSec * 1000))
+        }
+        text.addView(label(sub, 14.5f, white50))
+        row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
+        val moreIcon = icon(R.drawable.ic_more, Color.argb(115, 255, 255, 255)).apply {
+            setOnClickListener { showPlaylistMenu(p) }
+        }
+        row.addView(moreIcon, LinearLayout.LayoutParams(dp(28), dp(28)))
+        return row
+    }
+
+    private fun showPlaylistMenu(p: Playlist) {
+        showMenu(
+            p.name, listOf(
+                "Play" to {
+                    if (p.tracks.isNotEmpty()) {
+                        setQueue(p.tracks)
+                        play(p.tracks.first())
+                    }
+                },
+                "Rename" to {
+                    showNameDialog("Rename Playlist", p.name) { name ->
+                        Playlists.rename(this, p.id, name)
+                        if (visibleScreen == "Library") showLibrary()
+                    }
+                },
+                "Delete Playlist" to {
+                    showMenu(
+                        "Delete “${p.name}”?", listOf(
+                            "Delete" to {
+                                Playlists.delete(this, p.id)
+                                Toast.makeText(this, "Playlist deleted", Toast.LENGTH_SHORT).show()
+                                showLibrary()
+                            },
+                            "Cancel" to {}
+                        )
+                    )
+                }
+            )
+        )
+    }
+
+    private fun showPlaylist(playlistId: String) {
+        visibleScreen = "Playlist"
+        generation++
+        val p = Playlists.get(this, playlistId) ?: run {
+            showLibrary()
+            return
+        }
+        beginScreen(p.name, showAvatar = false)
+        val first = p.tracks.firstOrNull()
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        val art = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            roundedClip(this, 12)
+            elevation = dp(18).toFloat()
+        }
+        ArtworkLoader.load(first?.artworkLarge ?: first?.artworkSmall, art)
+        val artLp = LinearLayout.LayoutParams(dp(180), dp(180))
+        artLp.topMargin = dp(14)
+        head.addView(art, artLp)
+        val totalSec = p.tracks.sumOf { it.duration }
+        head.addView(
+            label(
+                buildString {
+                    append("${p.tracks.size} tracks")
+                    if (totalSec > 0) append(" · ").append(fmt(totalSec * 1000))
+                },
+                13.5f, white50
+            ).apply {
+                gravity = Gravity.CENTER
+                val lp = LinearLayout.LayoutParams(-1, -2)
+                lp.topMargin = dp(12)
+                layoutParams = lp
+            }
+        )
+        content.addView(head)
+        if (p.tracks.isNotEmpty()) {
+            val actions = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+            }
+            val aLp = LinearLayout.LayoutParams(-1, -2)
+            aLp.topMargin = dp(16)
+            aLp.bottomMargin = dp(6)
+            actions.layoutParams = aLp
+            val shuffleBtn = icon(R.drawable.ic_shuffle, Color.WHITE).apply {
+                background = glassBg(999f, Color.argb(28, 255, 255, 255), Color.argb(20, 255, 255, 255))
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+                setOnClickListener {
+                    shuffleOn = true
+                    setQueue(p.tracks)
+                    refreshTransportStates()
+                    play(p.tracks[playOrder.firstOrNull() ?: 0])
+                }
+            }
+            actions.addView(shuffleBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
+            val playAll = pillButton("Play", filled = true) {
+                setQueue(p.tracks)
+                play(p.tracks.first())
+            }
+            val playLp = LinearLayout.LayoutParams(dp(132), dp(40))
+            playLp.setMargins(dp(14), 0, dp(14), 0)
+            actions.addView(playAll, playLp)
+            val menuBtn = icon(R.drawable.ic_more, Color.WHITE).apply {
+                background = glassBg(999f, Color.argb(28, 255, 255, 255), Color.argb(20, 255, 255, 255))
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+                setOnClickListener { showPlaylistMenu(p) }
+            }
+            actions.addView(menuBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
+            content.addView(actions)
+            // Rows with playlist-specific menus: reorder happens
+            // through explicit Move Up / Move Down items (the list
+            // UI has no drag framework; numbered moves are exact).
+            p.tracks.forEachIndexed { i, track ->
+                if (i > 0) content.addView(hairline())
+                addTrackRow(track, content, p.tracks) { showPlaylistTrackMenu(p.id, track, i) }
+            }
+        } else {
+            content.addView(label("This playlist is empty.", 15f, white50).apply {
+                setPadding(0, dp(18), 0, 0)
+            })
+            content.addView(label("Add tracks from any song's ⋯ menu → Add to Playlist.", 14f, white50))
+        }
+    }
+
+    private fun showPlaylistTrackMenu(playlistId: String, track: Track, index: Int) {
+        val p = Playlists.get(this, playlistId) ?: return
+        val items = mutableListOf<Pair<String, () -> Unit>>()
+        items += "Play Next" to { playNextInsert(track) }
+        items += "Add to Queue" to { appendToQueue(track) }
+        if (index > 0) {
+            items += "Move Up" to {
+                Playlists.moveTrack(this, playlistId, index, index - 1)
+                showPlaylist(playlistId)
+            }
+        }
+        if (index < p.tracks.size - 1) {
+            items += "Move Down" to {
+                Playlists.moveTrack(this, playlistId, index, index + 1)
+                showPlaylist(playlistId)
+            }
+        }
+        if (Downloads.isDownloaded(this, track)) {
+            items += "Remove Download" to {
+                Downloads.remove(this, track)
+                Toast.makeText(this, "Download removed", Toast.LENGTH_SHORT).show()
+                refreshPlaybackUi()
+            }
+        } else if (track.source != SOURCE_LOCAL) {
+            items += "Download" to { startDownload(track) }
+        }
+        items += "Remove from Playlist" to {
+            Playlists.removeTrackAt(this, playlistId, index)
+            Toast.makeText(this, "Removed from ${p.name}", Toast.LENGTH_SHORT).show()
+            showPlaylist(playlistId)
+        }
+        items += "Share" to { shareTrack(track) }
+        val header = if (track.artist.isNotEmpty()) "${track.title}\n${track.artist}" else track.title
+        showMenu(header, items)
+    }
+
+    private fun showLiked() {
+        visibleScreen = "Liked"
+        generation++
+        beginScreen("Liked Songs", showAvatar = false)
+        val liked = Favorites.liked(this)
+        if (liked.isEmpty()) {
+            content.addView(sectionTitle("Nothing liked yet"))
+            content.addView(label("Tap the heart on Now Playing and the song lands here.", 15f, white50))
+        } else {
+            content.addView(sectionTitle("${liked.size} liked"))
+            addRows(liked, withHairlines = true, queueContext = liked)
+        }
+    }
+
+    private fun showHistory() {
+        visibleScreen = "History"
+        generation++
+        beginScreen("Listening History", showAvatar = false)
+        val events = PlayHistory.events(this)
+        if (events.isEmpty()) {
+            content.addView(sectionTitle("No plays yet"))
+            content.addView(label("Everything you play is recorded here, on this device only.", 15f, white50))
+        } else {
+            content.addView(sectionTitle("${events.size} plays"))
+            val list = events.map { it.first }
+            addRows(list, withHairlines = true, queueContext = list)
+        }
+    }
+
+    private fun showStats() {
+        visibleScreen = "Stats"
+        generation++
+        beginScreen("Your Listening", showAvatar = false)
+        val total = PlayHistory.totalPlays(this)
+        val listened = PlayHistory.listenedMs(this)
+        content.addView(sectionTitle("Overview"))
+        content.addView(label("Total plays · $total", 16f, Color.WHITE))
+        val mins = listened / 60_000
+        val timeText = when {
+            mins >= 60 -> "${mins / 60} h ${mins % 60} min"
+            mins > 0 -> "$mins min"
+            else -> "under a minute"
+        }
+        content.addView(label("Time listened · about $timeText", 16f, Color.WHITE))
+        content.addView(
+            label(
+                "Time is measured from real playback on this device and rounded — treat it as an estimate.",
+                12.5f, white50
+            )
+        )
+        val topTracks = PlayHistory.topTracks(this, 10)
+        if (topTracks.isNotEmpty()) {
+            content.addView(sectionTitle("Top Tracks"))
+            val ctx = topTracks.map { it.first }
+            topTracks.forEachIndexed { i, (t, count) ->
+                if (i > 0) content.addView(hairline())
+                addTrackRow(t, content, ctx)
+                // Play count appended as a trailing label row is
+                // overkill; the count rides in the stats line below
+                // via a dedicated compact row instead.
+            }
+            content.addView(statusLine(topTracks.joinToString(" · ") { "${it.first.title} ×${it.second}" }))
+        }
+        val topArtists = PlayHistory.topArtists(this, 10)
+        if (topArtists.isNotEmpty()) {
+            content.addView(sectionTitle("Top Artists"))
+            topArtists.forEach { (name, count, rep) ->
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(0, dp(10), 0, dp(10))
+                    if (rep?.artistId != null) {
+                        rippleRect()
+                        setOnClickListener { showArtist(rep.artistId, name, rep.artworkLarge) }
+                    }
+                }
+                val text = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                text.addView(label(name, 16f, Color.WHITE, mediumTf))
+                text.addView(label("$count plays", 14f, white50))
+                row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
+                content.addView(row)
+            }
+        }
+        if (topTracks.isEmpty() && topArtists.isEmpty()) {
+            content.addView(label("Play some music and your patterns show up here.", 15f, white50))
+        }
     }
 
     private fun shareTrack(track: Track?) {
@@ -2889,34 +4052,120 @@ class MainActivity : Activity() {
     }
 
     private fun startDownload(track: Track) {
-        if (!downloading.add(Downloads.key(track))) return
+        if (track.source == SOURCE_LOCAL) {
+            Toast.makeText(this, "Local files are already on this device", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (Downloads.isDownloaded(this, track)) {
+            Toast.makeText(this, "Already downloaded", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val key = Downloads.key(track)
+        if (!downloading.add(key)) return
+        dlStopModes.remove(key)
+        // The executor is single-threaded: a second start waits its
+        // turn and is honestly labeled Queued until it really runs.
+        Downloads.setStatus(
+            this, track,
+            if (downloading.size > 1) Downloads.ST_QUEUED else Downloads.ST_DOWNLOADING, 0
+        )
         refreshDownloadButton()
+        if (visibleScreen == "Downloads") showDownloads()
         Toast.makeText(this, "Downloading ${track.title}…", Toast.LENGTH_SHORT).show()
         val quality = effectiveQuality()
         executor.execute {
+            var lastPct = 0
             var err: String? = null
+            var stopped = false
+            Downloads.setStatus(this@MainActivity, track, Downloads.ST_DOWNLOADING, 0)
             try {
-                Downloads.downloadSync(this@MainActivity, track, quality)
+                Downloads.downloadSync(
+                    this@MainActivity, track, quality,
+                    shouldContinue = { !dlStopModes.containsKey(key) },
+                    onProgress = { pct ->
+                        lastPct = pct
+                        if (pct % 10 == 0) {
+                            Downloads.setStatus(
+                                this@MainActivity, track, Downloads.ST_DOWNLOADING, pct
+                            )
+                        }
+                        runOnUiThread {
+                            dlProgressViews[key]?.let { (bar, tv) ->
+                                bar.isIndeterminate = pct <= 0
+                                if (pct > 0) bar.progress = pct
+                                tv.text = "Downloading · $pct%"
+                            }
+                        }
+                    }
+                )
+            } catch (e: Downloads.StoppedException) {
+                stopped = true
             } catch (e: Throwable) {
                 err = shortErr(e)
             }
             runOnUiThread {
-                downloading.remove(Downloads.key(track))
-                if (err != null) {
-                    Toast.makeText(this@MainActivity, "Download failed: $err", Toast.LENGTH_LONG).show()
-                } else {
-                    Toast.makeText(this@MainActivity, "Downloaded: ${track.title}", Toast.LENGTH_SHORT).show()
+                downloading.remove(key)
+                val mode = dlStopModes.remove(key)
+                when {
+                    stopped && mode == "pause" -> {
+                        // Pause keeps the state row (and its percent);
+                        // the partial file is gone — resume restarts
+                        // from zero, and the row says so.
+                        Downloads.setStatus(this@MainActivity, track, Downloads.ST_PAUSED, lastPct)
+                        Toast.makeText(this@MainActivity, "Paused: ${track.title}", Toast.LENGTH_SHORT).show()
+                    }
+                    stopped -> {
+                        Downloads.clearStatus(this@MainActivity, key)
+                        Toast.makeText(this@MainActivity, "Download removed", Toast.LENGTH_SHORT).show()
+                    }
+                    err != null -> {
+                        Downloads.setStatus(this@MainActivity, track, Downloads.ST_FAILED, lastPct, err)
+                        Toast.makeText(this@MainActivity, "Download failed: $err", Toast.LENGTH_LONG).show()
+                    }
+                    else -> {
+                        Toast.makeText(this@MainActivity, "Downloaded: ${track.title}", Toast.LENGTH_SHORT).show()
+                    }
                 }
                 refreshPlaybackUi()
+                if (visibleScreen == "Downloads") showDownloads()
             }
+        }
+    }
+
+    /** Pause: an in-flight transfer stops at the next chunk check;
+     *  a queued one is simply re-labeled. */
+    private fun pauseDownload(track: Track) {
+        val key = Downloads.key(track)
+        if (downloading.contains(key)) {
+            dlStopModes[key] = "pause"
+        } else {
+            Downloads.setStatus(
+                this, track, Downloads.ST_PAUSED,
+                Downloads.statusOf(this, track)?.progress ?: 0
+            )
+            if (visibleScreen == "Downloads") showDownloads()
+        }
+    }
+
+    /** Remove: an in-flight transfer aborts and its state row is
+     *  dropped on completion; an idle row is dropped immediately. */
+    private fun cancelDownload(track: Track) {
+        val key = Downloads.key(track)
+        if (downloading.contains(key)) {
+            dlStopModes[key] = "remove"
+        } else {
+            Downloads.clearStatus(this, key)
+            if (visibleScreen == "Downloads") showDownloads()
         }
     }
 
     private fun showDownloads() {
         generation++
         beginScreen("Downloads", showAvatar = false)
+        dlProgressViews.clear()
         val entries = Downloads.entries(this)
-        if (entries.isEmpty()) {
+        val pending = Downloads.pendingRows(this)
+        if (entries.isEmpty() && pending.isEmpty()) {
             content.addView(sectionTitle("No downloads yet"))
             content.addView(
                 label(
@@ -2924,11 +4173,274 @@ class MainActivity : Activity() {
                     15f, white50
                 )
             )
-        } else {
+            return
+        }
+        content.addView(
+            statusLine(
+                "${entries.size} downloaded · ${fmtBytes(Downloads.storageBytes(this))} on this device"
+            )
+        )
+        if (pending.isNotEmpty()) {
+            content.addView(sectionTitle("Not finished"))
+            pending.forEachIndexed { i, (track, st) ->
+                if (i > 0) content.addView(hairline())
+                content.addView(downloadStateRow(track, st))
+            }
+        }
+        if (entries.isNotEmpty()) {
             val list = entries.map { it.track }
             content.addView(sectionTitle("${list.size} downloaded"))
             addRows(list, withHairlines = true, queueContext = list)
         }
+    }
+
+    /** One vault row for a track that is NOT fully downloaded yet:
+     *  state, live progress while downloading, and the actions that
+     *  state honestly supports (Pause/Resume/Retry/Remove). */
+    private fun downloadStateRow(track: Track, st: Downloads.Status): LinearLayout {
+        val key = Downloads.key(track)
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(4))
+            rippleRect()
+            setOnClickListener { play(track) }
+        }
+        val img = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            roundedClip(this, 9)
+        }
+        ArtworkLoader.load(track.artworkSmall ?: track.artworkLarge, img)
+        row.addView(img, LinearLayout.LayoutParams(dp(52), dp(52)))
+        val text = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(13), 0, dp(8), 0)
+        }
+        text.addView(label(track.title, 16f, Color.WHITE, mediumTf).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        val statusText = when (st.state) {
+            Downloads.ST_QUEUED -> "Queued"
+            Downloads.ST_DOWNLOADING -> "Downloading · ${st.progress}%"
+            Downloads.ST_PAUSED -> "Paused · ${st.progress}% · resumes from the start"
+            Downloads.ST_FAILED -> "Failed · ${st.error ?: "unknown error"}"
+            else -> st.state
+        }
+        val statusTv = label(statusText, 13.5f, if (st.state == Downloads.ST_FAILED) accent else white50).apply {
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        text.addView(statusTv)
+        row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
+        box.addView(row)
+        if (st.state == Downloads.ST_DOWNLOADING || st.state == Downloads.ST_PAUSED) {
+            val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+                max = 100
+                progress = st.progress
+                isIndeterminate = st.state == Downloads.ST_DOWNLOADING && st.progress <= 0
+                progressTintList = ColorStateList.valueOf(accent)
+            }
+            val bLp = LinearLayout.LayoutParams(-1, dp(3))
+            bLp.setMargins(dp(65), dp(2), dp(8), dp(2))
+            box.addView(bar, bLp)
+            if (st.state == Downloads.ST_DOWNLOADING) {
+                dlProgressViews[key] = bar to statusTv
+            }
+        }
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(65), dp(2), 0, dp(6))
+        }
+        fun action(name: String, run: () -> Unit) {
+            val tv = label(name, 14f, accent, mediumTf).apply {
+                setPadding(0, dp(4), dp(22), dp(4))
+                isClickable = true
+                setOnClickListener { run() }
+            }
+            actions.addView(tv)
+        }
+        when (st.state) {
+            Downloads.ST_DOWNLOADING -> {
+                action("Pause") { pauseDownload(track) }
+                action("Remove") { cancelDownload(track) }
+            }
+            Downloads.ST_QUEUED -> action("Remove") { cancelDownload(track) }
+            Downloads.ST_PAUSED -> {
+                action("Resume") { startDownload(track) }
+                action("Remove") { cancelDownload(track) }
+            }
+            Downloads.ST_FAILED -> {
+                action("Retry") { startDownload(track) }
+                action("Remove") { cancelDownload(track) }
+            }
+        }
+        box.addView(actions)
+        return box
+    }
+
+    // ------------------------------------------------------------ lyrics overlay
+
+    private fun buildLyricsOverlay(root: FrameLayout) {
+        lyricsOverlay = FrameLayout(this).apply {
+            visibility = View.GONE
+            setBackgroundColor(Color.argb(250, 0, 0, 0))
+        }
+        val inner = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(22), dp(48), dp(22), dp(20))
+        }
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        lyricsTitle = label("", 21f, Color.WHITE, boldTf).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        head.addView(lyricsTitle, LinearLayout.LayoutParams(0, -2, 1f))
+        val done = label("Done", 16f, accent, mediumTf).apply {
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            isClickable = true
+            setOnClickListener { hideLyrics() }
+        }
+        head.addView(done)
+        inner.addView(head)
+        lyricsStatus = label("", 13f, white50)
+        val stLp = LinearLayout.LayoutParams(-1, -2)
+        stLp.topMargin = dp(4)
+        inner.addView(lyricsStatus, stLp)
+        lyricsScroll = ScrollView(this)
+        lyricsList = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(10), 0, dp(40))
+        }
+        lyricsScroll.addView(lyricsList)
+        val sLp = LinearLayout.LayoutParams(-1, 0, 1f)
+        sLp.topMargin = dp(10)
+        inner.addView(lyricsScroll, sLp)
+        lyricsOverlay.addView(inner, FrameLayout.LayoutParams(-1, -1))
+        root.addView(lyricsOverlay, FrameLayout.LayoutParams(-1, -1))
+    }
+
+    private fun hideLyrics() {
+        if (::lyricsOverlay.isInitialized) lyricsOverlay.visibility = View.GONE
+    }
+
+    /**
+     * Opens the lyrics overlay for the current track. Synced (LRC)
+     * lyrics highlight line by line from the ticker and tap-to-seek;
+     * plain lyrics are labeled "Not synchronized" — timing is never
+     * invented. A miss says "Lyrics unavailable", plainly.
+     */
+    private fun showLyrics() {
+        val t = current ?: run {
+            Toast.makeText(this, "Nothing playing", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!::lyricsOverlay.isInitialized) return
+        lyricsOverlay.visibility = View.VISIBLE
+        lyricsOverlay.alpha = 0f
+        lyricsOverlay.animate().alpha(1f).setDuration(180).start()
+        lyricsTitle.text = t.title
+        val key = Downloads.key(t)
+        if (key == lyricsKey && (lyricsLineViews.isNotEmpty() || lyricsLoading)) {
+            // Already showing (or already fetching) this track.
+            return
+        }
+        lyricsKey = key
+        lyricsSyncedLines = emptyList()
+        lyricsLineViews = emptyList()
+        lyricsActiveLine = -2
+        lyricsList.removeAllViews()
+        lyricsStatus.text = if (t.artist.isNotEmpty()) "${t.artist} · Loading lyrics…" else "Loading lyrics…"
+        lyricsLoading = true
+        executor.execute {
+            val data = try {
+                Lyrics.fetch(this@MainActivity, t)
+            } catch (_: Throwable) {
+                null
+            }
+            runOnUiThread {
+                if (lyricsKey != key) return@runOnUiThread
+                lyricsLoading = false
+                renderLyrics(data)
+            }
+        }
+    }
+
+    private fun renderLyrics(data: LyricsData?) {
+        lyricsList.removeAllViews()
+        lyricsSyncedLines = emptyList()
+        lyricsLineViews = emptyList()
+        lyricsActiveLine = -2
+        when {
+            data == null -> {
+                lyricsStatus.text = "Lyrics unavailable for this track."
+                lyricsList.addView(label("No lyrics provider had this song.", 15f, white50))
+            }
+            data.instrumental -> {
+                lyricsStatus.text = "Instrumental · via ${data.source}"
+                lyricsList.addView(label("This track is instrumental.", 15f, white50))
+            }
+            data.synced != null -> {
+                lyricsStatus.text = "Synced · ${data.source} · tap a line to jump"
+                val lines = data.synced
+                lyricsSyncedLines = lines
+                val views = ArrayList<TextView>(lines.size)
+                lines.forEach { line ->
+                    val tv = label(line.text.ifEmpty { "♪" }, 17.5f, white50).apply {
+                        setPadding(0, dp(7), 0, dp(7))
+                        isClickable = true
+                        setOnClickListener {
+                            try {
+                                player?.seekTo(line.timeMs.toInt())
+                            } catch (_: Exception) {
+                            }
+                            updateLyricsHighlight()
+                        }
+                    }
+                    views.add(tv)
+                    lyricsList.addView(tv)
+                }
+                lyricsLineViews = views
+                updateLyricsHighlight()
+            }
+            else -> {
+                lyricsStatus.text = "Not synchronized · plain lyrics via ${data.source}"
+                data.plainLines.forEach { line ->
+                    lyricsList.addView(label(line.ifEmpty { " " }, 16.5f, white75).apply {
+                        setPadding(0, dp(3), 0, dp(3))
+                    })
+                }
+            }
+        }
+    }
+
+    /** Ticker hook (500ms): moves the synced-lyrics highlight to the
+     *  line the playback position has reached. Cheap no-op whenever
+     *  the overlay is closed or the lyrics are plain. */
+    private fun updateLyricsHighlight() {
+        if (!::lyricsOverlay.isInitialized || lyricsOverlay.visibility != View.VISIBLE) return
+        if (lyricsSyncedLines.isEmpty() || lyricsLineViews.isEmpty()) return
+        val pos = try {
+            player?.currentPosition
+        } catch (_: Exception) {
+            null
+        } ?: return
+        val idx = lyricsSyncedLines.indexOfLast { it.timeMs <= pos.toLong() }
+        if (idx == lyricsActiveLine) return
+        lyricsLineViews.getOrNull(lyricsActiveLine)?.let {
+            it.setTextColor(white50)
+            it.typeface = regularTf
+        }
+        lyricsActiveLine = idx
+        val view = lyricsLineViews.getOrNull(idx) ?: return
+        view.setTextColor(Color.WHITE)
+        view.typeface = boldTf
+        val y = (view.top - dp(140)).coerceAtLeast(0)
+        if (reduceMotion()) lyricsScroll.scrollTo(0, y) else lyricsScroll.smoothScrollTo(0, y)
     }
 
     // ------------------------------------------------------------ queue screen
@@ -2995,11 +4507,11 @@ class MainActivity : Activity() {
             val rest = upcoming.filter { it !in manualIndices }
             if (manual.isNotEmpty()) {
                 queueList.addView(queueSectionHeader("Next in Queue", showClear = true))
-                manual.forEach { qi -> queueList.addView(queueRow(queue[qi], isCurrent = false)) }
+                manual.forEach { qi -> queueList.addView(queueRow(queue[qi], isCurrent = false, queuePos = qi)) }
             }
             if (rest.isNotEmpty()) {
                 queueList.addView(sectionTitle("Next Up"))
-                rest.forEach { qi -> queueList.addView(queueRow(queue[qi], isCurrent = false)) }
+                rest.forEach { qi -> queueList.addView(queueRow(queue[qi], isCurrent = false, queuePos = qi)) }
             }
         }
         queueOverlay.visibility = View.VISIBLE
@@ -3064,7 +4576,24 @@ class MainActivity : Activity() {
         if (::queueOverlay.isInitialized) queueOverlay.visibility = View.GONE
     }
 
-    private fun queueRow(track: Track, isCurrent: Boolean): LinearLayout {
+    /** Removes one non-current track from the queue, remapping the
+     *  play order and the manual-queue set through the same index
+     *  shift clearManualQueue uses. The current track is never
+     *  removable here (it has no ✕). */
+    private fun removeFromQueue(qi: Int) {
+        if (qi !in queue.indices || qi == queueIndex) return
+        val kept = queue.indices.filter { it != qi }
+        val oldToNew = kept.mapIndexed { newIdx, oldIdx -> oldIdx to newIdx }.toMap()
+        playOrder = playOrder.filter { it != qi }.map { oldToNew.getValue(it) }
+        val newManual = manualIndices.filter { it != qi }.map { oldToNew.getValue(it) }
+        manualIndices.clear()
+        manualIndices.addAll(newManual)
+        queue = kept.map { queue[it] }
+        if (qi < queueIndex) queueIndex -= 1
+        showQueue()
+    }
+
+    private fun queueRow(track: Track, isCurrent: Boolean, queuePos: Int = -1): LinearLayout {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -3097,6 +4626,15 @@ class MainActivity : Activity() {
         })
         row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
         if (isCurrent && isPlayingSafe()) row.addView(visualizer())
+        if (!isCurrent && queuePos >= 0) {
+            val remove = label("✕", 15f, white50).apply {
+                setPadding(dp(10), dp(6), dp(4), dp(6))
+                isClickable = true
+                contentDescription = "Remove from queue"
+                setOnClickListener { removeFromQueue(queuePos) }
+            }
+            row.addView(remove)
+        }
         return row
     }
 
@@ -3213,6 +4751,7 @@ class MainActivity : Activity() {
     }
 
     private fun beginScreen(title: String, showAvatar: Boolean) {
+        visibleScreen = title
         content.removeAllViews()
         val head = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -3276,6 +4815,9 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         handler.removeCallbacks(ticker)
+        flushListened()
+        handler.removeCallbacks(crossfadeTick)
+        outPlayer?.release()
         player?.release()
         executor.shutdownNow()
         super.onDestroy()
