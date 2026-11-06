@@ -1,6 +1,7 @@
 package com.arzx.music
 
 import android.app.Activity
+import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -15,8 +16,11 @@ import android.os.Handler
 import android.os.Looper
 import android.text.TextUtils
 import android.util.LruCache
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
+import android.view.animation.AccelerateInterpolator
+import android.view.animation.DecelerateInterpolator
 import android.view.inputmethod.EditorInfo
 import android.widget.*
 import org.json.JSONArray
@@ -176,6 +180,35 @@ class MainActivity : Activity() {
     private var generation = 0
     private var playToken = 0
     private var activeTab = "Home"
+    private var shuffleOn = false
+    private var repeatMode = 0 // 0 = off, 1 = all, 2 = one
+    private var playOrder: List<Int> = emptyList()
+    private val downloading = mutableSetOf<String>()
+    private var sleepDeadline = 0L
+
+    private lateinit var npShuffleBtn: ImageView
+    private lateinit var npRepeatBtn: ImageView
+    private lateinit var npDownloadBtn: ImageView
+    private lateinit var npSleepLabel: TextView
+
+    private lateinit var menuOverlay: FrameLayout
+    private lateinit var menuPanel: LinearLayout
+    private lateinit var menuTitle: TextView
+    private lateinit var menuList: LinearLayout
+
+    private lateinit var queueOverlay: FrameLayout
+    private lateinit var queueList: LinearLayout
+
+    private val sleepFire = Runnable {
+        sleepDeadline = 0L
+        try {
+            if (player?.isPlaying == true) player?.pause()
+        } catch (_: IllegalStateException) {
+        }
+        refreshPlaybackUi()
+        updateSleepLabel()
+        Toast.makeText(this@MainActivity, "Sleep timer ended", Toast.LENGTH_SHORT).show()
+    }
     private val tabViews = mutableMapOf<String, Triple<LinearLayout, ImageView, TextView>>()
     private val categoryArtViews = mutableListOf<ImageView>()
 
@@ -276,7 +309,7 @@ class MainActivity : Activity() {
             Triple("Home", R.drawable.ic_home, Runnable { showHome() }),
             Triple("Search", R.drawable.ic_search, Runnable { showSearch() }),
             Triple("Library", R.drawable.ic_library, Runnable { showEmpty("Library", "Your library is empty", "Imported files and playlists will appear here.") }),
-            Triple("Downloads", R.drawable.ic_download, Runnable { showEmpty("Downloads", "No downloads yet", "Only authorized provider downloads will appear here.") }),
+            Triple("Downloads", R.drawable.ic_download, Runnable { showDownloads() }),
             Triple("Settings", R.drawable.ic_settings, Runnable { showSettings() })
         )
         tabs.forEach { (name, iconRes, action) ->
@@ -302,6 +335,8 @@ class MainActivity : Activity() {
         root.addView(bottomBar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
 
         buildNowPlaying(root)
+        buildQueueOverlay(root)
+        buildMenuOverlay(root)
         setContentView(root)
         setActiveTab("Home")
         bottomBar.post { fitContentPadding() }
@@ -357,6 +392,20 @@ class MainActivity : Activity() {
         scaleType = ImageView.ScaleType.CENTER_INSIDE
         isClickable = true
         isFocusable = true
+        // Native borderless ripple: every icon button answers a press
+        // immediately instead of feeling dead until the action lands.
+        val tv = TypedValue()
+        if (theme.resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, tv, true)) {
+            setBackgroundResource(tv.resourceId)
+        }
+    }
+
+    /** Rectangular ripple press feedback for list rows. */
+    private fun View.rippleRect() {
+        val tv = TypedValue()
+        if (theme.resolveAttribute(android.R.attr.selectableItemBackground, tv, true)) {
+            setBackgroundResource(tv.resourceId)
+        }
     }
 
     // ---------------------------------------------------------------- home
@@ -441,7 +490,7 @@ class MainActivity : Activity() {
             }
             clipToOutline = true
             setOnClickListener {
-                queue = context
+                setQueue(context)
                 play(track)
             }
         }
@@ -554,7 +603,7 @@ class MainActivity : Activity() {
                         if (ytArtists.isNotEmpty() || ytAlbums.isNotEmpty()) {
                             resultsBox.addView(sectionTitle("Songs"))
                         }
-                        queue = found
+                        setQueue(found)
                         addRows(found, resultsBox, withHairlines = true)
                     }
                     // Source status: always on screen, success or failure.
@@ -696,7 +745,12 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(9), 0, dp(9))
+            rippleRect()
             setOnClickListener { play(track) }
+            setOnLongClickListener {
+                showTrackMenu(track)
+                true
+            }
         }
         val img = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
@@ -770,9 +824,14 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(8), 0, dp(8))
+            rippleRect()
             setOnClickListener {
-                if (queueContext != null) queue = queueContext
+                if (queueContext != null) setQueue(queueContext)
                 play(track)
+            }
+            setOnLongClickListener {
+                showTrackMenu(track)
+                true
             }
         }
         val img = ImageView(this).apply {
@@ -816,10 +875,19 @@ class MainActivity : Activity() {
             badgeLp.marginEnd = dp(2)
             row.addView(badge, badgeLp)
         }
+        if (Downloads.isDownloaded(this, track)) {
+            val doneIcon = icon(R.drawable.ic_downloaded, accent)
+            val dLp = LinearLayout.LayoutParams(dp(19), dp(19))
+            dLp.marginStart = dp(8)
+            row.addView(doneIcon, dLp)
+        }
         if (track.id == current?.id && track.source == current?.source) {
             row.addView(visualizer())
         } else {
-            row.addView(icon(R.drawable.ic_more, Color.argb(115, 255, 255, 255)), LinearLayout.LayoutParams(dp(28), dp(28)))
+            val moreIcon = icon(R.drawable.ic_more, Color.argb(115, 255, 255, 255)).apply {
+                setOnClickListener { showTrackMenu(track) }
+            }
+            row.addView(moreIcon, LinearLayout.LayoutParams(dp(28), dp(28)))
         }
         target.addView(row)
     }
@@ -865,6 +933,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(8), 0, dp(8))
+            rippleRect()
             setOnClickListener { showArtist(artist.id, artist.name, artist.artworkLarge) }
         }
         val img = ImageView(this).apply {
@@ -894,6 +963,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(8), 0, dp(8))
+            rippleRect()
             setOnClickListener { showAlbum(album) }
         }
         val img = ImageView(this).apply {
@@ -1149,7 +1219,7 @@ class MainActivity : Activity() {
                             cornerRadius = dp(999).toFloat()
                         }
                         setOnClickListener {
-                            queue = p.tracks
+                            setQueue(p.tracks)
                             play(p.tracks.first())
                         }
                     }
@@ -1288,12 +1358,16 @@ class MainActivity : Activity() {
         val controlsLp = LinearLayout.LayoutParams(-1, -2)
         controlsLp.topMargin = dp(22)
         controls.layoutParams = controlsLp
+        npShuffleBtn = icon(R.drawable.ic_shuffle, white55).apply { setOnClickListener { toggleShuffle() } }
         val prevBtn = icon(R.drawable.ic_skip_prev, Color.WHITE).apply { setOnClickListener { playPrevious() } }
         npPlayButton = icon(R.drawable.ic_play, Color.WHITE).apply { setOnClickListener { togglePlayback() } }
         val nextBtn = icon(R.drawable.ic_skip_next, Color.WHITE).apply { setOnClickListener { playNext() } }
-        controls.addView(prevBtn, LinearLayout.LayoutParams(0, dp(56), 1f))
-        controls.addView(npPlayButton, LinearLayout.LayoutParams(0, dp(72), 1f))
-        controls.addView(nextBtn, LinearLayout.LayoutParams(0, dp(56), 1f))
+        npRepeatBtn = icon(R.drawable.ic_repeat, white55).apply { setOnClickListener { toggleRepeat() } }
+        controls.addView(npShuffleBtn, LinearLayout.LayoutParams(0, dp(44), 1f))
+        controls.addView(prevBtn, LinearLayout.LayoutParams(0, dp(52), 1f))
+        controls.addView(npPlayButton, LinearLayout.LayoutParams(0, dp(68), 1.2f))
+        controls.addView(nextBtn, LinearLayout.LayoutParams(0, dp(52), 1f))
+        controls.addView(npRepeatBtn, LinearLayout.LayoutParams(0, dp(44), 1f))
         inner.addView(controls)
 
         val volRow = LinearLayout(this).apply {
@@ -1322,29 +1396,41 @@ class MainActivity : Activity() {
         volRow.addView(icon(R.drawable.ic_volume_high, white50), LinearLayout.LayoutParams(dp(19), dp(19)))
         inner.addView(volRow)
 
+        npSleepLabel = label("", 12.5f, white55).apply {
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+        }
+        val sleepLp = LinearLayout.LayoutParams(-1, -2)
+        sleepLp.topMargin = dp(12)
+        inner.addView(npSleepLabel, sleepLp)
+
         val bottomRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(22), 0, dp(22), 0)
         }
         val bottomLp = LinearLayout.LayoutParams(-1, -2)
-        bottomLp.topMargin = dp(30)
+        bottomLp.topMargin = dp(24)
         bottomRow.layoutParams = bottomLp
         val lyricsBtn = icon(R.drawable.ic_lyrics, white75).apply {
             setOnClickListener { Toast.makeText(this@MainActivity, "Lyrics: Not available yet", Toast.LENGTH_SHORT).show() }
         }
-        val airBtn = icon(R.drawable.ic_airplay, white75).apply {
-            setOnClickListener { Toast.makeText(this@MainActivity, "Casting is not available in this build", Toast.LENGTH_SHORT).show() }
-        }
-        val radioBtn = icon(R.drawable.ic_radio, white75).apply {
-            setOnClickListener { startRadio() }
-        }
         val queueBtn = icon(R.drawable.ic_queue, white75).apply {
-            setOnClickListener { hideNowPlaying() }
+            setOnClickListener { showQueue() }
+        }
+        npDownloadBtn = icon(R.drawable.ic_download, white75).apply {
+            setOnClickListener { downloadCurrent() }
+        }
+        val shareBtn = icon(R.drawable.ic_share, white75).apply {
+            setOnClickListener { shareTrack(current) }
+        }
+        val moreBtn = icon(R.drawable.ic_more, white75).apply {
+            setOnClickListener { showNpMenu() }
         }
         bottomRow.addView(lyricsBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
-        bottomRow.addView(airBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
-        bottomRow.addView(radioBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
         bottomRow.addView(queueBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
+        bottomRow.addView(npDownloadBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
+        bottomRow.addView(shareBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
+        bottomRow.addView(moreBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
         inner.addView(bottomRow)
 
         nowPlaying.addView(inner, FrameLayout.LayoutParams(-1, -1))
@@ -1365,22 +1451,37 @@ class MainActivity : Activity() {
             npVolume.progress = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
         } catch (_: Exception) {
         }
+        // Slide up from the mini player instead of a hard cut; the
+        // transform is composited, so it stays smooth on mid-range GPUs.
+        val h = nowPlaying.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+        nowPlaying.translationY = h.toFloat()
+        nowPlaying.animate().translationY(0f).setDuration(300)
+            .setInterpolator(DecelerateInterpolator()).start()
     }
 
     private fun hideNowPlaying() {
-        nowPlaying.visibility = View.GONE
+        val h = nowPlaying.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+        nowPlaying.animate().translationY(h.toFloat()).setDuration(230)
+            .setInterpolator(AccelerateInterpolator())
+            .withEndAction {
+                nowPlaying.visibility = View.GONE
+                nowPlaying.translationY = 0f
+            }
+            .start()
     }
 
     override fun onBackPressed() {
-        if (::nowPlaying.isInitialized && nowPlaying.visibility == View.VISIBLE) {
-            hideNowPlaying()
-        } else {
-            super.onBackPressed()
+        when {
+            ::menuOverlay.isInitialized && menuOverlay.visibility == View.VISIBLE -> hideMenu()
+            ::queueOverlay.isInitialized && queueOverlay.visibility == View.VISIBLE -> hideQueue()
+            ::nowPlaying.isInitialized && nowPlaying.visibility == View.VISIBLE -> hideNowPlaying()
+            else -> super.onBackPressed()
         }
     }
 
     private fun updateProgress() {
         if (!::nowPlaying.isInitialized || nowPlaying.visibility != View.VISIBLE || seeking) return
+        updateSleepLabel()
         val p = player ?: return
         try {
             val dur = p.duration
@@ -1426,14 +1527,20 @@ class MainActivity : Activity() {
         val idx = queue.indexOfFirst { it.id == track.id && it.source == track.source }
         if (idx >= 0) {
             queueIndex = idx
+            if (playOrder.isEmpty()) rebuildOrder()
         } else {
-            queue = listOf(track)
-            queueIndex = 0
+            setQueue(listOf(track), 0)
         }
         current = track
         saveRecent(track)
         refreshPlaybackUi()
         val token = ++playToken
+        // A downloaded copy always wins: instant start, works offline.
+        val local = Downloads.localFile(this, track)
+        if (local != null) {
+            startPlayback(local.absolutePath)
+            return
+        }
         if (track.source == SOURCE_YOUTUBE) {
             // Stop the previous track now; the direct stream URL is
             // resolved on-device in the background, then handed to the
@@ -1470,7 +1577,7 @@ class MainActivity : Activity() {
                 it.start()
                 refreshPlaybackUi()
             }
-            setOnCompletionListener { refreshPlaybackUi() }
+            setOnCompletionListener { handleCompletion() }
             setOnErrorListener { _, _, _ ->
                 refreshPlaybackUi()
                 Toast.makeText(this@MainActivity, "This track could not be played.", Toast.LENGTH_SHORT).show()
@@ -1480,14 +1587,93 @@ class MainActivity : Activity() {
         }
     }
 
+    // ------------------------------------------------------------ queue order, shuffle, repeat
+
+    /** Replaces the queue and rebuilds the play order around it. */
+    private fun setQueue(newQueue: List<Track>, startIndex: Int = -1) {
+        queue = newQueue
+        if (startIndex in newQueue.indices) {
+            queueIndex = startIndex
+        } else if (queueIndex !in newQueue.indices) {
+            queueIndex = -1
+        }
+        rebuildOrder()
+    }
+
+    /** Play order is a permutation of queue indices: identity normally,
+     *  current-first + shuffled rest while shuffle is on. */
+    private fun rebuildOrder() {
+        playOrder = if (shuffleOn && queue.isNotEmpty()) {
+            val rest = queue.indices.filter { it != queueIndex }.shuffled()
+            if (queueIndex in queue.indices) listOf(queueIndex) + rest else rest
+        } else {
+            queue.indices.toList()
+        }
+    }
+
+    private fun currentOrderPos(): Int = playOrder.indexOf(queueIndex)
+
+    private fun toggleShuffle() {
+        shuffleOn = !shuffleOn
+        rebuildOrder()
+        refreshTransportStates()
+        Toast.makeText(this, if (shuffleOn) "Shuffle on" else "Shuffle off", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun toggleRepeat() {
+        repeatMode = (repeatMode + 1) % 3
+        refreshTransportStates()
+        val msg = when (repeatMode) {
+            1 -> "Repeat all"
+            2 -> "Repeat one"
+            else -> "Repeat off"
+        }
+        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun refreshTransportStates() {
+        if (!::npShuffleBtn.isInitialized || !::npRepeatBtn.isInitialized) return
+        npShuffleBtn.setColorFilter(if (shuffleOn) accent else white55)
+        npRepeatBtn.setImageResource(if (repeatMode == 2) R.drawable.ic_repeat_one else R.drawable.ic_repeat)
+        npRepeatBtn.setColorFilter(if (repeatMode > 0) accent else white55)
+    }
+
+    /** End-of-track: repeat-one replays, otherwise advance through the
+     *  play order, wrapping only under repeat-all. */
+    private fun handleCompletion() {
+        val t = current
+        if (t == null) {
+            refreshPlaybackUi()
+            return
+        }
+        if (repeatMode == 2) {
+            play(t)
+            return
+        }
+        val pos = currentOrderPos()
+        if (pos >= 0 && pos + 1 in playOrder.indices) {
+            play(queue[playOrder[pos + 1]])
+            return
+        }
+        if (repeatMode == 1 && playOrder.isNotEmpty()) {
+            play(queue[playOrder[0]])
+            return
+        }
+        refreshPlaybackUi()
+    }
+
     private fun playNext() {
         if (queue.isEmpty() || queueIndex < 0) return
-        val next = queueIndex + 1
-        if (next < queue.size) {
-            play(queue[next])
-        } else {
-            Toast.makeText(this, "No next track", Toast.LENGTH_SHORT).show()
+        val pos = currentOrderPos()
+        if (pos >= 0 && pos + 1 in playOrder.indices) {
+            play(queue[playOrder[pos + 1]])
+            return
         }
+        if (repeatMode == 1 && playOrder.isNotEmpty()) {
+            play(queue[playOrder[0]])
+            return
+        }
+        Toast.makeText(this, "No next track", Toast.LENGTH_SHORT).show()
     }
 
     private fun playPrevious() {
@@ -1500,9 +1686,9 @@ class MainActivity : Activity() {
         } catch (_: IllegalStateException) {
         }
         if (queue.isEmpty() || queueIndex < 0) return
-        val prev = queueIndex - 1
-        if (prev >= 0) {
-            play(queue[prev])
+        val pos = currentOrderPos()
+        if (pos > 0) {
+            play(queue[playOrder[pos - 1]])
         } else {
             try {
                 p?.seekTo(0)
@@ -1511,20 +1697,52 @@ class MainActivity : Activity() {
         }
     }
 
+    /** Inserts [track] to play right after the current track, keeping
+     *  the shuffled order consistent. */
+    private fun playNextInsert(track: Track) {
+        if (queue.isEmpty() || queueIndex < 0) {
+            setQueue(listOf(track), 0)
+            play(track)
+            return
+        }
+        val insertPos = queueIndex + 1
+        val newQueue = queue.toMutableList()
+        newQueue.add(insertPos, track)
+        val pos = currentOrderPos()
+        val newOrder = playOrder.map { if (it >= insertPos) it + 1 else it }.toMutableList()
+        newOrder.add(if (pos >= 0) pos + 1 else newOrder.size, insertPos)
+        queue = newQueue
+        playOrder = newOrder
+        Toast.makeText(this, "Will play next", Toast.LENGTH_SHORT).show()
+    }
+
+    /** Appends [track] at the end of the queue and the play order. */
+    private fun appendToQueue(track: Track) {
+        if (queue.isEmpty()) {
+            setQueue(listOf(track))
+        } else {
+            val newIndex = queue.size
+            queue = queue + track
+            playOrder = playOrder + newIndex
+        }
+        Toast.makeText(this, "Added to queue", Toast.LENGTH_SHORT).show()
+    }
+
     /**
-     * "Start radio" from Now Playing: builds a YouTube Music radio queue
-     * around the current track. The playing track is NOT interrupted —
-     * it stays as queue head and the radio tracks become what's next.
-     * Radio needs a YouTube seed (the automix is keyed by video id).
+     * Builds a YouTube Music radio queue around [seed]. When the seed
+     * is the playing track it is NOT interrupted — it stays as queue
+     * head and the radio tracks become what's next; for any other seed
+     * playback switches to it with its radio behind it. Radio needs a
+     * YouTube seed (the automix is keyed by video id).
      */
-    private fun startRadio() {
-        val seed = current ?: return
+    private fun startRadioFor(seed: Track) {
         if (seed.source != SOURCE_YOUTUBE) {
             Toast.makeText(this, "Radio is available for YouTube tracks", Toast.LENGTH_SHORT).show()
             return
         }
         Toast.makeText(this, "Starting radio…", Toast.LENGTH_SHORT).show()
         val token = playToken
+        val seedIsCurrent = current?.id == seed.id && current?.source == seed.source
         executor.execute {
             var list: List<Track> = emptyList()
             var err: String? = null
@@ -1544,8 +1762,8 @@ class MainActivity : Activity() {
                     Toast.makeText(this@MainActivity, "Radio unavailable right now.", Toast.LENGTH_SHORT).show()
                     return@runOnUiThread
                 }
-                queue = listOf(seed) + rest
-                queueIndex = 0
+                setQueue(listOf(seed) + rest, 0)
+                if (!seedIsCurrent) play(seed)
                 Toast.makeText(
                     this@MainActivity,
                     "Radio on · ${queue.size} tracks queued",
@@ -1581,6 +1799,8 @@ class MainActivity : Activity() {
         if (::npPlayButton.isInitialized) {
             npPlayButton.setImageResource(if (playing) R.drawable.ic_pause else R.drawable.ic_play)
         }
+        refreshTransportStates()
+        refreshDownloadButton()
         if (t == null) return
         miniTitle.text = t.title
         miniArtist.text = t.artist
@@ -1595,6 +1815,340 @@ class MainActivity : Activity() {
             npElapsed.text = "0:00"
             npRemaining.text = "-" + fmt(t.duration * 1000)
         }
+    }
+
+    // ---------------------------------------------------------------- menus, queue screen, sleep timer, downloads
+
+    private fun buildMenuOverlay(root: FrameLayout) {
+        menuOverlay = FrameLayout(this).apply {
+            visibility = View.GONE
+            setBackgroundColor(Color.argb(150, 0, 0, 0))
+            setOnClickListener { hideMenu() }
+        }
+        menuPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = glassBg(22f, Color.argb(242, 30, 30, 33), Color.argb(36, 255, 255, 255))
+            setPadding(dp(8), dp(10), dp(8), dp(10))
+            elevation = dp(16).toFloat()
+            isClickable = true // absorb taps; only the dim backdrop dismisses
+        }
+        menuTitle = label("", 13.5f, white50, boldTf).apply {
+            setPadding(dp(14), dp(6), dp(14), dp(8))
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        menuList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        menuPanel.addView(menuTitle)
+        menuPanel.addView(menuList)
+        val pLp = FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM)
+        pLp.setMargins(dp(12), 0, dp(12), dp(12))
+        menuOverlay.addView(menuPanel, pLp)
+        root.addView(menuOverlay, FrameLayout.LayoutParams(-1, -1))
+    }
+
+    /** Glass bottom-sheet menu used for track actions, the Now Playing
+     *  more menu, and the sleep timer picker. */
+    private fun showMenu(title: String?, items: List<Pair<String, () -> Unit>>) {
+        if (title.isNullOrEmpty()) {
+            menuTitle.visibility = View.GONE
+        } else {
+            menuTitle.visibility = View.VISIBLE
+            menuTitle.text = title
+        }
+        menuList.removeAllViews()
+        items.forEachIndexed { i, (text, action) ->
+            if (i > 0) {
+                val h = View(this).apply { setBackgroundColor(Color.argb(20, 255, 255, 255)) }
+                val lp = LinearLayout.LayoutParams(-1, 1)
+                lp.setMargins(dp(14), 0, dp(14), 0)
+                menuList.addView(h, lp)
+            }
+            val row = label(text, 16.5f, Color.WHITE).apply {
+                setPadding(dp(14), dp(13), dp(14), dp(13))
+                isClickable = true
+                rippleRect()
+                setOnClickListener {
+                    hideMenu()
+                    action()
+                }
+            }
+            menuList.addView(row)
+        }
+        menuOverlay.visibility = View.VISIBLE
+        menuOverlay.alpha = 0f
+        menuOverlay.animate().alpha(1f).setDuration(150).start()
+        menuPanel.translationY = dp(28).toFloat()
+        menuPanel.animate().translationY(0f).setDuration(220)
+            .setInterpolator(DecelerateInterpolator()).start()
+    }
+
+    private fun hideMenu() {
+        if (::menuOverlay.isInitialized) menuOverlay.visibility = View.GONE
+    }
+
+    /** The Now Playing ⋯ menu. Radio lives here; sleep timer, artist
+     *  jump and queue actions alongside. */
+    private fun showNpMenu() {
+        val t = current ?: return
+        val items = mutableListOf<Pair<String, () -> Unit>>()
+        items += "Start Radio" to { startRadioFor(t) }
+        val sleepText = if (sleepDeadline > System.currentTimeMillis()) {
+            "Sleep Timer · " + fmt((sleepDeadline - System.currentTimeMillis()).toInt()) + " left"
+        } else {
+            "Sleep Timer"
+        }
+        items += sleepText to { showSleepMenu() }
+        if (t.artistId != null) {
+            items += "Go to Artist" to {
+                hideNowPlaying()
+                showArtist(t.artistId, t.artist, t.artworkLarge)
+            }
+        }
+        items += "Play Next" to { playNextInsert(t) }
+        items += "Add to Queue" to { appendToQueue(t) }
+        showMenu(t.title, items)
+    }
+
+    private fun showSleepMenu() {
+        val items = mutableListOf<Pair<String, () -> Unit>>()
+        items += "Off" to { setSleepTimer(0) }
+        for (m in listOf(5, 10, 15, 30, 45, 60)) {
+            items += "$m minutes" to { setSleepTimer(m) }
+        }
+        showMenu("Sleep Timer", items)
+    }
+
+    private fun setSleepTimer(minutes: Int) {
+        handler.removeCallbacks(sleepFire)
+        if (minutes <= 0) {
+            sleepDeadline = 0L
+            Toast.makeText(this, "Sleep timer off", Toast.LENGTH_SHORT).show()
+        } else {
+            sleepDeadline = System.currentTimeMillis() + minutes * 60_000L
+            handler.postDelayed(sleepFire, minutes * 60_000L)
+            Toast.makeText(this, "Sleep timer: $minutes min", Toast.LENGTH_SHORT).show()
+        }
+        updateSleepLabel()
+    }
+
+    /** The honest remaining-time label under the Now Playing controls. */
+    private fun updateSleepLabel() {
+        if (!::npSleepLabel.isInitialized) return
+        val remaining = sleepDeadline - System.currentTimeMillis()
+        if (sleepDeadline > 0 && remaining > 0) {
+            npSleepLabel.text = "Sleep timer · " + fmt(remaining.toInt())
+            npSleepLabel.visibility = View.VISIBLE
+        } else {
+            npSleepLabel.visibility = View.GONE
+        }
+    }
+
+    /** Context menu for any track row (⋯ button or long-press), on
+     *  every screen that lists songs. */
+    private fun showTrackMenu(track: Track) {
+        val items = mutableListOf<Pair<String, () -> Unit>>()
+        items += "Play Next" to { playNextInsert(track) }
+        items += "Add to Queue" to { appendToQueue(track) }
+        if (Downloads.isDownloaded(this, track)) {
+            items += "Remove Download" to {
+                Downloads.remove(this, track)
+                Toast.makeText(this, "Download removed", Toast.LENGTH_SHORT).show()
+                refreshPlaybackUi()
+            }
+        } else {
+            items += "Download" to { startDownload(track) }
+        }
+        items += "Share" to { shareTrack(track) }
+        if (track.source == SOURCE_YOUTUBE) {
+            items += "Start Radio" to { startRadioFor(track) }
+        }
+        if (track.artistId != null) {
+            items += "Go to Artist" to {
+                if (::nowPlaying.isInitialized && nowPlaying.visibility == View.VISIBLE) hideNowPlaying()
+                showArtist(track.artistId, track.artist, track.artworkLarge)
+            }
+        }
+        showMenu(track.title, items)
+    }
+
+    private fun shareTrack(track: Track?) {
+        val t = track ?: return
+        val text = buildString {
+            append(t.title)
+            if (t.artist.isNotEmpty()) append(" — ").append(t.artist)
+            if (t.source == SOURCE_YOUTUBE) append("\nhttps://music.youtube.com/watch?v=${t.id}")
+        }
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, text)
+        }
+        startActivity(Intent.createChooser(intent, "Share track"))
+    }
+
+    // ------------------------------------------------------------ downloads glue
+
+    private fun refreshDownloadButton() {
+        if (!::npDownloadBtn.isInitialized) return
+        val t = current ?: return
+        when {
+            downloading.contains(Downloads.key(t)) -> {
+                npDownloadBtn.setImageResource(R.drawable.ic_download)
+                npDownloadBtn.setColorFilter(white50)
+            }
+            Downloads.isDownloaded(this, t) -> {
+                npDownloadBtn.setImageResource(R.drawable.ic_downloaded)
+                npDownloadBtn.setColorFilter(accent)
+            }
+            else -> {
+                npDownloadBtn.setImageResource(R.drawable.ic_download)
+                npDownloadBtn.setColorFilter(white75)
+            }
+        }
+    }
+
+    private fun downloadCurrent() {
+        val t = current ?: return
+        if (Downloads.isDownloaded(this, t)) {
+            Toast.makeText(this, "Already downloaded", Toast.LENGTH_SHORT).show()
+            return
+        }
+        startDownload(t)
+    }
+
+    private fun startDownload(track: Track) {
+        if (!downloading.add(Downloads.key(track))) return
+        refreshDownloadButton()
+        Toast.makeText(this, "Downloading ${track.title}…", Toast.LENGTH_SHORT).show()
+        executor.execute {
+            var err: String? = null
+            try {
+                Downloads.downloadSync(this@MainActivity, track)
+            } catch (e: Throwable) {
+                err = shortErr(e)
+            }
+            runOnUiThread {
+                downloading.remove(Downloads.key(track))
+                if (err != null) {
+                    Toast.makeText(this@MainActivity, "Download failed: $err", Toast.LENGTH_LONG).show()
+                } else {
+                    Toast.makeText(this@MainActivity, "Downloaded: ${track.title}", Toast.LENGTH_SHORT).show()
+                }
+                refreshPlaybackUi()
+            }
+        }
+    }
+
+    private fun showDownloads() {
+        generation++
+        beginScreen("Downloads", showAvatar = false)
+        val entries = Downloads.entries(this)
+        if (entries.isEmpty()) {
+            content.addView(sectionTitle("No downloads yet"))
+            content.addView(
+                label(
+                    "Tracks you download from Now Playing or a track's ⋯ menu live here and play offline.",
+                    15f, white50
+                )
+            )
+        } else {
+            val list = entries.map { it.track }
+            content.addView(sectionTitle("${list.size} downloaded"))
+            addRows(list, withHairlines = true, queueContext = list)
+        }
+    }
+
+    // ------------------------------------------------------------ queue screen
+
+    private fun buildQueueOverlay(root: FrameLayout) {
+        queueOverlay = FrameLayout(this).apply {
+            visibility = View.GONE
+            setBackgroundColor(Color.argb(250, 0, 0, 0))
+        }
+        val inner = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(22), dp(48), dp(22), dp(20))
+        }
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        head.addView(label("Queue", 26f, Color.WHITE, boldTf), LinearLayout.LayoutParams(0, -2, 1f))
+        val done = label("Done", 16f, accent, mediumTf).apply {
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            isClickable = true
+            setOnClickListener { hideQueue() }
+        }
+        head.addView(done)
+        inner.addView(head)
+        val scroll = ScrollView(this)
+        queueList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        scroll.addView(queueList)
+        val sLp = LinearLayout.LayoutParams(-1, 0, 1f)
+        sLp.topMargin = dp(8)
+        inner.addView(scroll, sLp)
+        queueOverlay.addView(inner, FrameLayout.LayoutParams(-1, -1))
+        root.addView(queueOverlay, FrameLayout.LayoutParams(-1, -1))
+    }
+
+    private fun showQueue() {
+        queueList.removeAllViews()
+        if (queue.isEmpty() || queueIndex < 0) {
+            queueList.addView(label("Queue is empty.", 15f, white50).apply {
+                setPadding(0, dp(16), 0, 0)
+            })
+        } else {
+            queueList.addView(sectionTitle("Now Playing"))
+            queueList.addView(queueRow(queue[queueIndex], isCurrent = true))
+            val pos = currentOrderPos()
+            val upcoming = if (pos >= 0) playOrder.drop(pos + 1) else emptyList()
+            if (upcoming.isNotEmpty()) {
+                queueList.addView(sectionTitle("Next Up"))
+                upcoming.forEach { qi -> queueList.addView(queueRow(queue[qi], isCurrent = false)) }
+            }
+        }
+        queueOverlay.visibility = View.VISIBLE
+        queueOverlay.alpha = 0f
+        queueOverlay.animate().alpha(1f).setDuration(180).start()
+    }
+
+    private fun hideQueue() {
+        if (::queueOverlay.isInitialized) queueOverlay.visibility = View.GONE
+    }
+
+    private fun queueRow(track: Track, isCurrent: Boolean): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+            if (!isCurrent) {
+                rippleRect()
+                setOnClickListener {
+                    hideQueue()
+                    play(track)
+                }
+            }
+        }
+        val img = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            roundedClip(this, 8)
+        }
+        ArtworkLoader.load(track.artworkSmall ?: track.artworkLarge, img)
+        row.addView(img, LinearLayout.LayoutParams(dp(46), dp(46)))
+        val text = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), 0, 0, 0)
+        }
+        text.addView(label(track.title, 16f, if (isCurrent) accent else Color.WHITE, mediumTf).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        text.addView(label(track.artist, 14f, white50).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
+        if (isCurrent) row.addView(visualizer())
+        return row
     }
 
     // ---------------------------------------------------------------- recents
@@ -1730,6 +2284,9 @@ class MainActivity : Activity() {
             head.addView(avatar, aLp)
         }
         content.addView(head)
+        // Cheap 150ms fade so tab switches don't hard-cut.
+        content.alpha = 0f
+        content.animate().alpha(1f).setDuration(150).start()
     }
 
     private fun sectionTitle(text: String): TextView {
