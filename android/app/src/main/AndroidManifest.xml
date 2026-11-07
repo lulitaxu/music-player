@@ -1,7 +1,19 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Live visualizer only: the audiofx Visualizer reads playback
+         LEVELS from the player's own audio session. Nothing is
+         recorded or stored; the permission is Android's requirement
+         for any Visualizer use. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <!-- Background playback (0.6.1): the media notification is the
+         foreground service's face. Requested at runtime on first
+         play; if denied, playback continues and the system simply
+         hides the notification. WAKE_LOCK pairs with ExoPlayer's
+         WAKE_MODE_NETWORK so screen-off streaming does not stall. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <application
         android:theme="@style/AppTheme"
         android:label="arzxsh"
@@ -18,5 +30,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- Background playback service (0.6.1): media notification
+             + media session; the mediaPlayback type is the
+             Android 14 foreground-service requirement. Not
+             exported: only this app starts it and sends it
+             transport actions; media-button routing goes through
+             the session itself. -->
+        <service
+            android:name=".PlaybackService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
     </application>
 </manifest>
