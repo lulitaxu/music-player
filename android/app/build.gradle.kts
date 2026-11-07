@@ -1,5 +1,3 @@
-import java.util.Properties
-
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -9,17 +7,28 @@ android {
     namespace = "com.arzx.music"
     compileSdk = 35
 
-    val signingProperties = rootProject.file("keystore.properties")
-    if (signingProperties.exists()) {
-        val props = Properties().apply {
-            load(signingProperties.inputStream())
-        }
+    // Signing identity (0.6.6): ONE permanent keystore signs every build,
+    // so in-app updates install in place. Before this, CI signed each run
+    // with a fresh throwaway debug key and Android refused every update
+    // ("package conflicts with an existing package").
+    // Canonical source = environment variables. CI injects them from
+    // GitHub secrets (keystore decoded to a temp path); locally they are
+    // derived from keys/keystore.env at the repo root, which is
+    // gitignored — never commit a keystore or its password.
+    //   ANDROID_KEYSTORE_FILE     path to the .keystore file
+    //   ANDROID_KEYSTORE_PASSWORD store password
+    //   ANDROID_KEY_ALIAS         key alias
+    //   ANDROID_KEY_PASSWORD      key password
+    // When the vars are absent (plain local build), debug falls back to
+    // the default Android debug key and release is left unsigned.
+    val keystorePath = System.getenv("ANDROID_KEYSTORE_FILE")
+    if (!keystorePath.isNullOrBlank()) {
         signingConfigs {
-            create("release") {
-                storeFile = file(props.getProperty("storeFile"))
-                storePassword = props.getProperty("storePassword")
-                keyAlias = props.getProperty("keyAlias")
-                keyPassword = props.getProperty("keyPassword")
+            create("stable") {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
             }
         }
     }
@@ -28,8 +37,8 @@ android {
         applicationId = "com.arzx.music"
         minSdk = 26
         targetSdk = 35
-        versionCode = 13
-        versionName = "0.6.5"
+        versionCode = 14
+        versionName = "0.6.6"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -37,6 +46,8 @@ android {
         debug {
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
+            // Null when the env vars are absent -> default debug key.
+            signingConfig = signingConfigs.findByName("stable")
         }
         release {
             isMinifyEnabled = true
@@ -45,7 +56,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.findByName("release")
+            signingConfig = signingConfigs.findByName("stable")
         }
     }
 
