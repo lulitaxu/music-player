@@ -13,6 +13,7 @@ import android.media.MediaMetadataRetriever
 import android.media.audiofx.AudioEffect
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultDataSource
@@ -257,6 +258,7 @@ private object ArtworkLoader {
  * track's session. All calls happen on the main thread (ExoPlayer's
  * contract) and are exception-shielded like the MediaPlayer code was.
  */
+@OptIn(UnstableApi::class)
 private class EnginePlayer(val exo: ExoPlayer) {
     @Volatile
     var retired = false
@@ -305,6 +307,7 @@ private class EnginePlayer(val exo: ExoPlayer) {
     }
 }
 
+@OptIn(UnstableApi::class)
 class MainActivity : Activity() {
     private val executor = Executors.newSingleThreadExecutor()
 
