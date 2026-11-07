@@ -2408,10 +2408,14 @@ class MainActivity : Activity() {
 
     /** Small-caps group header, the reference apps' settings shape. */
     private fun settingsGroupHeader(text: String): TextView {
-        val tv = label(text.uppercase(), 12.5f, white50, boldTf).apply { letterSpacing = 0.12f }
+        // Breathing room (0.6.4, WS-3): sections were separated
+        // by 26dp above and only 4dp below the header, so groups
+        // read as one cramped column. 34/10 gives each section a
+        // visible start.
+        val tv = label(text.uppercase(), 13f, white50, boldTf).apply { letterSpacing = 0.12f }
         val lp = LinearLayout.LayoutParams(-1, -2)
-        lp.topMargin = dp(26)
-        lp.bottomMargin = dp(4)
+        lp.topMargin = dp(34)
+        lp.bottomMargin = dp(10)
         tv.layoutParams = lp
         return tv
     }
@@ -2428,22 +2432,32 @@ class MainActivity : Activity() {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(11), 0, dp(11))
+            // Spacing pass (0.6.4, WS-3): rows were 11dp-padded
+            // (~45dp single-line — under the 48dp touch floor —
+            // and visually tight). 15dp padding + a 60dp floor
+            // puts every row at a comfortable, consistent height.
+            setPadding(0, dp(15), 0, dp(15))
+            minimumHeight = dp(60)
             rippleRect()
             isClickable = true
             setOnClickListener { onClick() }
         }
-        // Leading glyph (0.6.1 icon pass): 22dp, secondary tint —
-        // accent only where the row itself is accent-relevant
-        // (Theme color passes iconTint = accent).
+        // Leading glyph (0.6.1 icon pass, 24dp since WS-3):
+        // secondary tint — accent only where the row itself is
+        // accent-relevant (Theme color passes iconTint = accent).
         if (iconRes != null) {
-            val ivLp = LinearLayout.LayoutParams(dp(22), dp(22))
-            ivLp.marginEnd = dp(12)
+            val ivLp = LinearLayout.LayoutParams(dp(24), dp(24))
+            ivLp.marginEnd = dp(14)
             row.addView(icon(iconRes, iconTint), ivLp)
         }
         val text = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        text.addView(label(title, 15.5f, titleColor))
-        if (subtitle != null) text.addView(label(subtitle, 13f, white50))
+        text.addView(label(title, 16f, titleColor))
+        if (subtitle != null) {
+            val sub = label(subtitle, 13.5f, white50)
+            val subLp = LinearLayout.LayoutParams(-1, -2)
+            subLp.topMargin = dp(3)
+            text.addView(sub, subLp)
+        }
         row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
         row.addView(label("›", 22f, white50))
         return row
@@ -2694,7 +2708,7 @@ class MainActivity : Activity() {
                     "The next song loads before this one ends, so tracks flow with no gap"
                 },
                 12.5f, white50
-            ).apply { setPadding(dp(34), 0, 0, dp(8)) }
+            ).apply { setPadding(dp(38), 0, 0, dp(10)) }
         )
         content.addView(
             settingsRow(
@@ -2750,7 +2764,7 @@ class MainActivity : Activity() {
         content.addView(setting("Live visualizer", true) { updateVisualizerState() })
         content.addView(
             label(liveVizSubtitle(), 12.5f, white50).apply {
-                setPadding(dp(34), 0, 0, dp(8))
+                setPadding(dp(38), 0, 0, dp(10))
             }
         )
         content.addView(setting("Compact mini-player", false))
@@ -2760,7 +2774,7 @@ class MainActivity : Activity() {
         content.addView(ImageView(this).apply {
             setImageResource(R.drawable.ic_logo)
             layoutParams = LinearLayout.LayoutParams(dp(52), dp(52))
-            setPadding(0, dp(2), 0, dp(10))
+            setPadding(0, dp(2), 0, dp(16))
         })
         // Read from the build, never hardcoded (v4 shipped a stale
         // literal "Version 0.2.0" long after the app had moved on).
@@ -2769,11 +2783,21 @@ class MainActivity : Activity() {
         } catch (_: Exception) {
             null
         } ?: "?"
-        content.addView(label("Version $ver", 15f, Color.WHITE))
-        content.addView(label("arzxsh by Arafat Arzu", 15f, white50))
-        content.addView(label("Sources · YouTube Music · Audius · On-device files", 15f, white50))
-        content.addView(label("Lyrics · LRCLIB / lyrics.ovh when available", 15f, white50))
-        content.addView(label("No DRM bypass, ever.", 15f, white50))
+        // About lines get real line gaps (0.6.4, WS-3): they were
+        // stacked at the label helper's bare 2dp padding and read
+        // as one tight block.
+        content.addView(label("Version $ver", 15.5f, Color.WHITE))
+        for (line in listOf(
+            "arzxsh by Arafat Arzu",
+            "Sources · YouTube Music · Audius · On-device files",
+            "Lyrics · LRCLIB / lyrics.ovh when available",
+            "No DRM bypass, ever."
+        )) {
+            val lv = label(line, 15.5f, white50)
+            val lvLp = LinearLayout.LayoutParams(-1, -2)
+            lvLp.topMargin = dp(5)
+            content.addView(lv, lvLp)
+        }
         content.addView(settingsRow("Open-source licenses", null, iconRes = R.drawable.ic_doc) { showLicenses() })
         content.addView(
             settingsRow(
@@ -8217,7 +8241,7 @@ class MainActivity : Activity() {
         val key = "setting_$name"
         val sw = Switch(this).apply {
             text = name
-            textSize = 15f
+            textSize = 16f
             setTextColor(Color.WHITE)
             val states = arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf())
             thumbTintList = ColorStateList(states, intArrayOf(accent, Color.argb(160, 255, 255, 255)))
@@ -8237,15 +8261,20 @@ class MainActivity : Activity() {
                 onChange?.invoke(checked)
             }
         }
-        // Icon slot (0.6.1): 22dp glyph, secondary tint, same slot
-        // geometry as the tappable rows.
+        // Icon slot (0.6.1; 24dp since 0.6.4 WS-3): same slot
+        // geometry as the tappable rows, and the same 60dp row
+        // floor, so toggle rows and tappable rows share one
+        // rhythm down the whole Settings screen. Toggle rows
+        // had NO vertical padding before WS-3.
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+            minimumHeight = dp(60)
         }
         settingIconRes(name)?.let { res ->
-            val ivLp = LinearLayout.LayoutParams(dp(22), dp(22))
-            ivLp.marginEnd = dp(12)
+            val ivLp = LinearLayout.LayoutParams(dp(24), dp(24))
+            ivLp.marginEnd = dp(14)
             row.addView(icon(res, white55), ivLp)
         }
         row.addView(sw, LinearLayout.LayoutParams(0, -2, 1f))
