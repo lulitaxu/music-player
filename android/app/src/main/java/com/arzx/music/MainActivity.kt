@@ -8607,6 +8607,31 @@ class MainActivity : Activity() {
             aLp.marginStart = dp(10)
             head.addView(avatarBox, aLp)
         }
+        if (title == "Listen Now") {
+            // Brand lockup (0.6.4, WS-4/WS-5): the living
+            // Equalizer A + wordmark as a compact brand row
+            // ABOVE the title — beside it would crowd the 32sp
+            // headline and the corner avatar; stacked, the
+            // composition reads brand → screen → content and
+            // the title stays the biggest type on the screen.
+            // Listen Now only.
+            val brand = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(2), 0, dp(10))
+            }
+            val logo = EqLogoView(this).apply {
+                motionAllowed = { !activityStopped && !reduceMotion() }
+                playingProvider = { isPlayingSafe() }
+                contentDescription = "arzxsh"
+            }
+            brand.addView(logo, LinearLayout.LayoutParams(dp(28), dp(28)))
+            val wm = label("arzxsh", 17f, Color.WHITE, semiboldTf)
+            val wmLp = LinearLayout.LayoutParams(-2, -2)
+            wmLp.marginStart = dp(9)
+            brand.addView(wm, wmLp)
+            content.addView(brand, 0)
+        }
         content.addView(head)
         // Cheap 150ms fade so tab switches don't hard-cut.
         if (reduceMotion()) {
@@ -8626,7 +8651,7 @@ class MainActivity : Activity() {
      *  and the profile sheet preview (96dp). */
     private fun fillAvatar(box: FrameLayout, sizeDp: Int) {
         box.removeAllViews()
-        val bmp = Profile.photoBitmap(this)
+        val bmp = Profile.photoBitmap(this, dp(sizeDp))
         if (bmp != null) {
             val iv = ImageView(this).apply {
                 setImageBitmap(bmp)

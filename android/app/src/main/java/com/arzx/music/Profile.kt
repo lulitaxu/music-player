@@ -26,10 +26,14 @@ import kotlin.math.min
  * read grant is consumed immediately by copying the image in
  * [savePhotoFromUri].
  *
- * Perf discipline: the stored photo decodes to ONE cached
- * bitmap (≤512×512, ~1 MB), decoded once per change and reused
- * by every header — never decoded per draw, never routed
- * through the remote-artwork pipeline.
+ * Perf discipline (the 0.6.4 optimization gate): the stored
+ * file is capped at 512px, and DISPLAY decodes are sampled to
+ * the requesting view's size — the ~34dp header corner decodes
+ * at ~128px class, only the 96dp sheet preview approaches the
+ * 512px ceiling. The largest decode per photo is cached and
+ * reused by smaller targets: one bounded decode per (photo
+ * change × size class), never a decode per draw, and nothing
+ * is routed through the remote-artwork pipeline.
  *
  * V7 NOTE: when Google sign-in ships, the Google account name
  * and photo take precedence over this local profile wherever
@@ -83,26 +87,47 @@ object Profile {
     @Volatile
     private var cachedStamp: Long = -1L
 
-    /** The stored photo, decoded once and cached by file
-     *  stamp; null when no photo is set. Safe to call on the
-     *  UI thread: the decode is a single ≤512px JPEG. */
-    fun photoBitmap(ctx: Context): Bitmap? {
+    /** The stored photo decoded for a view of [targetPx]
+     *  pixels, cached by file stamp; null when no photo is
+     *  set. The decode is sampled (largest power-of-two sample
+     *  still yielding ≥ [targetPx] wide), so the header corner
+     *  never pays for the full 512px bitmap. The largest decode
+     *  for a stamp is kept and reused by smaller targets. */
+    fun photoBitmap(ctx: Context, targetPx: Int): Bitmap? {
         val f = photoFile(ctx)
         if (!f.exists() || f.length() == 0L) return null
         val stamp = f.lastModified() xor f.length()
         synchronized(cacheLock) {
-            if (cached != null && cachedStamp == stamp) return cached
+            val c = cached
+            if (c != null && cachedStamp == stamp && c.width >= targetPx) return c
         }
         val bmp = try {
-            BitmapFactory.decodeFile(f.absolutePath)
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(f.absolutePath, bounds)
+            if (bounds.outWidth <= 0) {
+                null
+            } else {
+                var sample = 1
+                while (bounds.outWidth / (sample * 2) >= targetPx) sample *= 2
+                BitmapFactory.decodeFile(
+                    f.absolutePath,
+                    BitmapFactory.Options().apply { inSampleSize = sample }
+                )
+            }
         } catch (_: Exception) {
             null
         }
-        synchronized(cacheLock) {
-            cached = bmp
-            cachedStamp = stamp
+        if (bmp != null) {
+            synchronized(cacheLock) {
+                val c = cached
+                if (cachedStamp != stamp || c == null || bmp.width > c.width) {
+                    cached = bmp
+                    cachedStamp = stamp
+                }
+            }
+            return bmp
         }
-        return bmp
+        return synchronized(cacheLock) { if (cachedStamp == stamp) cached else null }
     }
 
     /**
