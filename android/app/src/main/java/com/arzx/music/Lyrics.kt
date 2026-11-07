@@ -299,7 +299,8 @@ object Lyrics {
         durationSec: Int,
         notes: MutableList<String>,
         tag: String
-    ): LyricsData? = try {
+    ): LyricsData? {
+        return try {
         val sb = StringBuilder("https://lrclib.net/api/search?track_name=")
         sb.append(enc(title))
         if (!artist.isNullOrEmpty()) sb.append("&artist_name=").append(enc(artist))
@@ -361,9 +362,10 @@ object Lyrics {
                 best!!.first
             }
         }
-    } catch (e: Exception) {
-        notes += "LRCLIB search ($tag): ${shortOutcome(e)}"
-        null
+        } catch (e: Exception) {
+            notes += "LRCLIB search ($tag): ${shortOutcome(e)}"
+            null
+        }
     }
 
     private fun lyricsOvh(title: String, artist: String, notes: MutableList<String>): LyricsData? = try {

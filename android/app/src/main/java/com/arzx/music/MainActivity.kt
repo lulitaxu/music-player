@@ -1864,7 +1864,7 @@ class MainActivity : Activity() {
                 value.text = fmtOffset(0L)
             }
         })
-        AlertDialog.Builder(this).setTitle("Lyrics sync offset").setView(box)
+        android.app.AlertDialog.Builder(this).setTitle("Lyrics sync offset").setView(box)
             .setPositiveButton("Done") { _, _ -> showSettings() }.show()
     }
 
@@ -4318,7 +4318,7 @@ class MainActivity : Activity() {
         val glow = GradientDrawable().apply {
             shape = GradientDrawable.OVAL
             gradientType = GradientDrawable.RADIAL_GRADIENT
-            gradientCenter(0.5f, 0.30f)
+            setGradientCenter(0.5f, 0.30f)
             gradientRadius = resources.displayMetrics.heightPixels * 0.75f
             colors = intArrayOf(
                 Color.argb(235, Color.red(c), Color.green(c), Color.blue(c)),
@@ -4349,7 +4349,7 @@ class MainActivity : Activity() {
      *  applied (effective line time = lineTimeMs − offsetMs). -1
      *  before the first line. Reads real player position only —
      *  no proportion-of-duration math anywhere. */
-    private fun currentLyricIndex(lines: List<LrcLine>, posMs: Long, offsetMs: Long): Int =
+    private fun currentLyricIndex(lines: List<LyriTimber>, posMs: Long, offsetMs: Long): Int =
         lines.indexOfLast { it.timeMs - offsetMs <= posMs }
 
     /** Fetches (LRCLIB-cached) lyrics for the Now Playing surfaces:
