@@ -23,6 +23,8 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.common.AudioAttributes as Media3AudioAttributes
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import android.provider.OpenableColumns
 import android.os.Bundle
 import android.os.Handler
@@ -36,6 +38,7 @@ import android.view.MotionEvent
 import android.view.VelocityTracker
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.ViewGroup
 import android.animation.ValueAnimator
 import android.view.animation.AccelerateInterpolator
 import android.view.animation.DecelerateInterpolator
@@ -905,7 +908,7 @@ class MainActivity : Activity() {
     private var gaplessFire: Runnable? = null
 
     private lateinit var queueOverlay: FrameLayout
-    private lateinit var queueList: LinearLayout
+    private lateinit var queueRecycler: RecyclerView
 
     private val sleepFire = Runnable {
         sleepDeadline = 0L
@@ -2042,8 +2045,11 @@ class MainActivity : Activity() {
                     }
                 }
                 runOnUiThread {
-                    searchInFlight = false
+                    // A stale search's completion must not clear
+                    // the NEWER search's in-flight flag (0.6.3):
+                    // the epoch check comes first now.
                     if (myEpoch != searchEpoch) return@runOnUiThread
+                    searchInFlight = false
                     resultsBox.removeAllViews()
                     resultsBox.addView(sectionTitle("Results for \"$q\""))
                     val nothing = found.isEmpty() && ytArtists.isEmpty() &&
@@ -2060,59 +2066,81 @@ class MainActivity : Activity() {
                     // render LAST, below the fold, behind Artists and
                     // Albums — a title search made the user scroll
                     // and hunt for the actual song.
+                    // The sections BELOW the songs render from
+                    // onDone (0.6.3): the song rows now build over
+                    // several frames, and Artists/Albums/Playlists
+                    // must stay under them, in the same order.
+                    val renderTail = {
+                        if (ytArtists.isNotEmpty()) {
+                            resultsBox.addView(sectionTitle("Artists"))
+                            ytArtists.forEach { resultsBox.addView(artistResultRow(it)) }
+                        }
+                        if (ytAlbums.isNotEmpty()) {
+                            resultsBox.addView(sectionTitle("Albums"))
+                            ytAlbums.forEachIndexed { i, album ->
+                                if (i > 0) resultsBox.addView(hairline())
+                                resultsBox.addView(albumResultRow(album))
+                            }
+                        }
+                        if (ytPlaylists.isNotEmpty()) {
+                            resultsBox.addView(sectionTitle("Playlists"))
+                            ytPlaylists.forEachIndexed { i, ref ->
+                                if (i > 0) resultsBox.addView(hairline())
+                                resultsBox.addView(ytmPlaylistRow(ref))
+                            }
+                        }
+                        // Source status: always on screen, success or failure.
+                        val errors = listOfNotNull(
+                            ytErr?.let { "songs: $it" },
+                            ytArtistsErr?.let { "artists: $it" },
+                            ytAlbumsErr?.let { "albums: $it" },
+                            ytPlaylistsErr?.let { "playlists: $it" }
+                        )
+                        if (errors.isNotEmpty()) {
+                            resultsBox.addView(errorLine("YouTube unavailable: " + errors.joinToString(" · ")))
+                        }
+                        if (mode == "youtube" && ytSongs.isEmpty() && !audius.isNullOrEmpty()) {
+                            // Search-level fallback, stated on screen:
+                            // YouTube failed or came back empty, so
+                            // Audius is carrying this search.
+                            resultsBox.addView(statusLine("YouTube songs unavailable — showing Audius results instead."))
+                        }
+                        if (mode == "audius") {
+                            resultsBox.addView(statusLine("Source: Audius only — YouTube Music is off."))
+                        }
+                        if (ytNote != null) {
+                            resultsBox.addView(statusLine("YouTube: $ytNote"))
+                        }
+                        if (mode != "audius" && errors.isEmpty() && ytNote == null) {
+                            resultsBox.addView(
+                                statusLine(
+                                    "YouTube Music: ${ytSongs.size} songs · ${ytArtists.size} artists · ${ytAlbums.size} albums · ${ytPlaylists.size} playlists"
+                                )
+                            )
+                        }
+                    }
                     if (found.isNotEmpty()) {
                         resultsBox.addView(sectionTitle("Top result"))
                         resultsBox.addView(topResultCard(found.first(), found, q))
                         resultsBox.addView(sectionTitle("Songs"))
                         setQueue(found)
-                        addRows(found, resultsBox, withHairlines = true, queueContext = found, contextLabel = "Search" to q)
-                    }
-                    if (ytArtists.isNotEmpty()) {
-                        resultsBox.addView(sectionTitle("Artists"))
-                        ytArtists.forEach { resultsBox.addView(artistResultRow(it)) }
-                    }
-                    if (ytAlbums.isNotEmpty()) {
-                        resultsBox.addView(sectionTitle("Albums"))
-                        ytAlbums.forEachIndexed { i, album ->
-                            if (i > 0) resultsBox.addView(hairline())
-                            resultsBox.addView(albumResultRow(album))
-                        }
-                    }
-                    if (ytPlaylists.isNotEmpty()) {
-                        resultsBox.addView(sectionTitle("Playlists"))
-                        ytPlaylists.forEachIndexed { i, ref ->
-                            if (i > 0) resultsBox.addView(hairline())
-                            resultsBox.addView(ytmPlaylistRow(ref))
-                        }
-                    }
-                    // Source status: always on screen, success or failure.
-                    val errors = listOfNotNull(
-                        ytErr?.let { "songs: $it" },
-                        ytArtistsErr?.let { "artists: $it" },
-                        ytAlbumsErr?.let { "albums: $it" },
-                        ytPlaylistsErr?.let { "playlists: $it" }
-                    )
-                    if (errors.isNotEmpty()) {
-                        resultsBox.addView(errorLine("YouTube unavailable: " + errors.joinToString(" · ")))
-                    }
-                    if (mode == "youtube" && ytSongs.isEmpty() && !audius.isNullOrEmpty()) {
-                        // Search-level fallback, stated on screen:
-                        // YouTube failed or came back empty, so
-                        // Audius is carrying this search.
-                        resultsBox.addView(statusLine("YouTube songs unavailable — showing Audius results instead."))
-                    }
-                    if (mode == "audius") {
-                        resultsBox.addView(statusLine("Source: Audius only — YouTube Music is off."))
-                    }
-                    if (ytNote != null) {
-                        resultsBox.addView(statusLine("YouTube: $ytNote"))
-                    }
-                    if (mode != "audius" && errors.isEmpty() && ytNote == null) {
-                        resultsBox.addView(
-                            statusLine(
-                                "YouTube Music: ${ytSongs.size} songs · ${ytArtists.size} artists · ${ytAlbums.size} albums · ${ytPlaylists.size} playlists"
-                            )
+                        // Chunked (audit S1): searchInFlight stays
+                        // true until the rows land so the Search
+                        // root never snapshots half-built.
+                        searchInFlight = true
+                        val genAtRender = generation
+                        addRowsChunked(
+                            found, resultsBox,
+                            queueContext = found,
+                            contextLabel = "Search" to q,
+                            alive = { myEpoch == searchEpoch && genAtRender == generation },
+                            onDone = { completed ->
+                                searchInFlight = false
+                                if (completed) renderTail()
+                            }
                         )
+                    } else {
+                        renderTail()
                     }
                 }
             }
@@ -2822,6 +2850,73 @@ class MainActivity : Activity() {
         }
     }
 
+    /** In-flight chunked builds (0.6.3): while > 0, tab roots are
+     *  NOT settled — a half-built list must never be snapshotted
+     *  into the retention cache (saveCurrentRoot checks this). */
+    private var chunkBuildsInFlight = 0
+
+    /**
+     * addRows spread across frames (0.6.3, audit S1): the shell
+     * lists live inside the app's ONE big ScrollView, where a
+     * RecyclerView expanded to full height would bind every row
+     * anyway (it has no viewport of its own — no recycling win;
+     * the queue overlay, which DOES own its viewport, got the
+     * real RecyclerView). The freeze being fixed here is the
+     * single synchronous 200-row build on tab switch, so the
+     * rows build ~20 per frame instead: the screen paints
+     * immediately and fills in over the next few frames.
+     * [alive] is the caller's staleness token (screen generation,
+     * search epoch): navigate away and the remaining chunks die
+     * instead of appending into another screen's tree. [onDone]
+     * runs on the UI thread when the last chunk lands (or at
+     * once for an empty list) — trailing sections that must
+     * stay BELOW the rows go there.
+     */
+    private fun addRowsChunked(
+        list: List<Track>,
+        target: LinearLayout,
+        withHairlines: Boolean = true,
+        queueContext: List<Track>? = null,
+        contextLabel: Pair<String, String>? = null,
+        menuOverrideFor: ((Int) -> (() -> Unit))? = null,
+        alive: () -> Boolean,
+        onDone: ((Boolean) -> Unit)? = null
+    ) {
+        if (list.isEmpty()) {
+            onDone?.invoke(true)
+            return
+        }
+        val dlKeys = Downloads.downloadedKeys(this)
+        chunkBuildsInFlight++
+        var idx = 0
+        fun step() {
+            if (!alive()) {
+                chunkBuildsInFlight--
+                onDone?.invoke(false)
+                return
+            }
+            val end = minOf(idx + 20, list.size)
+            while (idx < end) {
+                val track = list[idx]
+                if (withHairlines && idx > 0) target.addView(hairline())
+                addTrackRow(
+                    track, target, queueContext,
+                    contextLabel = contextLabel,
+                    menuOverride = menuOverrideFor?.invoke(idx),
+                    dlKeys = dlKeys
+                )
+                idx++
+            }
+            if (idx < list.size) {
+                handler.post { step() }
+            } else {
+                chunkBuildsInFlight--
+                onDone?.invoke(true)
+            }
+        }
+        step()
+    }
+
     private fun hairline(): View {
         val v = View(this).apply { setBackgroundColor(Color.argb(23, 255, 255, 255)) }
         val lp = LinearLayout.LayoutParams(-1, 1)
@@ -3358,7 +3453,12 @@ class MainActivity : Activity() {
                     }
                     actions.addView(dlBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
                     content.addView(actions)
-                    addRows(p.tracks, withHairlines = true, queueContext = p.tracks, contextLabel = "Album" to p.title)
+                    addRowsChunked(
+                        p.tracks, content,
+                        queueContext = p.tracks,
+                        contextLabel = "Album" to p.title,
+                        alive = { gen == generation }
+                    )
                 } else {
                     content.addView(label("No tracks listed for this album.", 15f, white50).apply {
                         setPadding(0, dp(18), 0, 0)
@@ -3617,7 +3717,12 @@ class MainActivity : Activity() {
                 playLp.setMargins(dp(14), 0, dp(14), 0)
                 actions.addView(playAll, playLp)
                 content.addView(actions)
-                addRows(tracks, withHairlines = true, queueContext = tracks, contextLabel = "Playlist" to ref.title)
+                addRowsChunked(
+                    tracks, content,
+                    queueContext = tracks,
+                    contextLabel = "Playlist" to ref.title,
+                    alive = { gen == generation }
+                )
             }
         }
     }
@@ -6441,8 +6546,24 @@ class MainActivity : Activity() {
         if (locals.isNotEmpty()) {
             val list = locals
             content.addView(sectionTitle("${list.size} imported"))
-            addRows(list, withHairlines = true, queueContext = list)
+            // Chunked (0.6.3, S1); the Import row + format note
+            // render in onDone so they stay BELOW the tracks.
+            val gen = generation
+            addRowsChunked(
+                list, content,
+                queueContext = list,
+                alive = { gen == generation },
+                onDone = { completed -> if (completed) addImportTail() }
+            )
+        } else {
+            addImportTail()
         }
+    }
+
+    /** Library tail: the import action + format note. Split out
+     *  (0.6.3) because with chunked local-track rows it must
+     *  render after the last chunk, not before it. */
+    private fun addImportTail() {
         content.addView(
             settingsRow("Import Music Files", "Links to files — nothing is copied") {
                 launchImport()
@@ -6769,16 +6890,16 @@ class MainActivity : Activity() {
             // Rows with playlist-specific menus: reorder happens
             // through explicit Move Up / Move Down items (the list
             // UI has no drag framework; numbered moves are exact).
-            val playlistDlKeys = Downloads.downloadedKeys(this)
-            p.tracks.forEachIndexed { i, track ->
-                if (i > 0) content.addView(hairline())
-                addTrackRow(
-                    track, content, p.tracks,
-                    contextLabel = "Playlist" to p.name,
-                    menuOverride = { showPlaylistTrackMenu(p.id, track, i) },
-                    dlKeys = playlistDlKeys
-                )
-            }
+            // Chunked (0.6.3, S1): a 200-track playlist no longer
+            // builds in one main-thread pass.
+            val gen = generation
+            addRowsChunked(
+                p.tracks, content,
+                queueContext = p.tracks,
+                contextLabel = "Playlist" to p.name,
+                menuOverrideFor = { i -> { showPlaylistTrackMenu(p.id, p.tracks[i], i) } },
+                alive = { gen == generation }
+            )
         } else {
             content.addView(label("This playlist is empty.", 15f, white50).apply {
                 setPadding(0, dp(18), 0, 0)
@@ -6834,7 +6955,13 @@ class MainActivity : Activity() {
             content.addView(label("Tap the heart on Now Playing and the song lands here.", 15f, white50))
         } else {
             content.addView(sectionTitle("${liked.size} liked"))
-            addRows(liked, withHairlines = true, queueContext = liked, contextLabel = "Playlist" to "Liked Songs")
+            val gen = generation
+            addRowsChunked(
+                liked, content,
+                queueContext = liked,
+                contextLabel = "Playlist" to "Liked Songs",
+                alive = { gen == generation }
+            )
         }
     }
 
@@ -6850,7 +6977,8 @@ class MainActivity : Activity() {
         } else {
             content.addView(sectionTitle("${events.size} plays"))
             val list = events.map { it.first }
-            addRows(list, withHairlines = true, queueContext = list)
+            val gen = generation
+            addRowsChunked(list, content, queueContext = list, alive = { gen == generation })
         }
     }
 
@@ -7079,7 +7207,8 @@ class MainActivity : Activity() {
         if (entries.isNotEmpty()) {
             val list = entries.map { it.track }
             content.addView(sectionTitle("${list.size} downloaded"))
-            addRows(list, withHairlines = true, queueContext = list)
+            val gen = generation
+            addRowsChunked(list, content, queueContext = list, alive = { gen == generation })
         }
     }
 
@@ -7508,40 +7637,45 @@ class MainActivity : Activity() {
         }
         head.addView(done)
         inner.addView(head)
-        val scroll = ScrollView(this)
-        queueList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        scroll.addView(queueList)
+        // 0.6.3 (audit S1): a RecyclerView with a real
+        // LinearLayoutManager — the queue is the one list that
+        // owns its viewport, so rows RECYCLE here instead of a
+        // 200-track queue building 200 row trees in one pass.
+        queueRecycler = RecyclerView(this).apply {
+            layoutManager = LinearLayoutManager(this@MainActivity)
+            itemAnimator = null
+            isVerticalScrollBarEnabled = false
+        }
         val sLp = LinearLayout.LayoutParams(-1, 0, 1f)
         sLp.topMargin = dp(8)
-        inner.addView(scroll, sLp)
+        inner.addView(queueRecycler, sLp)
         queueOverlay.addView(inner, FrameLayout.LayoutParams(-1, -1))
         root.addView(queueOverlay, FrameLayout.LayoutParams(-1, -1))
     }
 
+    /** Queue overlay items (0.6.3): the flattened section/row
+     *  structure the RecyclerView adapter binds. */
+    private sealed class QueueItem {
+        object Chips : QueueItem()
+        data class Note(val text: String) : QueueItem()
+        data class Section(val title: String, val clear: Boolean) : QueueItem()
+        data class Row(val track: Track, val isCurrent: Boolean, val queuePos: Int) : QueueItem()
+    }
+
     private fun showQueue() {
         ensureOverlays()
-        queueList.removeAllViews()
-        // Mode chips at the top of the queue (Apple puts the toggles
-        // here), reflecting and driving the same player state.
-        val modes = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dp(10), 0, dp(2))
-        }
-        modes.addView(modeChip("Shuffle", shuffleOn) { toggleShuffle(); showQueue() })
-        val repeatText = when (repeatMode) {
-            1 -> "Repeat All"
-            2 -> "Repeat One"
-            else -> "Repeat"
-        }
-        modes.addView(modeChip(repeatText, repeatMode > 0) { toggleRepeat(); showQueue() })
-        queueList.addView(modes)
+        // Same composition as the hand-built list had (0.6.3,
+        // audit S1): mode chips, Now Playing, the manual section
+        // with its Clear action, then Next Up — now as adapter
+        // items, so opening a 200-track queue binds only the
+        // rows on screen instead of building 200 row trees.
+        val items = ArrayList<QueueItem>()
+        items.add(QueueItem.Chips)
         if (queue.isEmpty() || queueIndex < 0) {
-            queueList.addView(label("Queue is empty.", 15f, white50).apply {
-                setPadding(0, dp(16), 0, 0)
-            })
+            items.add(QueueItem.Note("Queue is empty."))
         } else {
-            queueList.addView(sectionTitle("Now Playing"))
-            queueList.addView(queueRow(queue[queueIndex], isCurrent = true))
+            items.add(QueueItem.Section("Now Playing", clear = false))
+            items.add(QueueItem.Row(queue[queueIndex], isCurrent = true, queuePos = -1))
             val pos = currentOrderPos()
             val upcoming = if (pos >= 0) playOrder.drop(pos + 1) else emptyList()
             // Spotify's section rule: what the user queued by hand is
@@ -7549,17 +7683,188 @@ class MainActivity : Activity() {
             val manual = upcoming.filter { it in manualIndices }
             val rest = upcoming.filter { it !in manualIndices }
             if (manual.isNotEmpty()) {
-                queueList.addView(queueSectionHeader("Next in Queue", showClear = true))
-                manual.forEach { qi -> queueList.addView(queueRow(queue[qi], isCurrent = false, queuePos = qi)) }
+                items.add(QueueItem.Section("Next in Queue", clear = true))
+                manual.forEach { qi -> items.add(QueueItem.Row(queue[qi], isCurrent = false, queuePos = qi)) }
             }
             if (rest.isNotEmpty()) {
-                queueList.addView(sectionTitle("Next Up"))
-                rest.forEach { qi -> queueList.addView(queueRow(queue[qi], isCurrent = false, queuePos = qi)) }
+                items.add(QueueItem.Section("Next Up", clear = false))
+                rest.forEach { qi -> items.add(QueueItem.Row(queue[qi], isCurrent = false, queuePos = qi)) }
             }
         }
+        queueRecycler.adapter = QueueAdapter(items)
         queueOverlay.visibility = View.VISIBLE
         queueOverlay.alpha = 0f
         queueOverlay.animate().alpha(1f).setDuration(180).start()
+    }
+
+    /**
+     * The queue's RecyclerView adapter (0.6.3, audit S1). Row
+     * holders carry a fixed skeleton (art, title, artist,
+     * visualizer slot, remove) bound per track — every behavior
+     * of the hand-built rows is preserved: tap a non-current row
+     * to play it, the current row shows the live visualizer
+     * while playing, manual rows carry the remove action. The
+     * visualizer set a bind installs leaves the registry through
+     * the S4 detach pruning when the holder recycles.
+     */
+    private inner class QueueAdapter(private val items: List<QueueItem>) :
+        RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+
+        override fun getItemViewType(position: Int): Int = when (items[position]) {
+            is QueueItem.Chips -> 0
+            is QueueItem.Note -> 1
+            is QueueItem.Section -> 2
+            is QueueItem.Row -> 3
+        }
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder =
+            when (viewType) {
+                0 -> {
+                    val box = LinearLayout(this@MainActivity).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        setPadding(0, dp(10), 0, dp(2))
+                        layoutParams = RecyclerView.LayoutParams(-1, -2)
+                    }
+                    object : RecyclerView.ViewHolder(box) {}
+                }
+                1 -> {
+                    val tv = label("", 15f, white50).apply {
+                        setPadding(0, dp(16), 0, 0)
+                        layoutParams = RecyclerView.LayoutParams(-1, -2)
+                    }
+                    object : RecyclerView.ViewHolder(tv) {}
+                }
+                2 -> SectionHolder()
+                else -> RowHolder()
+            }
+
+        override fun getItemCount(): Int = items.size
+
+        override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
+            when (val item = items[position]) {
+                is QueueItem.Chips -> {
+                    val box = holder.itemView as LinearLayout
+                    box.removeAllViews()
+                    box.addView(modeChip("Shuffle", shuffleOn) { toggleShuffle(); showQueue() })
+                    val repeatText = when (repeatMode) {
+                        1 -> "Repeat All"
+                        2 -> "Repeat One"
+                        else -> "Repeat"
+                    }
+                    box.addView(modeChip(repeatText, repeatMode > 0) { toggleRepeat(); showQueue() })
+                }
+                is QueueItem.Note -> (holder.itemView as TextView).text = item.text
+                is QueueItem.Section -> (holder as SectionHolder).bind(item)
+                is QueueItem.Row -> (holder as RowHolder).bind(item)
+            }
+        }
+
+        override fun onViewRecycled(holder: RecyclerView.ViewHolder) {
+            if (holder is RowHolder) holder.vizSlot.removeAllViews()
+        }
+
+        inner class SectionHolder : RecyclerView.ViewHolder(
+            LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutParams = RecyclerView.LayoutParams(-1, -2).apply {
+                    topMargin = dp(24)
+                    bottomMargin = dp(6)
+                }
+            }
+        ) {
+            val titleView: TextView = label("", 21f, Color.WHITE, boldTf)
+            val clearView: TextView = label("Clear", 14.5f, accent, mediumTf).apply {
+                setPadding(dp(10), dp(4), dp(2), dp(4))
+                isClickable = true
+                setOnClickListener { clearManualQueue() }
+            }
+
+            init {
+                val box = itemView as LinearLayout
+                box.addView(titleView, LinearLayout.LayoutParams(0, -2, 1f))
+                box.addView(clearView)
+            }
+
+            fun bind(item: QueueItem.Section) {
+                titleView.text = item.title
+                clearView.visibility = if (item.clear) View.VISIBLE else View.GONE
+            }
+        }
+
+        inner class RowHolder : RecyclerView.ViewHolder(
+            LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(8), 0, dp(8))
+                layoutParams = RecyclerView.LayoutParams(-1, -2)
+            }
+        ) {
+            val img: ImageView = ImageView(this@MainActivity).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                roundedClip(this, 8)
+            }
+            val titleView: TextView = label("", 16f, Color.WHITE, mediumTf).apply {
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            }
+            val artistView: TextView = label("", 14f, white50).apply {
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            }
+            val vizSlot = FrameLayout(this@MainActivity)
+            val removeView: TextView = label("✕", 15f, white50).apply {
+                setPadding(dp(10), dp(6), dp(4), dp(6))
+                isClickable = true
+                contentDescription = "Remove from queue"
+                setOnClickListener { if (queuePos >= 0) removeFromQueue(queuePos) }
+            }
+            var queuePos: Int = -1
+            var boundTrack: Track? = null
+            var boundCurrent: Boolean = false
+
+            init {
+                val row = itemView as LinearLayout
+                row.addView(img, LinearLayout.LayoutParams(dp(46), dp(46)))
+                val text = LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(12), 0, 0, 0)
+                }
+                text.addView(titleView)
+                text.addView(artistView)
+                row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
+                row.addView(vizSlot)
+                row.addView(removeView)
+                row.setOnClickListener {
+                    val t = boundTrack
+                    if (!boundCurrent && t != null) {
+                        hideQueue()
+                        play(t)
+                    }
+                }
+            }
+
+            fun bind(item: QueueItem.Row) {
+                boundTrack = item.track
+                boundCurrent = item.isCurrent
+                queuePos = item.queuePos
+                titleView.text = item.track.title
+                titleView.setTextColor(if (item.isCurrent) accent else Color.WHITE)
+                artistView.text = item.track.artist
+                ArtworkLoader.load(
+                    item.track.artworkSmall ?: item.track.artworkLarge, img, null, dp(46)
+                )
+                vizSlot.removeAllViews()
+                if (item.isCurrent && isPlayingSafe()) vizSlot.addView(visualizer())
+                removeView.visibility =
+                    if (!item.isCurrent && item.queuePos >= 0) View.VISIBLE else View.GONE
+                if (item.isCurrent) {
+                    itemView.background = null
+                } else {
+                    itemView.rippleRect()
+                }
+            }
+        }
     }
 
     private fun modeChip(text: String, active: Boolean, onClick: () -> Unit): TextView {
@@ -7582,26 +7887,6 @@ class MainActivity : Activity() {
 
     /** Queue section header with an optional Clear action (Apple:
      *  Clear empties only the manually queued part). */
-    private fun queueSectionHeader(title: String, showClear: Boolean): LinearLayout {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        val lp = LinearLayout.LayoutParams(-1, -2)
-        lp.topMargin = dp(24)
-        lp.bottomMargin = dp(6)
-        row.layoutParams = lp
-        row.addView(label(title, 21f, Color.WHITE, boldTf), LinearLayout.LayoutParams(0, -2, 1f))
-        if (showClear) {
-            val clear = label("Clear", 14.5f, accent, mediumTf).apply {
-                setPadding(dp(10), dp(4), dp(2), dp(4))
-                isClickable = true
-                setOnClickListener { clearManualQueue() }
-            }
-            row.addView(clear)
-        }
-        return row
-    }
 
     private fun clearManualQueue() {
         if (manualIndices.isEmpty()) return
@@ -7636,50 +7921,6 @@ class MainActivity : Activity() {
         showQueue()
     }
 
-    private fun queueRow(track: Track, isCurrent: Boolean, queuePos: Int = -1): LinearLayout {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(8), 0, dp(8))
-            if (!isCurrent) {
-                rippleRect()
-                setOnClickListener {
-                    hideQueue()
-                    play(track)
-                }
-            }
-        }
-        val img = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            roundedClip(this, 8)
-        }
-        ArtworkLoader.load(track.artworkSmall ?: track.artworkLarge, img, null, dp(46))
-        row.addView(img, LinearLayout.LayoutParams(dp(46), dp(46)))
-        val text = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), 0, 0, 0)
-        }
-        text.addView(label(track.title, 16f, if (isCurrent) accent else Color.WHITE, mediumTf).apply {
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-        })
-        text.addView(label(track.artist, 14f, white50).apply {
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-        })
-        row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
-        if (isCurrent && isPlayingSafe()) row.addView(visualizer())
-        if (!isCurrent && queuePos >= 0) {
-            val remove = label("✕", 15f, white50).apply {
-                setPadding(dp(10), dp(6), dp(4), dp(6))
-                isClickable = true
-                contentDescription = "Remove from queue"
-                setOnClickListener { removeFromQueue(queuePos) }
-            }
-            row.addView(remove)
-        }
-        return row
-    }
 
     // ---------------------------------------------------------------- recents
 
@@ -7981,6 +8222,10 @@ class MainActivity : Activity() {
         val settled = when (tab) {
             "Home" -> homeMainDone && !homeMixPending
             "Search" -> !searchInFlight
+            // Chunked list builds (0.6.3) must have landed: a
+            // half-built Downloads/Library tree is not a root
+            // worth retaining.
+            "Downloads", "Library" -> chunkBuildsInFlight == 0
             else -> true
         }
         if (!settled) {
