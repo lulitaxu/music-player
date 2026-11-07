@@ -1,48 +1,27 @@
-# Music Player (working title)
+# arzxsh
 
-A production-grade personal iOS music player: global discovery, authorized
-playback sources, offline downloads, synced lyrics, and a premium native
-interface. Target device: iPhone XS on iOS 18 (minimum OS: iOS 18).
+A personal music player for Android, built by Arafat Arzu.
 
-**Status: Phase 0 (repository + architecture).** See `SPEC.md` for the full
-product specification and `docs/PHASE0.md` for the feasibility report,
-provider decisions, roadmap, and Milestone 1 acceptance tests.
+arzxsh started life as an Audius-powered player. It has since pivoted: **YouTube Music is now the primary source**, and everything happens on your own device. The app talks to YouTube the way a real client does, from your phone and your connection. No server in the middle, no account, no sign-in. **Audius** stays on as a fallback source, and the music files already on your device are a third.
 
-## Build workflow (read this first)
+## Features
 
-Development happens on Arch Linux, which cannot compile or sign iOS apps.
-Source, docs, and Git live here. Builds run on macOS:
+- Search, charts, artists, albums and radio from YouTube Music
+- Automatic fallback to the Audius version when a YouTube track cannot play
+- Playlists, Liked Songs, listening history and your listening stats
+- Offline downloads with progress, pause and retry
+- Synced lyrics (LRCLIB) that highlight as the song plays, tap a line to jump
+- Sleep timer with fade-out, crossfade, and source modes (YouTube Music / Audius / Both)
+- Import and play local audio files
 
-- GitHub Actions macOS runners generate the Xcode project from
-  `project.yml` (XcodeGen), build, and run the test suites.
-- The `.xcodeproj` is never committed; `project.yml` is the source of truth.
-- Physical-device verification (iPhone XS) happens on Arz's iPhone.
+## How it works
 
-No feature is "done" because code exists. A feature is done when its
-tests pass in CI and, where the spec requires it, on the physical device.
+Catalog browsing and stream resolution run entirely on-device, using the same internal client interfaces the official apps use, with NewPipeExtractor as a secondary resolver. Playback runs on Media3 ExoPlayer, and stream requests go out with the same client identity that resolved them. Lyrics come from LRCLIB with a lyrics.ovh fallback. Nothing about your listening goes anywhere except the requests a normal client would make.
 
-## Platform versions
+## Status
 
-- `App/`, `Core/`, `Features/`, and `Providers/` contain the native SwiftUI
-  iOS app for iOS 18 and later.
-- `android/` contains the native Kotlin Android app. It uses the same honest
-  availability wording and authorized Audius streaming source, with Android
-  playback handled by `MediaPlayer`.
+Personal project under active development. Android is the lead platform (built and tested on a Realme 8); an iOS sibling build lives in this repo too.
 
-The Android project can be opened as a standalone Gradle project. Both
-platforms intentionally keep downloads, lyrics, and local library features
-unavailable until their provider and persistence implementations are ready;
-they do not show fake controls for unfinished features.
+## Notes
 
-The player UI includes built-in power-user features inspired by desktop
-customization ecosystems: a visualizer surface, animated Now Playing artwork
-that respects Reduce Motion, a compact mini-player preference, and a
-segmented Player/Queue view. These are app features, not installable
-third-party add-ons.
-
-## Non-negotiables (from SPEC.md)
-
-- No DRM bypass, no provider-restriction bypass, ever.
-- Metadata, playable, and downloadable are three different claims and the
-  UI always says which one is true.
-- Playback, offline, and lyrics sync are built before decorative UI.
+Not affiliated with YouTube, Google, Apple or Audius. Built with open-source libraries including NewPipeExtractor (GPL-3.0); full attributions are in the app's licenses screen.
