@@ -28,8 +28,8 @@ android {
         applicationId = "com.arzx.music"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.5.0"
+        versionCode = 7
+        versionName = "0.5.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -66,6 +66,14 @@ kotlin {
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
+    // Media3 ExoPlayer: googlevideo stream URLs are bound to the
+    // client that requested them, so playback must send the SAME
+    // User-Agent as the Innertube context that produced the URL.
+    // Bare MediaPlayer sends the Stagefright UA and gets rejected
+    // (error -38 on device, 2026-11-07). ExoPlayer's HTTP data
+    // source takes a per-player UA + headers.
+    implementation("androidx.media3:media3-exoplayer:1.5.1")
+    implementation("androidx.media3:media3-common:1.5.1")
     // On-device YouTube Music search + stream extraction (no backend).
     // GPL-3.0, fine for this personal build.
     implementation("com.github.teamnewpipe:NewPipeExtractor:v0.26.5")

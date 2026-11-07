@@ -8,11 +8,18 @@ import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaMetadataRetriever
-import android.media.MediaPlayer
 import android.media.audiofx.AudioEffect
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.common.AudioAttributes as Media3AudioAttributes
 import android.provider.OpenableColumns
 import android.os.Bundle
 import android.os.Handler
@@ -51,12 +58,21 @@ data class Track(
 )
 
 /**
- * Tiny artwork loader for the UI layer: downloads Audius artwork on a
- * background pool, caches bitmaps, and guards against view recycling by
- * tagging each ImageView with the URL it is waiting for.
+ * Artwork loader for the UI layer: downloads artwork on a background
+ * pool, caches bitmaps, and guards against view recycling by tagging
+ * each ImageView with the URL it is waiting for.
+ *
+ * v5.1 jank pass: bitmaps are decoded AT the size they will be shown
+ * (two-pass sampled decode into size buckets), never at the source's
+ * full resolution — YouTube's large thumbnails are 2268px squares,
+ * and decoding those for a 52dp row was the artwork half of the
+ * scroll/touch jank on the Helio G95. Cache keys carry the bucket,
+ * so the same URL can live at row size and Now Playing size side by
+ * side. Bytes are fetched once per decode; the bounds pass runs on
+ * the downloaded bytes, not on a second request.
  */
 private object ArtworkLoader {
-    private val cache = LruCache<String, Bitmap>(64)
+    private val cache = LruCache<String, Bitmap>(128)
     private val pool = Executors.newFixedThreadPool(3)
 
     /** Bytes currently held by the in-memory artwork cache. */
@@ -65,6 +81,15 @@ private object ArtworkLoader {
     /** Drops every cached bitmap (Settings → Clear cache). */
     fun clearCache() {
         cache.evictAll()
+    }
+
+    /** Decode bucket (long-edge px) for a requested display size. */
+    private fun bucketFor(targetPx: Int): Int = when {
+        targetPx <= 128 -> 128
+        targetPx <= 256 -> 256
+        targetPx <= 512 -> 512
+        targetPx <= 1024 -> 1024
+        else -> 2048
     }
 
     fun load(url: String?, into: ImageView) = load(url, into, null)
@@ -76,33 +101,43 @@ private object ArtworkLoader {
      * large artwork was right there.)
      */
     fun load(url: String?, into: ImageView, fallbackUrl: String?) {
+        val lp = into.layoutParams
+        val target = if (lp != null && lp.width > 0) lp.width else 512
+        load(url, into, fallbackUrl, target)
+    }
+
+    /** [targetPx] is the display size the caller knows (row height,
+     *  mini player size, Now Playing width); decode size follows it. */
+    fun load(url: String?, into: ImageView, fallbackUrl: String?, targetPx: Int) {
         if (url.isNullOrEmpty()) {
             if (!fallbackUrl.isNullOrEmpty() && fallbackUrl != url) {
-                load(fallbackUrl, into, null)
+                load(fallbackUrl, into, null, targetPx)
             } else {
                 into.tag = null
                 into.setImageDrawable(null)
             }
             return
         }
-        into.tag = url
-        val hit = cache.get(url)
+        val bucket = bucketFor(targetPx)
+        val key = "$url@$bucket"
+        into.tag = key
+        val hit = cache.get(key)
         if (hit != null) {
             into.setImageBitmap(hit)
             return
         }
         into.setImageDrawable(null)
         pool.execute {
-            var bmp = download(url)
+            var bmp = decode(url, bucket)
             if (bmp != null) {
-                cache.put(url, bmp)
+                cache.put(key, bmp)
             } else if (!fallbackUrl.isNullOrEmpty() && fallbackUrl != url) {
-                bmp = download(fallbackUrl)
-                if (bmp != null) cache.put(url, bmp)
+                bmp = decode(fallbackUrl, bucket)
+                if (bmp != null) cache.put(key, bmp)
             }
             val result = bmp
             into.post {
-                if (result != null && into.tag == url) into.setImageBitmap(result)
+                if (result != null && into.tag == key) into.setImageBitmap(result)
             }
         }
     }
@@ -122,8 +157,10 @@ private object ArtworkLoader {
             return
         }
         pool.execute {
-            val src = cache.get(url) ?: download(url)?.also { cache.put(url, it) }
-            val blurred = src?.let { blur(it) }
+            // The blur output is 28px wide; decoding anything bigger
+            // is pure waste (v5 decoded the full-size artwork first).
+            val small = decode(url, 128)
+            val blurred = small?.let { blur(it) }
             if (blurred != null) cache.put(key, blurred)
             into.post {
                 if (blurred != null && into.tag == key) into.setImageBitmap(blurred)
@@ -131,25 +168,47 @@ private object ArtworkLoader {
         }
     }
 
-    private fun download(url: String): Bitmap? = try {
+    private fun downloadBytes(url: String): ByteArray? = try {
         if (url.startsWith("file:")) {
             // Local artwork extracted at import time lives on disk.
-            java.io.FileInputStream(java.io.File(java.net.URI(url))).use {
-                BitmapFactory.decodeStream(it)
-            }
+            java.io.FileInputStream(java.io.File(java.net.URI(url))).use { it.readBytes() }
         } else {
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 10_000
-            readTimeout = 10_000
-            // Some artwork CDNs refuse the default Java user agent;
-            // identify the app like every other request it makes.
-            setRequestProperty("User-Agent", "arzxsh (Android)")
-        }
-        if (conn.responseCode !in 200..299) null
-        else conn.inputStream.use { BitmapFactory.decodeStream(it) }
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 10_000
+                readTimeout = 10_000
+                // Some artwork CDNs refuse the default Java user agent;
+                // identify the app like every other request it makes.
+                setRequestProperty("User-Agent", "arzxsh (Android)")
+            }
+            if (conn.responseCode !in 200..299) null
+            else conn.inputStream.use { it.readBytes() }
         }
     } catch (_: Exception) {
         null
+    }
+
+    /** Sampled decode: the result's dimensions land within
+     *  [maxPx, 2×maxPx) on both axes instead of the source size. */
+    private fun decode(url: String, maxPx: Int): Bitmap? {
+        val bytes = downloadBytes(url) ?: return null
+        return try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            } else {
+                var sample = 1
+                while (bounds.outWidth / (sample * 2) >= maxPx &&
+                    bounds.outHeight / (sample * 2) >= maxPx
+                ) {
+                    sample *= 2
+                }
+                val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+            }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun blur(src: Bitmap): Bitmap {
@@ -183,10 +242,81 @@ private object ArtworkLoader {
     }
 }
 
+/**
+ * One playback engine instance: a Media3 ExoPlayer plus the state
+ * the activity's engine semantics need around it.
+ *
+ * Why ExoPlayer (v5.1): googlevideo stream URLs are bound to the
+ * client context that requested them. ExoPlayer's HTTP data source
+ * sends the SAME User-Agent as that context, per player instance;
+ * MediaPlayer could not set one at all, and Stagefright's default
+ * UA got resolved URLs rejected on device (what=-38). [retired]
+ * replaces MediaPlayer's listener-detach trick: when a new track
+ * starts, the outgoing instance is retired and every callback checks
+ * it, so a stale completion or error can never fire into the new
+ * track's session. All calls happen on the main thread (ExoPlayer's
+ * contract) and are exception-shielded like the MediaPlayer code was.
+ */
+private class EnginePlayer(val exo: ExoPlayer) {
+    @Volatile
+    var retired = false
+
+    @Volatile
+    var readyFired = false
+
+    var listener: Player.Listener? = null
+
+    val isPlaying: Boolean
+        get() = try { exo.isPlaying } catch (_: Exception) { false }
+
+    val isEnded: Boolean
+        get() = try { exo.playbackState == Player.STATE_ENDED } catch (_: Exception) { false }
+
+    /** Duration in ms; negative (C.TIME_UNSET) until the player knows it. */
+    val durationMs: Long
+        get() = try { exo.duration } catch (_: Exception) { 0L }
+
+    val positionMs: Long
+        get() = try { exo.currentPosition } catch (_: Exception) { 0L }
+
+    val audioSessionId: Int
+        get() = try { exo.audioSessionId } catch (_: Exception) { 0 }
+
+    fun setVolume(v: Float) {
+        try { exo.volume = v.coerceIn(0f, 1f) } catch (_: Exception) {}
+    }
+
+    fun play() {
+        try { exo.play() } catch (_: Exception) {}
+    }
+
+    fun pause() {
+        try { exo.pause() } catch (_: Exception) {}
+    }
+
+    fun seekTo(ms: Long) {
+        try { exo.seekTo(ms.coerceAtLeast(0L)) } catch (_: Exception) {}
+    }
+
+    fun release() {
+        retired = true
+        try { listener?.let { exo.removeListener(it) } } catch (_: Exception) {}
+        try { exo.release() } catch (_: Exception) {}
+    }
+}
+
 class MainActivity : Activity() {
     private val executor = Executors.newSingleThreadExecutor()
+
+    /** Playback-only executor. v5 ran stream resolution on the shared
+     *  [executor], where a single in-flight DOWNLOAD (minutes long)
+     *  blocked every YouTube resolution queued behind it — a real
+     *  chunk of the "playback starts slowly" complaint. Resolution,
+     *  the retry ladder, radio and the Audius fallback live here;
+     *  catalog/search/downloads stay on [executor]. */
+    private val playerExecutor = Executors.newSingleThreadExecutor()
     private val tracks = mutableListOf<Track>()
-    private var player: MediaPlayer? = null
+    private var player: EnginePlayer? = null
     private var current: Track? = null
     private var queue: List<Track> = emptyList()
     private var queueIndex: Int = -1
@@ -244,7 +374,7 @@ class MainActivity : Activity() {
 
     // ---- v5: crossfade (dual player) ----
     /** The outgoing player while a crossfade runs; null otherwise. */
-    private var outPlayer: MediaPlayer? = null
+    private var outPlayer: EnginePlayer? = null
     /** Track the CURRENT [player] instance is playing (for the
      *  repeat-one no-fade rule and crossfade bookkeeping). */
     private var activePlayerTrack: Track? = null
@@ -258,8 +388,8 @@ class MainActivity : Activity() {
             fadeStep++
             try {
                 val t = (fadeStep.toFloat() / fadeTotalSteps).coerceIn(0f, 1f)
-                out.setVolume(1f - t, 1f - t)
-                cur.setVolume(t, t)
+                out.setVolume(1f - t)
+                cur.setVolume(t)
                 if (fadeStep < fadeTotalSteps) {
                     handler.postDelayed(this, 100)
                 } else {
@@ -270,6 +400,28 @@ class MainActivity : Activity() {
             }
         }
     }
+
+    // ---- v5.1: YouTube retry ladder + crossfade source ----
+    /** The player that was AUDIBLE when the current track was
+     *  requested. Held across resolution (and across ladder attempts)
+     *  so a crossfade can still start from the track the user is
+     *  actually hearing; consumed by the next successful start. */
+    private var fadeSource: EnginePlayer? = null
+    /** Track the active YouTube ladder belongs to. */
+    private var ytTrack: Track? = null
+    /** Stage labels still to try, in order (see StreamResolver). */
+    private var ytStageLabels: List<String> = emptyList()
+    private var ytStage = -1
+    /** Known-good cached resolution prepended as stage "CACHE". */
+    private var ytCached: StreamResolver.Resolved? = null
+    /** One report line per failed stage, printed if the ladder dies. */
+    private val ytReports = mutableListOf<String>()
+    private var ytQuality = "normal"
+
+    // ---- v5.1: ticker change-guards (jank pass) ----
+    private var lastNpElapsed = ""
+    private var lastNpRemaining = ""
+    private var lastSleepLabel = ""
 
     // ---- v5: downloads vault glue ----
     /** key -> "pause" | "remove": how an in-flight download should end. */
@@ -370,6 +522,9 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         recentTracks.addAll(loadRecents())
+        // Last-good Innertube client memory persists on disk so the
+        // stream resolver tries the working context first.
+        YtmApi.initStore(this)
         // Any download left "downloading" by a dead process was in
         // fact interrupted: the vault says so, on the record.
         Downloads.reconcileOnStart(this)
@@ -833,6 +988,7 @@ class MainActivity : Activity() {
             browseBox.visibility = View.GONE
             resultsBox.visibility = View.VISIBLE
             resultsBox.removeAllViews()
+            resultsBox.addView(sectionTitle("Results for \"$q\""))
             resultsBox.addView(label("Searching catalogs…", 14f, white50))
             val mode = sourceMode()
             executor.execute {
@@ -888,6 +1044,7 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     if (gen != generation) return@runOnUiThread
                     resultsBox.removeAllViews()
+                    resultsBox.addView(sectionTitle("Results for \"$q\""))
                     val nothing = found.isEmpty() && ytArtists.isEmpty() && ytAlbums.isEmpty()
                     if (nothing) {
                         if (audius == null && ytErr != null) {
@@ -946,36 +1103,74 @@ class MainActivity : Activity() {
             }
         }
 
+        // The search field is the FIRST thing on the screen, above
+        // the source selector, and impossible to miss: full width,
+        // 48dp tall, white text with a visible cursor, and a clear
+        // (✕) button while it holds text. v5's field sat UNDER the
+        // segmented control at 38dp with no clear button, and the
+        // activity declared no soft-input mode, so typed text could
+        // end up hidden behind the keyboard — a tester searched and
+        // never saw her own query (2026-11-07). The manifest now
+        // sets adjustResize; submitting keeps the query in the field
+        // and echoes it over the results ("Results for …").
         val field = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             background = GradientDrawable().apply {
-                setColor(Color.argb(28, 255, 255, 255))
-                cornerRadius = dp(11).toFloat()
+                setColor(Color.argb(38, 255, 255, 255))
+                cornerRadius = dp(12).toFloat()
             }
-            setPadding(dp(11), 0, dp(11), 0)
+            setPadding(dp(12), 0, dp(6), 0)
         }
-        val fLp = LinearLayout.LayoutParams(-1, dp(38))
+        val fLp = LinearLayout.LayoutParams(-1, dp(48))
         fLp.topMargin = dp(14)
         field.layoutParams = fLp
-        field.addView(icon(R.drawable.ic_search, white50), LinearLayout.LayoutParams(dp(17), dp(17)))
+        field.addView(icon(R.drawable.ic_search, white50), LinearLayout.LayoutParams(dp(18), dp(18)))
+        val clearBtn = label("✕", 17f, white55).apply {
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+            isClickable = true
+            contentDescription = "Clear search"
+            setOnClickListener {
+                input.text?.clear()
+                resultsBox.removeAllViews()
+                resultsBox.visibility = View.GONE
+                browseBox.visibility = View.VISIBLE
+                input.requestFocus()
+            }
+        }
         input = EditText(this).apply {
             hint = "Artists, Songs, Lyrics and More"
             setTextColor(Color.WHITE)
             setHintTextColor(white50)
-            setTextSize(16f)
+            setTextSize(16.5f)
             setSingleLine(true)
             background = null
+            isCursorVisible = true
             imeOptions = EditorInfo.IME_ACTION_SEARCH
-            setPadding(dp(7), 0, 0, 0)
+            setPadding(dp(8), 0, 0, 0)
+            addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {
+                    clearBtn.visibility = if (s.isNullOrEmpty()) View.GONE else View.VISIBLE
+                }
+                override fun afterTextChanged(s: android.text.Editable?) {}
+            })
             setOnEditorActionListener { _, actionId, _ ->
                 if (actionId == EditorInfo.IME_ACTION_SEARCH) {
                     runSearch(text.toString())
+                    // Results get the screen; the query stays in the
+                    // field above them and is echoed over the results.
+                    val imm = getSystemService(INPUT_METHOD_SERVICE)
+                        as? android.view.inputmethod.InputMethodManager
+                    imm?.hideSoftInputFromWindow(windowToken, 0)
+                    clearFocus()
                     true
                 } else false
             }
         }
         field.addView(input, LinearLayout.LayoutParams(0, -1, 1f))
+        field.addView(clearBtn, LinearLayout.LayoutParams(dp(38), -1))
 
         // Source selector: the same three states as Settings →
         // Music source, two-way synced through the one preference.
@@ -1023,8 +1218,8 @@ class MainActivity : Activity() {
             segViews += mode to tv
         }
         renderSegs()
-        content.addView(segRow)
         content.addView(field)
+        content.addView(segRow)
 
         resultsBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1057,7 +1252,8 @@ class MainActivity : Activity() {
                 val cardLp = LinearLayout.LayoutParams(0, dp(104), 1f)
                 if (colIdx == 0) cardLp.marginEnd = dp(13)
                 rowLayout.addView(categoryCard(name, tint) {
-                    input.setText(name)
+                    // The field shows what was actually searched.
+                    input.setText(term)
                     runSearch(term)
                 }, cardLp)
             }
@@ -1533,7 +1729,7 @@ class MainActivity : Activity() {
             scaleType = ImageView.ScaleType.CENTER_CROP
             roundedClip(this, 9)
         }
-        ArtworkLoader.load(track.artworkSmall ?: track.artworkLarge, img)
+        ArtworkLoader.load(track.artworkSmall ?: track.artworkLarge, img, null, dp(104))
         row.addView(img, LinearLayout.LayoutParams(dp(52), dp(52)))
         val text = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -2233,10 +2429,10 @@ class MainActivity : Activity() {
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
                     if (fromUser) {
-                        val dur = try { player?.duration ?: 0 } catch (_: IllegalStateException) { 0 }
+                        val dur = player?.durationMs ?: 0L
                         if (dur > 0) {
                             npElapsed.text = fmt(progress)
-                            npRemaining.text = "-" + fmt((dur - progress).coerceAtLeast(0))
+                            npRemaining.text = "-" + fmt((dur - progress).coerceAtLeast(0L).toInt())
                         }
                     }
                 }
@@ -2247,10 +2443,7 @@ class MainActivity : Activity() {
 
                 override fun onStopTrackingTouch(sb: SeekBar?) {
                     seeking = false
-                    try {
-                        player?.seekTo(sb?.progress ?: 0)
-                    } catch (_: IllegalStateException) {
-                    }
+                    player?.seekTo((sb?.progress ?: 0).toLong())
                 }
             })
         }
@@ -2464,15 +2657,26 @@ class MainActivity : Activity() {
         if (!::nowPlaying.isInitialized || nowPlaying.visibility != View.VISIBLE || seeking) return
         updateSleepLabel()
         val p = player ?: return
-        try {
-            val dur = p.duration
-            if (dur > 0) {
-                npSeek.max = dur
-                npSeek.progress = p.currentPosition
-                npElapsed.text = fmt(p.currentPosition)
-                npRemaining.text = "-" + fmt((dur - p.currentPosition).coerceAtLeast(0))
+        // Jank pass: the 500ms ticker touches ONLY the seek bar and
+        // the two time labels, and only when their rendered values
+        // actually changed — no layout passes, no row re-binding.
+        val dur = p.durationMs
+        if (dur > 0) {
+            val pos = p.positionMs.coerceIn(0L, dur)
+            val durInt = dur.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            if (npSeek.max != durInt) npSeek.max = durInt
+            val posInt = pos.toInt()
+            if (npSeek.progress != posInt) npSeek.progress = posInt
+            val elapsed = fmt(posInt)
+            if (elapsed != lastNpElapsed) {
+                lastNpElapsed = elapsed
+                npElapsed.text = elapsed
             }
-        } catch (_: IllegalStateException) {
+            val remaining = "-" + fmt((dur - pos).coerceAtLeast(0L).toInt())
+            if (remaining != lastNpRemaining) {
+                lastNpRemaining = remaining
+                npRemaining.text = remaining
+            }
         }
     }
 
@@ -2537,15 +2741,16 @@ class MainActivity : Activity() {
         val token = ++playToken
         // The outgoing player must never fire completion/error into
         // the NEW track's session (it would advance the queue or
-        // print a stale error). Detach its listeners up front; what
-        // happens to the instance itself is decided per path below.
+        // print a stale error). Retire it up front (every callback
+        // checks the flag); what happens to the instance itself is
+        // decided per path below. An outgoing player that is actually
+        // audible becomes the crossfade source, so the fade can start
+        // from the track the user is hearing even after a background
+        // resolution — ladder retries and the Audius fallback
+        // re-enter play() and must not lose it.
         player?.let { old ->
-            try {
-                old.setOnCompletionListener(null)
-                old.setOnErrorListener(null)
-                old.setOnPreparedListener(null)
-            } catch (_: Exception) {
-            }
+            old.retired = true
+            if (old.isPlaying) fadeSource = old
         }
         // Local files play from their content URI, offline, always.
         if (track.source == SOURCE_LOCAL) {
@@ -2559,49 +2764,105 @@ class MainActivity : Activity() {
             return
         }
         if (track.source == SOURCE_YOUTUBE) {
-            // Stop the previous track now; the direct stream URL is
-            // resolved on-device in the background (Innertube primary,
-            // NewPipe fallback), then handed to the same player path
-            // as every other source. A failure PRINTS both resolvers'
-            // outcomes on Now Playing — no more generic silence.
+            // The direct stream URL is resolved on-device by the
+            // retry ladder (see beginYtResolution): the known-good
+            // cached resolution first, then the Innertube contexts in
+            // last-good-first order, then NewPipe — and a stream the
+            // PLAYER rejects advances to the next context instead of
+            // killing the track. v5 resolved exactly once and handed
+            // the URL to a bare-UA MediaPlayer; one rejection
+            // (what=-38) was final. Failures still PRINT every
+            // stage's outcome on Now Playing — no generic silence.
             // With crossfade on, the old track keeps playing through
-            // the resolution and is faded out by startPlayback —
-            // releasing here would make every YouTube transition a
+            // the resolution and is faded out when the new one starts
+            // — releasing here would make every YouTube transition a
             // hard cut with a silent gap.
             if (crossfadeSec() <= 0) {
-                player?.release()
-                player = null
+                releaseActivePlayer()
                 refreshPlaybackUi()
             }
-            val quality = effectiveQuality()
-            executor.execute {
-                val resolved = StreamResolver.resolveYoutube(track.id, quality)
-                runOnUiThread {
-                    if (token != playToken) return@runOnUiThread
-                    if (resolved.url == null) {
-                        // Active fallback (Audius is the standing
-                        // second source): try the same song on Audius
-                        // before declaring failure. Applies in
-                        // YouTube Music and Both modes only; in Audius
-                        // mode the printed resolver report stands.
-                        if (sourceMode() != "audius") {
-                            tryAudiusFallback(track, resolved.report, token)
-                        } else {
-                            showPlaybackError("Couldn't play this track — ${resolved.report}")
-                            refreshPlaybackUi()
-                            Toast.makeText(
-                                this@MainActivity,
-                                "This track could not be played.",
-                                Toast.LENGTH_SHORT
-                            ).show()
-                        }
-                    } else {
-                        startPlayback(resolved.url)
-                    }
-                }
-            }
+            beginYtResolution(track, token)
         } else {
             startPlayback("https://api.audius.co/v1/tracks/${track.id}/stream?app_name=arzxsh")
+        }
+    }
+
+    /** Releases the active player (if any) and forgets it as a
+     *  crossfade source when it was the source. */
+    private fun releaseActivePlayer() {
+        val p = player ?: return
+        if (fadeSource === p) fadeSource = null
+        p.release()
+        player = null
+    }
+
+    // ------------------------------------------------------------ YouTube retry ladder (v5.1)
+
+    /**
+     * Starts stream resolution for a YouTube track as a staged
+     * ladder. Stage order: the session's known-good cached
+     * resolution when one exists, then the Innertube contexts in
+     * last-good-first order, then NewPipe. Each stage either produces
+     * a stream the player accepts, fails resolution (its report is
+     * kept), or is REJECTED by the player — which also advances the
+     * ladder (see onPlayerFailed). Only when every stage is spent do
+     * the Audius fallback and the printed error happen, carrying
+     * every stage's outcome. Resolution runs on [playerExecutor],
+     * never queued behind a download.
+     */
+    private fun beginYtResolution(track: Track, token: Int) {
+        ytTrack = track
+        ytQuality = effectiveQuality()
+        ytReports.clear()
+        ytCached = StreamResolver.cachedGood(track.id, ytQuality)
+        ytStageLabels = if (ytCached?.url != null) {
+            listOf("CACHE") + StreamResolver.youtubeStageLabels()
+        } else {
+            StreamResolver.youtubeStageLabels()
+        }
+        ytStage = -1
+        advanceYtLadder(token)
+    }
+
+    private fun advanceYtLadder(token: Int) {
+        val track = ytTrack ?: return
+        ytStage++
+        if (ytStage >= ytStageLabels.size) {
+            // Ladder spent: the Audius fallback (standing second
+            // source, YouTube Music and Both modes) gets the full
+            // report; in Audius-only mode the printed report stands.
+            val report = ytReports.joinToString(" · ")
+            if (sourceMode() != "audius") {
+                tryAudiusFallback(track, report, token)
+            } else {
+                showPlaybackError("Couldn't play this track — $report")
+                refreshPlaybackUi()
+                Toast.makeText(this, "This track could not be played.", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+        val label = ytStageLabels[ytStage]
+        if (label == "CACHE") {
+            val cached = ytCached
+            val cachedUrl = cached?.url
+            if (cached != null && cachedUrl != null) {
+                startPlayback(cachedUrl, cached.userAgent, cached)
+            } else {
+                advanceYtLadder(token)
+            }
+            return
+        }
+        playerExecutor.execute {
+            val resolved = StreamResolver.resolveYoutubeStage(track.id, ytQuality, label)
+            runOnUiThread {
+                if (token != playToken) return@runOnUiThread
+                if (resolved.url == null) {
+                    ytReports += resolved.report
+                    advanceYtLadder(token)
+                } else {
+                    startPlayback(resolved.url, resolved.userAgent, resolved)
+                }
+            }
         }
     }
 
@@ -2663,7 +2924,7 @@ class MainActivity : Activity() {
      * printed resolver report stands as the diagnosis.
      */
     private fun tryAudiusFallback(ytTrack: Track, report: String, token: Int) {
-        executor.execute {
+        playerExecutor.execute {
             var match: Track? = null
             try {
                 val q = URLEncoder.encode(
@@ -2720,106 +2981,206 @@ class MainActivity : Activity() {
         getPreferences(MODE_PRIVATE).getInt("crossfade_seconds", 0).coerceIn(0, 12)
 
     /** Shared player setup for every source: [stream] is a direct
-     *  audio URL or file path. */
-    private fun startPlayback(stream: String) = startPlaybackInternal(stream, null)
+     *  audio URL or a downloaded file's path. [userAgent] is the UA of
+     *  the client context that produced a YouTube URL (googlevideo
+     *  binds URLs to it); [resolved] marks a YouTube ladder start,
+     *  whose player errors advance the ladder instead of failing the
+     *  track outright. */
+    private fun startPlayback(
+        stream: String,
+        userAgent: String? = null,
+        resolved: StreamResolver.Resolved? = null
+    ) = startPlaybackInternal(stream, null, userAgent, resolved)
 
     /** Player setup for a content:// data source (local files). */
-    private fun startPlaybackUri(uri: android.net.Uri) = startPlaybackInternal(null, uri)
+    private fun startPlaybackUri(uri: android.net.Uri) =
+        startPlaybackInternal(null, uri, null, null)
 
     /**
-     * Dual-player start. The previous player is released on prepare
-     * (v4.1 behavior) EXCEPT when crossfade applies: crossfade is on,
-     * the old player is actually playing, and the new track is a
-     * DIFFERENT track (repeat-one restarts never fade into
-     * themselves). Then the old player becomes [outPlayer], the new
-     * one starts silent, and [crossfadeTick] swaps their volumes
-     * over the configured seconds. Any failure anywhere falls back
-     * to the hard cut — crossfade must never break playback.
+     * Builds one ExoPlayer for the new stream and makes it [player].
+     * Its HTTP data source sends [userAgent] — the actual v5.1
+     * playback fix. v5's MediaPlayer could not set a UA at all, so
+     * googlevideo saw Stagefright's default and rejected the
+     * resolved URL (what=-38) even though resolution had succeeded.
+     *
+     * Crossfade keeps v5's semantics on the new engine: when
+     * crossfade is on, the new track is a DIFFERENT track, and the
+     * previous track is still audible ([fadeSource]), the new player
+     * starts silent and [crossfadeTick] swaps the volumes over the
+     * configured seconds; any failure falls back to the hard cut.
+     * Repeat-one restarts never fade into themselves.
      */
-    private fun startPlaybackInternal(stream: String?, uri: android.net.Uri?) {
+    private fun startPlaybackInternal(
+        stream: String?,
+        uri: android.net.Uri?,
+        userAgent: String?,
+        resolved: StreamResolver.Resolved?
+    ) {
         val old = player
         val forTrack = current
+        val sessionToken = playToken
         val fadeMs = crossfadeSec() * 1000
+        val fade = fadeSource
         val sameTrack = forTrack != null && activePlayerTrack != null &&
             forTrack.id == activePlayerTrack?.id && forTrack.source == activePlayerTrack?.source
-        val canFade = fadeMs > 0 && old != null && !sameTrack && try {
-            old.isPlaying
-        } catch (_: Exception) {
-            false
-        }
-        val np = MediaPlayer()
-        player = np
+        val canFade = fadeMs > 0 && fade != null && !sameTrack && fade.isPlaying
+        val httpFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent(userAgent ?: "arzxsh (Android)")
+            .setConnectTimeoutMs(15_000)
+            .setReadTimeoutMs(30_000)
+            .setAllowCrossProtocolRedirects(true)
+        val exo = ExoPlayer.Builder(this)
+            .setMediaSourceFactory(
+                DefaultMediaSourceFactory(DefaultDataSource.Factory(this, httpFactory))
+            )
+            .build()
+        val holder = EnginePlayer(exo)
+        player = holder
         activePlayerTrack = forTrack
-        np.apply {
-            setAudioAttributes(AudioAttributes.Builder().setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
-            try {
-                if (uri != null) setDataSource(applicationContext, uri) else setDataSource(stream!!)
-            } catch (e: Exception) {
-                showPlaybackError("Player error: ${shortErr(e)}")
-                refreshPlaybackUi()
-                return
-            }
-            setOnPreparedListener {
-                val notice = pendingNpNotice
-                if (notice != null) {
-                    pendingNpNotice = null
-                    showPlaybackError(notice)
-                } else {
-                    clearPlaybackError()
-                }
-                if (canFade && old != null) {
-                    try {
-                        np.setVolume(0f, 0f)
-                        np.start()
-                        beginCrossfade(old, fadeMs)
-                    } catch (_: Exception) {
-                        try { old.release() } catch (_: Exception) {}
-                        try {
-                            np.setVolume(1f, 1f)
-                            if (!np.isPlaying) np.start()
-                        } catch (_: Exception) {
-                        }
+        exo.setAudioAttributes(
+            Media3AudioAttributes.Builder()
+                .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                .setUsage(C.USAGE_MEDIA)
+                .build(),
+            false
+        )
+        val item = when {
+            uri != null -> MediaItem.fromUri(uri)
+            stream != null && stream.startsWith("/") ->
+                MediaItem.fromUri(android.net.Uri.fromFile(java.io.File(stream)))
+            stream != null -> MediaItem.fromUri(stream)
+            else -> null
+        }
+        if (item == null) {
+            showPlaybackError("Player error: no stream to play")
+            refreshPlaybackUi()
+            return
+        }
+        val listener = object : Player.Listener {
+            override fun onPlaybackStateChanged(state: Int) {
+                if (holder.retired || player !== holder) return
+                when (state) {
+                    Player.STATE_READY -> if (!holder.readyFired) {
+                        holder.readyFired = true
+                        onPlayerReady(holder, old, forTrack, canFade, fadeMs, resolved)
                     }
-                } else {
-                    if (old != null && old !== np) {
-                        try { old.release() } catch (_: Exception) {}
-                    }
-                    try { it.start() } catch (_: Exception) {}
+                    Player.STATE_ENDED -> handleCompletion()
                 }
+            }
+
+            override fun onPlayerError(error: PlaybackException) {
+                if (holder.retired || player !== holder) return
+                onPlayerFailed(holder, forTrack, resolved, sessionToken, error)
+            }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (holder.retired || player !== holder) return
+                // ExoPlayer starts asynchronously (MediaPlayer's
+                // start() looked instant), so the transport icons
+                // follow the REAL playing state from here.
                 refreshPlaybackUi()
             }
-            setOnCompletionListener {
-                // Only the ACTIVE player's end counts (an outgoing
-                // crossfade player has its listeners detached anyway;
-                // this guard is the second lock on that door).
-                if (player === np) handleCompletion()
-            }
-            setOnErrorListener { _, what, extra ->
-                if (player !== np) return@setOnErrorListener true
-                // The player rejected the stream: say WHAT failed, with
-                // the MediaPlayer codes, on Now Playing (and the toast).
-                val t = current
-                val src = when (t?.source) {
-                    SOURCE_YOUTUBE -> "YouTube stream"
-                    SOURCE_AUDIUS -> "Audius stream"
-                    SOURCE_LOCAL -> "local file"
-                    else -> "stream"
-                }
-                showPlaybackError("Player error playing $src (what=$what, extra=$extra). The resolved URL was rejected.")
-                refreshPlaybackUi()
-                Toast.makeText(this@MainActivity, "This track could not be played.", Toast.LENGTH_SHORT).show()
-                true
-            }
-            prepareAsync()
+        }
+        holder.listener = listener
+        exo.addListener(listener)
+        if (canFade) holder.setVolume(0f)
+        try {
+            exo.setMediaItem(item)
+            exo.prepare()
+            exo.play()
+        } catch (e: Exception) {
+            showPlaybackError("Player error: ${shortErr(e)}")
+            refreshPlaybackUi()
         }
     }
 
-    private fun beginCrossfade(old: MediaPlayer, fadeMs: Int) {
+    /** The new player reached READY: the v5 "prepared" moment. A
+     *  YouTube stream that actually starts is remembered as
+     *  known-good (replays skip resolution); the crossfade partner is
+     *  consumed exactly once — faded out, or released for the hard
+     *  cut — and any other superseded player is released. */
+    private fun onPlayerReady(
+        holder: EnginePlayer,
+        old: EnginePlayer?,
+        forTrack: Track?,
+        canFade: Boolean,
+        fadeMs: Int,
+        resolved: StreamResolver.Resolved?
+    ) {
+        if (resolved != null && forTrack != null) {
+            StreamResolver.rememberGood(forTrack.id, ytQuality, resolved)
+        }
+        val notice = pendingNpNotice
+        if (notice != null) {
+            pendingNpNotice = null
+            showPlaybackError(notice)
+        } else {
+            clearPlaybackError()
+        }
+        val partner = fadeSource
+        fadeSource = null
+        if (old != null && old !== holder && old !== partner) {
+            old.release()
+        }
+        var faded = false
+        if (canFade && partner != null && partner !== holder) {
+            try {
+                beginCrossfade(partner, fadeMs)
+                faded = true
+            } catch (_: Exception) {
+                faded = false
+            }
+        }
+        if (!faded) {
+            if (partner != null && partner !== holder) partner.release()
+            holder.setVolume(1f)
+        }
+        refreshPlaybackUi()
+    }
+
+    /**
+     * The player rejected (or lost) its stream. For a YouTube ladder
+     * start this is NOT the end: the attempt's outcome joins the
+     * report, the session cache entry is evicted, and the ladder
+     * advances to the next client context — the fix for v5's "one
+     * resolution, one rejection, dead track". Any other source
+     * prints the failure on Now Playing exactly like v5 did, now
+     * with ExoPlayer's error code name instead of MediaPlayer codes.
+     */
+    private fun onPlayerFailed(
+        holder: EnginePlayer,
+        forTrack: Track?,
+        resolved: StreamResolver.Resolved?,
+        sessionToken: Int,
+        error: PlaybackException
+    ) {
+        if (player === holder) player = null
+        holder.release()
+        if (resolved != null && forTrack != null && sessionToken == playToken &&
+            ytTrack?.id == forTrack.id && ytTrack?.source == forTrack.source
+        ) {
+            ytReports += "${resolved.clientLabel ?: "stream"}: player rejected (${error.errorCodeName})"
+            StreamResolver.forgetGood(forTrack.id, ytQuality)
+            advanceYtLadder(sessionToken)
+            return
+        }
+        val src = when (forTrack?.source) {
+            SOURCE_YOUTUBE -> "YouTube stream"
+            SOURCE_AUDIUS -> "Audius stream"
+            SOURCE_LOCAL -> "local file"
+            else -> "stream"
+        }
+        showPlaybackError(
+            "Player error playing $src (${error.errorCodeName}). The resolved URL was rejected."
+        )
+        refreshPlaybackUi()
+        Toast.makeText(this, "This track could not be played.", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun beginCrossfade(old: EnginePlayer, fadeMs: Int) {
         // Retire any previous outgoing player first.
         outPlayer?.let { prev ->
-            if (prev !== old) {
-                try { prev.release() } catch (_: Exception) {}
-            }
+            if (prev !== old) prev.release()
         }
         handler.removeCallbacks(crossfadeTick)
         outPlayer = old
@@ -2832,11 +3193,9 @@ class MainActivity : Activity() {
      *  released, active player restored to full volume. */
     private fun finishCrossfadeNow() {
         handler.removeCallbacks(crossfadeTick)
-        outPlayer?.let {
-            try { it.release() } catch (_: Exception) {}
-        }
+        outPlayer?.release()
         outPlayer = null
-        try { player?.setVolume(1f, 1f) } catch (_: Exception) {}
+        player?.setVolume(1f)
     }
 
     // ------------------------------------------------------------ queue order, shuffle, repeat
@@ -2952,7 +3311,7 @@ class MainActivity : Activity() {
     private fun continueAutoplay() {
         val t = current ?: return
         val token = playToken
-        executor.execute {
+        playerExecutor.execute {
             var more: List<Track> = emptyList()
             var err: String? = null
             try {
@@ -3000,22 +3359,16 @@ class MainActivity : Activity() {
 
     private fun playPrevious() {
         val p = player
-        try {
-            if (p != null && p.currentPosition > 3000) {
-                p.seekTo(0)
-                return
-            }
-        } catch (_: IllegalStateException) {
+        if (p != null && p.positionMs > 3000) {
+            p.seekTo(0)
+            return
         }
         if (queue.isEmpty() || queueIndex < 0) return
         val pos = currentOrderPos()
         if (pos > 0) {
             play(queue[playOrder[pos - 1]])
         } else {
-            try {
-                p?.seekTo(0)
-            } catch (_: IllegalStateException) {
-            }
+            p?.seekTo(0)
         }
     }
 
@@ -3078,7 +3431,7 @@ class MainActivity : Activity() {
         Toast.makeText(this, "Starting radio…", Toast.LENGTH_SHORT).show()
         val token = playToken
         val seedIsCurrent = current?.id == seed.id && current?.source == seed.source
-        executor.execute {
+        playerExecutor.execute {
             var list: List<Track> = emptyList()
             var err: String? = null
             try {
@@ -3113,13 +3466,13 @@ class MainActivity : Activity() {
         // resume always acts on ONE player at full volume.
         if (outPlayer != null) finishCrossfadeNow()
         val active = player ?: return
-        try {
-            if (active.isPlaying) {
-                active.pause()
-            } else {
-                active.start()
-            }
-        } catch (_: IllegalStateException) {
+        if (active.isPlaying) {
+            active.pause()
+        } else {
+            // ExoPlayer play() at the ENDED state is a no-op (unlike
+            // MediaPlayer's start(), which restarted): rewind first.
+            if (active.isEnded) active.seekTo(0)
+            active.play()
         }
         // Small scale pop on the glyph swap (spec §13.4), transform-only.
         if (!reduceMotion() && ::npPlayButton.isInitialized && nowPlaying.visibility == View.VISIBLE) {
@@ -3132,11 +3485,7 @@ class MainActivity : Activity() {
         refreshPlaybackUi()
     }
 
-    private fun isPlayingSafe(): Boolean = try {
-        player?.isPlaying == true
-    } catch (_: IllegalStateException) {
-        false
-    }
+    private fun isPlayingSafe(): Boolean = player?.isPlaying == true
 
     private fun refreshPlaybackUi() {
         val t = current
@@ -3166,17 +3515,19 @@ class MainActivity : Activity() {
         miniArtist.text = t.artist
         // Small first, large as the fallback: a failed small thumbnail
         // must not leave the mini player artwork blank (v4 bug).
-        ArtworkLoader.load(t.artworkSmall, miniArtwork, t.artworkLarge)
+        ArtworkLoader.load(t.artworkSmall, miniArtwork, t.artworkLarge, dp(84))
         if (::npTitle.isInitialized) {
             npTitle.text = t.title
             npArtist.text = t.artist
             val big = largeArt(t)
-            ArtworkLoader.load(big, npArtwork, t.artworkSmall)
+            ArtworkLoader.load(big, npArtwork, t.artworkSmall, resources.displayMetrics.widthPixels)
             ArtworkLoader.loadBlurred(big, npBackdrop)
             updateHeart()
             npSeek.progress = 0
             npElapsed.text = "0:00"
+            lastNpElapsed = "0:00"
             npRemaining.text = "-" + fmt(t.duration * 1000)
+            lastNpRemaining = npRemaining.text.toString()
         }
     }
 
@@ -3424,30 +3775,23 @@ class MainActivity : Activity() {
         val out = outPlayer
         if (out != null) {
             handler.removeCallbacks(crossfadeTick)
-            try { out.release() } catch (_: Exception) {}
+            out.release()
             outPlayer = null
-            try { p.setVolume(1f, 1f) } catch (_: Exception) {}
+            p.setVolume(1f)
         }
-        try {
-            if (!p.isPlaying) return
-        } catch (_: IllegalStateException) {
-            return
-        }
+        if (!p.isPlaying) return
         var step = 0
         val fade = object : Runnable {
             override fun run() {
                 step++
-                try {
-                    val v = (1f - step / 20f).coerceAtLeast(0f)
-                    p.setVolume(v, v)
-                    if (step < 20) {
-                        handler.postDelayed(this, 100)
-                    } else {
-                        p.pause()
-                        p.setVolume(1f, 1f)
-                        refreshPlaybackUi()
-                    }
-                } catch (_: IllegalStateException) {
+                val v = (1f - step / 20f).coerceAtLeast(0f)
+                p.setVolume(v)
+                if (step < 20) {
+                    handler.postDelayed(this, 100)
+                } else {
+                    p.pause()
+                    p.setVolume(1f)
+                    refreshPlaybackUi()
                 }
             }
         }
@@ -3457,22 +3801,22 @@ class MainActivity : Activity() {
     /** The honest remaining-time label under the Now Playing controls. */
     private fun updateSleepLabel() {
         if (!::npSleepLabel.isInitialized) return
-        if (sleepAfterTrack) {
-            npSleepLabel.text = "Sleep timer · ends after this track"
-            npSleepLabel.visibility = View.VISIBLE
-            return
+        // Runs from the 500ms ticker: only touch the view when the
+        // rendered string actually changes (jank pass).
+        val text = when {
+            sleepAfterTrack -> "Sleep timer · ends after this track"
+            sleepAfterQueue -> "Sleep timer · ends at the end of the queue"
+            sleepDeadline > 0 && sleepDeadline - System.currentTimeMillis() > 0 ->
+                "Sleep timer · " + fmt((sleepDeadline - System.currentTimeMillis()).toInt())
+            else -> ""
         }
-        if (sleepAfterQueue) {
-            npSleepLabel.text = "Sleep timer · ends at the end of the queue"
-            npSleepLabel.visibility = View.VISIBLE
-            return
-        }
-        val remaining = sleepDeadline - System.currentTimeMillis()
-        if (sleepDeadline > 0 && remaining > 0) {
-            npSleepLabel.text = "Sleep timer · " + fmt(remaining.toInt())
-            npSleepLabel.visibility = View.VISIBLE
-        } else {
+        if (text == lastSleepLabel) return
+        lastSleepLabel = text
+        if (text.isEmpty()) {
             npSleepLabel.visibility = View.GONE
+        } else {
+            npSleepLabel.text = text
+            npSleepLabel.visibility = View.VISIBLE
         }
     }
 
@@ -4211,7 +4555,7 @@ class MainActivity : Activity() {
             scaleType = ImageView.ScaleType.CENTER_CROP
             roundedClip(this, 9)
         }
-        ArtworkLoader.load(track.artworkSmall ?: track.artworkLarge, img)
+        ArtworkLoader.load(track.artworkSmall ?: track.artworkLarge, img, null, dp(104))
         row.addView(img, LinearLayout.LayoutParams(dp(52), dp(52)))
         val text = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -4394,10 +4738,7 @@ class MainActivity : Activity() {
                         setPadding(0, dp(7), 0, dp(7))
                         isClickable = true
                         setOnClickListener {
-                            try {
-                                player?.seekTo(line.timeMs.toInt())
-                            } catch (_: Exception) {
-                            }
+                            player?.seekTo(line.timeMs)
                             updateLyricsHighlight()
                         }
                     }
@@ -4424,12 +4765,8 @@ class MainActivity : Activity() {
     private fun updateLyricsHighlight() {
         if (!::lyricsOverlay.isInitialized || lyricsOverlay.visibility != View.VISIBLE) return
         if (lyricsSyncedLines.isEmpty() || lyricsLineViews.isEmpty()) return
-        val pos = try {
-            player?.currentPosition
-        } catch (_: Exception) {
-            null
-        } ?: return
-        val idx = lyricsSyncedLines.indexOfLast { it.timeMs <= pos.toLong() }
+        val pos = player?.positionMs ?: return
+        val idx = lyricsSyncedLines.indexOfLast { it.timeMs <= pos }
         if (idx == lyricsActiveLine) return
         lyricsLineViews.getOrNull(lyricsActiveLine)?.let {
             it.setTextColor(white50)
@@ -4820,6 +5157,7 @@ class MainActivity : Activity() {
         outPlayer?.release()
         player?.release()
         executor.shutdownNow()
+        playerExecutor.shutdownNow()
         super.onDestroy()
     }
 }
