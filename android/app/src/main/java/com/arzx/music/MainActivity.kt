@@ -46,6 +46,8 @@ import android.view.animation.LinearInterpolator
 import android.view.animation.PathInterpolator
 import android.view.inputmethod.EditorInfo
 import android.widget.*
+import android.provider.Settings
+import androidx.core.content.FileProvider
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -1059,6 +1061,9 @@ class MainActivity : Activity() {
         showShell()
         showHome()
         handler.post(ticker)
+        // Quiet update check (0.6.3, WS-E): at most once a day,
+        // and it only ever speaks when an update EXISTS.
+        checkForUpdates(manual = false)
     }
 
     /**
@@ -2757,6 +2762,179 @@ class MainActivity : Activity() {
         content.addView(label("Lyrics · LRCLIB / lyrics.ovh when available", 15f, white50))
         content.addView(label("No DRM bypass, ever.", 15f, white50))
         content.addView(settingsRow("Open-source licenses", null, iconRes = R.drawable.ic_doc) { showLicenses() })
+        content.addView(
+            settingsRow(
+                "Check for updates",
+                "You're on version $ver · new builds land on GitHub",
+                iconRes = R.drawable.ic_download
+            ) { checkForUpdates(manual = true) }
+        )
+    }
+
+    // ------------------------------------------------------------ in-app updates (0.6.3, WS-E)
+
+    /**
+     * The update check. Manual (the Settings row) ALWAYS reports
+     * back — latest, update found, or couldn't check. Automatic
+     * (once from onCreate) is throttled to once a day and stays
+     * silent unless an update exists; the prompt for a given
+     * version is shown at most once ever, so there is no nag
+     * loop. The fetch runs on the shared executor: if this
+     * instance dies mid-check the result is dropped by the
+     * isFinishing/isDestroyed guard.
+     */
+    private fun checkForUpdates(manual: Boolean) {
+        val prefs = getPreferences(MODE_PRIVATE)
+        if (!manual) {
+            val last = prefs.getLong("update_last_check_ms", 0L)
+            if (System.currentTimeMillis() - last < 24L * 3600L * 1000L) return
+        }
+        prefs.edit().putLong("update_last_check_ms", System.currentTimeMillis()).apply()
+        if (manual) {
+            Toast.makeText(this, "Checking for updates…", Toast.LENGTH_SHORT).show()
+        }
+        executor.execute {
+            val rel = try {
+                UpdateChecker.fetchLatest(this)
+            } catch (_: Exception) {
+                null
+            }
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                when {
+                    rel == null -> if (manual) {
+                        Toast.makeText(
+                            this,
+                            "Couldn't check for updates. Check your connection and try again.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                    rel.versionCode > UpdateChecker.installedVersionCode(this) ->
+                        showUpdatePrompt(rel, fromAuto = !manual)
+                    else -> if (manual) {
+                        Toast.makeText(
+                            this,
+                            "You're on the latest version (${UpdateChecker.installedVersionName(this)})",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun showUpdatePrompt(rel: UpdateChecker.Release, fromAuto: Boolean) {
+        if (fromAuto) {
+            // Auto-prompts: at most once per version, ever.
+            val prefs = getPreferences(MODE_PRIVATE)
+            if (prefs.getInt("update_prompted_code", 0) >= rel.versionCode) return
+            prefs.edit().putInt("update_prompted_code", rel.versionCode).apply()
+        }
+        val notes = rel.notes.trim().let {
+            if (it.length > 600) it.substring(0, 600) + "…" else it
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Update available — ${rel.versionName}")
+            .setMessage(if (notes.isEmpty()) "A new version of arzxsh is ready to install." else notes)
+            .setPositiveButton("Update") { _, _ -> startUpdateDownload(rel) }
+            .setNegativeButton("Later", null)
+            .show()
+    }
+
+    private fun startUpdateDownload(rel: UpdateChecker.Release) {
+        // Already downloaded (e.g. returning from the
+        // unknown-sources grant): straight to the installer.
+        UpdateChecker.downloadedApk(this, rel)?.let { file ->
+            promptInstall(file, rel)
+            return
+        }
+        val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progress = 0
+            setPadding(dp(24), dp(8), dp(24), 0)
+        }
+        val dialog = android.app.AlertDialog.Builder(this)
+            .setTitle("Downloading ${rel.versionName}…")
+            .setView(bar)
+            .setNegativeButton("Later", null)
+            .create()
+        dialog.show()
+        // The download itself lives on UpdateChecker's
+        // process-lifetime executor (the WS-D survival rule):
+        // dismissing this dialog — or this activity dying —
+        // cannot interrupt it; the finished APK stays cached
+        // and the next Update tap goes straight to install.
+        UpdateChecker.downloadApk(
+            this, rel,
+            onProgress = { pct ->
+                runOnUiThread { if (!isFinishing && !isDestroyed) bar.progress = pct }
+            },
+            onDone = { file ->
+                runOnUiThread {
+                    if (dialog.isShowing) dialog.dismiss()
+                    if (isFinishing || isDestroyed) return@runOnUiThread
+                    if (file != null) {
+                        promptInstall(file, rel)
+                    } else {
+                        Toast.makeText(
+                            this,
+                            "The update download failed. Opening the release page instead.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        openReleasePage(rel)
+                    }
+                }
+            }
+        )
+    }
+
+    /**
+     * Hands the downloaded APK to the system installer. On
+     * Android 8+ the per-app unknown-sources grant comes first:
+     * if arzxsh may not install yet, the user is sent to that
+     * one system toggle (their tap, never ours); the APK stays
+     * downloaded, so Update → install is immediate afterwards.
+     * Any failure falls back to the release page.
+     */
+    private fun promptInstall(file: java.io.File, rel: UpdateChecker.Release) {
+        if (android.os.Build.VERSION.SDK_INT >= 26 && !packageManager.canRequestPackageInstalls()) {
+            Toast.makeText(
+                this,
+                "One system step: allow installs from arzxsh, then tap Update again.",
+                Toast.LENGTH_LONG
+            ).show()
+            try {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        Uri.parse("package:$packageName")
+                    )
+                )
+            } catch (_: Exception) {
+                openReleasePage(rel)
+            }
+            return
+        }
+        try {
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+            startActivity(
+                Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "application/vnd.android.package-archive")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            )
+        } catch (_: Exception) {
+            openReleasePage(rel)
+        }
+    }
+
+    private fun openReleasePage(rel: UpdateChecker.Release) {
+        if (rel.pageUrl.isEmpty()) return
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(rel.pageUrl)))
+        } catch (_: Exception) {
+            // No browser either: the Settings row can be retried.
+        }
     }
 
     private fun showEmpty(title: String, heading: String, message: String) {

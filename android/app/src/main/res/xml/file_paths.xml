@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider paths (0.6.3, WS-E): ONLY the updates cache
+     directory is shareable, and only with the system installer
+     via a per-intent grant. Nothing else in the app's storage
+     is reachable through the provider. -->
+<paths>
+    <cache-path name="updates" path="updates/" />
+</paths>
