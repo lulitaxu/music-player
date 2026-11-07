@@ -207,7 +207,7 @@ object YtmApi {
     private fun post(
         endpoint: String,
         body: JSONObject,
-        useVisitor: Boolean,
+        useVisitor: Boolean = true,
         gl: String = "US"
     ): JSONObject {
         val context = JSONObject()
