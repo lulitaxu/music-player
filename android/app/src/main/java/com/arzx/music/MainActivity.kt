@@ -2795,20 +2795,20 @@ class MainActivity : Activity() {
             Toast.makeText(this, "Checking for updates…", Toast.LENGTH_SHORT).show()
         }
         executor.execute {
-            val rel = try {
-                UpdateChecker.fetchLatest(this)
-            } catch (_: Exception) {
-                null
+            var rel: UpdateChecker.Release? = null
+            var failDetail: String? = null
+            try {
+                rel = UpdateChecker.fetchLatest(this)
+            } catch (e: UpdateChecker.UpdateCheckException) {
+                failDetail = e.detail
+            } catch (e: Exception) {
+                failDetail = e.javaClass.simpleName
             }
             runOnUiThread {
                 if (isFinishing || isDestroyed) return@runOnUiThread
                 when {
                     rel == null -> if (manual) {
-                        Toast.makeText(
-                            this,
-                            "Couldn't check for updates. Check your connection and try again.",
-                            Toast.LENGTH_LONG
-                        ).show()
+                        showUpdateCheckFailed(failDetail)
                     }
                     rel.versionCode > UpdateChecker.installedVersionCode(this) ->
                         showUpdatePrompt(rel, fromAuto = !manual)
@@ -2822,6 +2822,31 @@ class MainActivity : Activity() {
                 }
             }
         }
+    }
+
+    /**
+     * Manual-check failure (0.6.4, WS-1): never a bare "check
+     * your connection" — the dialog carries the real reason
+     * (HTTP status / GitHub's message / exception class) as
+     * small print, plus a way out to the releases page.
+     */
+    private fun showUpdateCheckFailed(detail: String?) {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Couldn't check for updates")
+            .setMessage(
+                "The check didn't reach GitHub.\n\nDetails: ${detail ?: "unknown error"}"
+            )
+            .setPositiveButton("OK", null)
+            .setNeutralButton("Releases page") { _, _ ->
+                try {
+                    startActivity(
+                        Intent(Intent.ACTION_VIEW, Uri.parse(UpdateChecker.RELEASES_PAGE_URL))
+                    )
+                } catch (_: Exception) {
+                    // No browser either: the Settings row can be retried.
+                }
+            }
+            .show()
     }
 
     private fun showUpdatePrompt(rel: UpdateChecker.Release, fromAuto: Boolean) {
@@ -2870,7 +2895,7 @@ class MainActivity : Activity() {
             onProgress = { pct ->
                 runOnUiThread { if (!isFinishing && !isDestroyed) bar.progress = pct }
             },
-            onDone = { file ->
+            onDone = { file, errDetail ->
                 runOnUiThread {
                     if (dialog.isShowing) dialog.dismiss()
                     if (isFinishing || isDestroyed) return@runOnUiThread
@@ -2879,7 +2904,9 @@ class MainActivity : Activity() {
                     } else {
                         Toast.makeText(
                             this,
-                            "The update download failed. Opening the release page instead.",
+                            "The update download failed" +
+                                (errDetail?.let { " ($it)" } ?: "") +
+                                ". Opening the release page instead.",
                             Toast.LENGTH_LONG
                         ).show()
                         openReleasePage(rel)
