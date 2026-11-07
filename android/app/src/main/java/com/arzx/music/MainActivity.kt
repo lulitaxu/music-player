@@ -1,5 +1,3 @@
-@file:OptIn(androidx.media3.common.util.UnstableApi::class)
-
 package com.arzx.music
 
 import android.app.Activity
@@ -260,7 +258,7 @@ private object ArtworkLoader {
  * track's session. All calls happen on the main thread (ExoPlayer's
  * contract) and are exception-shielded like the MediaPlayer code was.
  */
-@OptIn(UnstableApi::class)
+@UnstableApi
 private class EnginePlayer(val exo: ExoPlayer) {
     @Volatile
     var retired = false
@@ -309,7 +307,7 @@ private class EnginePlayer(val exo: ExoPlayer) {
     }
 }
 
-@OptIn(UnstableApi::class)
+@UnstableApi
 class MainActivity : Activity() {
     private val executor = Executors.newSingleThreadExecutor()
 
