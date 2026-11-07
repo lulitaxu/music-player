@@ -49,7 +49,7 @@ data class Playlist(
     val id: String,
     val name: String,
     val createdAt: Long,
-    val tracks: List<Track>
+    val tracks: List<Track>,
 )
 
 object Playlists {
@@ -70,7 +70,7 @@ object Playlists {
                     o.optString("name", "Playlist"),
                     o.optLong("createdAt"),
                     List(ta.length()) { j -> trackFromJson(ta.getJSONObject(j)) }
-                        .filterNotNull()
+                        .filterNotNull(),
                 )
             }
         } catch (_: Exception) {
@@ -156,6 +156,7 @@ object Playlists {
             }
         }
     }
+
 }
 
 // ------------------------------------------------------------ favorites
@@ -285,6 +286,7 @@ object PlayHistory {
     }
 
     fun listenedMs(ctx: Context): Long = prefs(ctx).getLong(KEY_LISTENED, 0L)
+
 }
 
 // ------------------------------------------------------------ local files
@@ -330,3 +332,56 @@ object LocalTracks {
         write(ctx, all(ctx).filter { it.id != track.id })
     }
 }
+
+// ------------------------------------------------------------ lyrics sync offsets (v6)
+
+/**
+ * Per-track lyrics sync offsets — the real-world cure for "lyrics
+ * aren't synced": LRCLIB's timing belongs to the exact release it
+ * was submitted against, and a different edit of the same song can
+ * sit a second or two off. The offset shifts the LRC timestamps for
+ * BOTH the highlight and tap-to-seek, so what you tap is where you
+ * land. A global default (Settings → Playback) applies to tracks
+ * with no per-track value.
+ *
+ * Sign convention (one place, applied everywhere): the effective
+ * line time is `lineTimeMs - offsetMs`. A POSITIVE offset therefore
+ * makes lines trigger EARLIER (use it when lyrics lag behind the
+ * singing); negative delays them.
+ */
+object LyricOffsets {
+    private const val KEY_PREFIX = "lyric_offset:"
+    private const val KEY_GLOBAL = "lyric_offset_global"
+
+    private fun prefs(ctx: Context) =
+        ctx.getSharedPreferences(LIB_PREFS, Context.MODE_PRIVATE)
+
+    /** Key form: the same Downloads.key(track) the lyrics cache uses. */
+    fun keyFor(track: Track): String = "${track.source}_${track.id}"
+
+    fun globalMs(ctx: Context): Long = prefs(ctx).getLong(KEY_GLOBAL, 0L)
+
+    fun setGlobalMs(ctx: Context, ms: Long) {
+        prefs(ctx).edit().putLong(KEY_GLOBAL, ms.coerceIn(-5000L, 5000L)).apply()
+    }
+
+    fun trackMs(ctx: Context, track: Track): Long? {
+        val p = prefs(ctx)
+        val k = KEY_PREFIX + keyFor(track)
+        return if (p.contains(k)) p.getLong(k, 0L) else null
+    }
+
+    fun setTrackMs(ctx: Context, track: Track, ms: Long) {
+        prefs(ctx).edit()
+            .putLong(KEY_PREFIX + keyFor(track), ms.coerceIn(-5000L, 5000L)).apply()
+    }
+
+    fun clearTrack(ctx: Context, track: Track) {
+        prefs(ctx).edit().remove(KEY_PREFIX + keyFor(track)).apply()
+    }
+
+    /** Effective offset for a track: its own value, else the global. */
+    fun effectiveMs(ctx: Context, track: Track): Long =
+        trackMs(ctx, track) ?: globalMs(ctx)
+}
+
