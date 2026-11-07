@@ -11,3 +11,8 @@ build/
 .venv/
 __pycache__/
 ytmusic-backend/.venv/
+
+# Signing identity (0.6.6) — the ONE permanent keystore and its password
+# live here locally; CI receives them from GitHub secrets. NEVER commit.
+keys/
+android/keystore.properties
