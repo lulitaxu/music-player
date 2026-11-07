@@ -17,6 +17,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import androidx.media3.common.util.UnstableApi
 import java.net.URL
 import java.util.concurrent.Executors
 
@@ -87,6 +88,7 @@ object PlaybackBridge {
  * [PlaybackBridge]; all transport actions call back into the
  * activity's own control functions.
  */
+@UnstableApi
 class PlaybackService : Service() {
 
     private lateinit var session: MediaSession
