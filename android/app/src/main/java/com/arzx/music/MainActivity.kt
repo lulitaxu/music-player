@@ -46,6 +46,7 @@ import android.view.animation.LinearInterpolator
 import android.view.animation.PathInterpolator
 import android.view.inputmethod.EditorInfo
 import android.widget.*
+import android.net.Uri
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import org.json.JSONArray
@@ -1979,28 +1980,28 @@ class MainActivity : Activity() {
                 val audiusF = fetchPool.submit<List<Track>?> {
                     fetch("/tracks/search?query=${URLEncoder.encode(q, "UTF-8")}&limit=25")
                 }
-                val ytSongsF = if (mode == "audius") null else fetchPool.submit {
+                val ytSongsF = if (mode == "audius") null else fetchPool.submit<Pair<SongSearchResult?, String?>> {
                     try {
                         YoutubeSource.searchSongs(q) to null as String?
                     } catch (t: Throwable) {
                         null to shortErr(t)
                     }
                 }
-                val ytArtistsF = if (mode == "audius") null else fetchPool.submit {
+                val ytArtistsF = if (mode == "audius") null else fetchPool.submit<Pair<List<YtmArtistRef>?, String?>> {
                     try {
                         YtmApi.searchArtists(q) to null as String?
                     } catch (t: Throwable) {
                         null to shortErr(t)
                     }
                 }
-                val ytAlbumsF = if (mode == "audius") null else fetchPool.submit {
+                val ytAlbumsF = if (mode == "audius") null else fetchPool.submit<Pair<List<YtmAlbumRef>?, String?>> {
                     try {
                         YtmApi.searchAlbums(q) to null as String?
                     } catch (t: Throwable) {
                         null to shortErr(t)
                     }
                 }
-                val ytPlaylistsF = if (mode == "audius") null else fetchPool.submit {
+                val ytPlaylistsF = if (mode == "audius") null else fetchPool.submit<Pair<List<YtmPlaylistRef>?, String?>> {
                     try {
                         YtmApi.searchPlaylists(q) to null as String?
                     } catch (t: Throwable) {
