@@ -41,9 +41,20 @@ object Downloads {
     @Volatile
     private var cache: List<Entry>? = null
 
+    /** Bumped on every index write (0.6.3, audit S6): lets
+     *  navigation fingerprints be O(1) instead of stat-ing every
+     *  downloaded file on every tab switch / screen render. */
+    @Volatile
+    private var indexVersion = 0
+
     fun key(track: Track): String = "${track.source}_${track.id}"
 
-    private fun dir(ctx: Context): File = File(ctx.filesDir, "downloads").apply { mkdirs() }
+    @Volatile
+    private var dirCache: File? = null
+
+    private fun dir(ctx: Context): File =
+        dirCache ?: File(ctx.filesDir, "downloads").apply { mkdirs() }
+            .also { dirCache = it }
 
     fun entries(ctx: Context): List<Entry> {
         cache?.let { return it }
@@ -79,6 +90,19 @@ object Downloads {
     }
 
     fun isDownloaded(ctx: Context, track: Track): Boolean = localFile(ctx, track) != null
+
+    /** Downloaded track keys from the cached index — ZERO file
+     *  stats (0.6.3, audit S6). List builders snapshot this once
+     *  and test membership per row instead of running a linear
+     *  scan + File.exists()/length() per row on the main thread.
+     *  The index is the source of truth for row badges; files are
+     *  verified lazily when actually played or downloaded. */
+    fun downloadedKeys(ctx: Context): Set<String> =
+        entries(ctx).mapTo(HashSet()) { key(it.track) }
+
+    /** O(1) change fingerprint for navigation retention: entry
+     *  count + a version that moves on every index write. */
+    fun fingerprint(ctx: Context): Int = entries(ctx).size * 131 + indexVersion
 
     /** Total bytes the download store currently occupies on disk. */
     fun storageBytes(ctx: Context): Long =
@@ -314,6 +338,7 @@ object Downloads {
 
     private fun writeAll(ctx: Context, list: List<Entry>) {
         cache = list
+        indexVersion++
         val arr = JSONArray()
         list.forEach { e ->
             arr.put(JSONObject().apply {

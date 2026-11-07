@@ -475,6 +475,22 @@ class MainActivity : Activity() {
      *  sat at "unavailable"; on the player executor a multi-request
      *  fetch could stall the playback ladder. Isolation both ways. */
     private val lyricsExecutor = Executors.newSingleThreadExecutor()
+
+    /** Stats persistence (0.6.3, audit S10): recents/history JSON
+     *  writes land here — single-threaded so write order is call
+     *  order — instead of taxing play()'s main-thread prelude. */
+    private val statsExecutor = Executors.newSingleThreadExecutor()
+
+    /** Gapless warm/arm work (0.6.3, audit S5): pre-resolution
+     *  walks live here, NOT on [playerExecutor], so a background
+     *  warm-up can never sit FIFO-ahead of a user's tap-to-play on
+     *  the foreground resolution ladder. */
+    private val gaplessExecutor = Executors.newSingleThreadExecutor()
+
+    /** Parallel fetch pool (0.6.3, audit S5): Search's five
+     *  independent source calls run concurrently here instead of
+     *  summing their round trips on the single-thread [executor]. */
+    private val fetchPool = Executors.newFixedThreadPool(4)
     private val tracks = mutableListOf<Track>()
     private var player: EnginePlayer? = null
     private var current: Track? = null
@@ -7230,20 +7246,28 @@ class MainActivity : Activity() {
         recentTracks.removeAll { it.id == track.id && it.source == track.source }
         recentTracks.add(0, track)
         while (recentTracks.size > 10) recentTracks.removeAt(recentTracks.size - 1)
-        val arr = JSONArray()
-        recentTracks.forEach { t ->
-            arr.put(JSONObject().apply {
-                put("id", t.id)
-                put("title", t.title)
-                put("artist", t.artist)
-                put("duration", t.duration)
-                put("source", t.source)
-                put("artistId", t.artistId ?: JSONObject.NULL)
-                put("artworkSmall", t.artworkSmall ?: JSONObject.NULL)
-                put("artworkLarge", t.artworkLarge ?: JSONObject.NULL)
-            })
+        // 0.6.3 (audit S10): the in-memory list above is the
+        // synchronous truth; the JSON serialize + prefs write move
+        // to the order-preserving stats thread, off play()'s
+        // main-thread prelude.
+        val snapshot = ArrayList(recentTracks)
+        statsExecutor.execute {
+            val arr = JSONArray()
+            snapshot.forEach { t ->
+                arr.put(JSONObject().apply {
+                    put("id", t.id)
+                    put("title", t.title)
+                    put("artist", t.artist)
+                    put("duration", t.duration)
+                    put("source", t.source)
+                    put("artistId", t.artistId ?: JSONObject.NULL)
+                    put("artworkSmall", t.artworkSmall ?: JSONObject.NULL)
+                    put("artworkLarge", t.artworkLarge ?: JSONObject.NULL)
+                })
+            }
+            getPreferences(MODE_PRIVATE).edit()
+                .putString("recent_tracks", arr.toString()).apply()
         }
-        getPreferences(MODE_PRIVATE).edit().putString("recent_tracks", arr.toString()).apply()
     }
 
     // ---------------------------------------------------------------- helpers kept from the original UI
@@ -7505,15 +7529,17 @@ class MainActivity : Activity() {
 
     /** Cheap local fingerprints: if the underlying data changed
      *  while the tab was away, the retained tree is dropped and
-     *  the tab rebuilds. No network involved in any of these. */
+     *  the tab rebuilds. No network involved in any of these.
+     *  0.6.3 (audit S2/S6): these are O(1) — the Library stores
+     *  read from their in-memory caches (sizes only, no JSON
+     *  parse) and Downloads keeps a versioned index counter
+     *  instead of stat-ing every file on every navigation. */
     private fun rootFingerprint(tab: String): Int = when (tab) {
         "Library" -> {
             val ps = Playlists.all(this)
             ps.size * 131 + ps.sumOf { it.tracks.size } * 17 + Favorites.liked(this).size
         }
-        "Downloads" ->
-            Downloads.entries(this).size * 131 +
-                (Downloads.storageBytes(this) % 100000).toInt()
+        "Downloads" -> Downloads.fingerprint(this)
         "Search" -> sourceMode().hashCode()
         else -> 0
     }
@@ -7639,6 +7665,9 @@ class MainActivity : Activity() {
         executor.shutdownNow()
         playerExecutor.shutdownNow()
         lyricsExecutor.shutdownNow()
+        statsExecutor.shutdownNow()
+        gaplessExecutor.shutdownNow()
+        fetchPool.shutdownNow()
         super.onDestroy()
     }
 }

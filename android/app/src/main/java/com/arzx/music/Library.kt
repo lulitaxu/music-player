@@ -55,12 +55,20 @@ data class Playlist(
 object Playlists {
     private const val KEY = "playlists"
 
+    /** Parsed-once in-memory cache (0.6.3, audit S2): [all] used to
+     *  re-parse the ENTIRE playlists JSON on every call, and it is
+     *  called from navigation fingerprints and playback paths.
+     *  Writes replace the cache, so it can never go stale. */
+    @Volatile
+    private var cached: List<Playlist>? = null
+
     private fun prefs(ctx: Context) =
         ctx.getSharedPreferences(LIB_PREFS, Context.MODE_PRIVATE)
 
     fun all(ctx: Context): List<Playlist> {
+        cached?.let { return it }
         val raw = prefs(ctx).getString(KEY, null) ?: return emptyList()
-        return try {
+        val parsed = try {
             val arr = JSONArray(raw)
             List(arr.length()) { i ->
                 val o = arr.getJSONObject(i)
@@ -76,11 +84,14 @@ object Playlists {
         } catch (_: Exception) {
             emptyList()
         }
+        cached = parsed
+        return parsed
     }
 
     fun get(ctx: Context, id: String): Playlist? = all(ctx).firstOrNull { it.id == id }
 
     private fun write(ctx: Context, list: List<Playlist>) {
+        cached = list
         val arr = JSONArray()
         list.forEach { p ->
             arr.put(JSONObject().apply {
@@ -172,24 +183,41 @@ object Playlists {
 object Favorites {
     private const val KEY = "favorites"
 
+    /** Parsed-once caches (0.6.3, audit S2): [contains] sits on the
+     *  playback-UI path (every state change re-checked the heart by
+     *  re-parsing the whole Liked list). The key set makes it O(1). */
+    @Volatile
+    private var cached: List<Track>? = null
+
+    @Volatile
+    private var cachedKeys: Set<String> = emptySet()
+
     private fun prefs(ctx: Context) =
         ctx.getSharedPreferences(LIB_PREFS, Context.MODE_PRIVATE)
 
     /** Most recently liked first. */
     fun liked(ctx: Context): List<Track> {
+        cached?.let { return it }
         val raw = prefs(ctx).getString(KEY, null) ?: return emptyList()
-        return try {
+        val parsed = try {
             val arr = JSONArray(raw)
             List(arr.length()) { trackFromJson(arr.getJSONObject(it)) }.filterNotNull()
         } catch (_: Exception) {
             emptyList()
         }
+        cached = parsed
+        cachedKeys = parsed.map { trackKey(it) }.toHashSet()
+        return parsed
     }
 
-    fun contains(ctx: Context, track: Track): Boolean =
-        liked(ctx).any { trackKey(it) == trackKey(track) }
+    fun contains(ctx: Context, track: Track): Boolean {
+        liked(ctx)
+        return trackKey(track) in cachedKeys
+    }
 
     private fun write(ctx: Context, list: List<Track>) {
+        cached = list
+        cachedKeys = list.map { trackKey(it) }.toHashSet()
         val arr = JSONArray()
         list.forEach { arr.put(trackToJson(it)) }
         prefs(ctx).edit().putString(KEY, arr.toString()).apply()
@@ -219,6 +247,17 @@ object PlayHistory {
     private const val KEY_LISTENED = "listened_ms_total"
     private const val MAX_EVENTS = 300
 
+    /** Parsed-once event cache (0.6.3, audit S2/S10): [record] used
+     *  to parse all ≤300 events, re-serialize them and write the
+     *  whole string back ON THE MAIN THREAD on every play(). Now
+     *  the in-memory list updates synchronously (so stats reads are
+     *  always current) and the serialization + prefs write run on
+     *  this single order-preserving thread. */
+    @Volatile
+    private var cachedEvents: MutableList<Pair<Track, Long>>? = null
+
+    private val persistExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+
     private fun prefs(ctx: Context) =
         ctx.getSharedPreferences(LIB_PREFS, Context.MODE_PRIVATE)
 
@@ -226,20 +265,30 @@ object PlayHistory {
         val events = events(ctx).toMutableList()
         events.add(0, track to System.currentTimeMillis())
         while (events.size > MAX_EVENTS) events.removeAt(events.size - 1)
-        val arr = JSONArray()
-        events.forEach { (t, ts) ->
-            arr.put(JSONObject().apply {
-                put("track", trackToJson(t))
-                put("ts", ts)
-            })
+        cachedEvents = events
+        // Snapshot for the persist thread: the live list keeps
+        // mutating with later plays, and this write must carry the
+        // state as of THIS record (single thread = write order is
+        // record order, so the last write always wins correctly).
+        val snapshot = ArrayList(events)
+        val appCtx = ctx.applicationContext
+        persistExecutor.execute {
+            val arr = JSONArray()
+            snapshot.forEach { (t, ts) ->
+                arr.put(JSONObject().apply {
+                    put("track", trackToJson(t))
+                    put("ts", ts)
+                })
+            }
+            prefs(appCtx).edit().putString(KEY_EVENTS, arr.toString()).apply()
         }
-        prefs(ctx).edit().putString(KEY_EVENTS, arr.toString()).apply()
     }
 
     /** Newest first. */
     fun events(ctx: Context): List<Pair<Track, Long>> {
+        cachedEvents?.let { return it }
         val raw = prefs(ctx).getString(KEY_EVENTS, null) ?: return emptyList()
-        return try {
+        val parsed = try {
             val arr = JSONArray(raw)
             List(arr.length()) { i ->
                 val o = arr.getJSONObject(i)
@@ -249,6 +298,9 @@ object PlayHistory {
         } catch (_: Exception) {
             emptyList()
         }
+        val mutable = parsed.toMutableList()
+        cachedEvents = mutable
+        return mutable
     }
 
     fun totalPlays(ctx: Context): Int = events(ctx).size
@@ -300,20 +352,28 @@ object PlayHistory {
 object LocalTracks {
     private const val KEY = "local_tracks"
 
+    /** Parsed-once cache (0.6.3, audit S2 pattern). */
+    @Volatile
+    private var cached: List<Track>? = null
+
     private fun prefs(ctx: Context) =
         ctx.getSharedPreferences(LIB_PREFS, Context.MODE_PRIVATE)
 
     fun all(ctx: Context): List<Track> {
+        cached?.let { return it }
         val raw = prefs(ctx).getString(KEY, null) ?: return emptyList()
-        return try {
+        val parsed = try {
             val arr = JSONArray(raw)
             List(arr.length()) { trackFromJson(arr.getJSONObject(it)) }.filterNotNull()
         } catch (_: Exception) {
             emptyList()
         }
+        cached = parsed
+        return parsed
     }
 
     private fun write(ctx: Context, list: List<Track>) {
+        cached = list
         val arr = JSONArray()
         list.forEach { arr.put(trackToJson(it)) }
         prefs(ctx).edit().putString(KEY, arr.toString()).apply()
