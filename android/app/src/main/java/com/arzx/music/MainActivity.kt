@@ -7,7 +7,9 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
 import android.media.AudioManager
 import android.media.MediaMetadataRetriever
 import android.media.audiofx.AudioEffect
@@ -1050,9 +1052,15 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             // v6: the chrome sits on solid black (Spotify). 0.6.1:
             // with glass on, the bar goes translucent so scrolling
-            // content ghosts through its margins.
-            if (glassOn()) setBackgroundColor(Color.argb(228, 10, 10, 12))
-            else setBackgroundColor(Color.BLACK)
+            // content ghosts through its margins. 0.6.3 (WS-B):
+            // the glass bar is LIT from above (a vertical
+            // lightening gradient) so it reads as glass, not as
+            // another black slab.
+            if (glassOn()) {
+                background = glassBar(Color.argb(238, 32, 32, 36), Color.argb(230, 12, 12, 14))
+            } else {
+                setBackgroundColor(Color.BLACK)
+            }
         }
 
         // ---- mini player ----
@@ -1151,8 +1159,14 @@ class MainActivity : Activity() {
         val nav = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            if (glassOn()) setBackgroundColor(Color.argb(233, 14, 14, 16))
-            else setBackgroundColor(Color.BLACK)
+            // 0.6.1: translucent glass-dark while glass is on.
+            // 0.6.3 (WS-B): lit-from-above gradient, same rule as
+            // the bottom bar — visible as glass over content.
+            if (glassOn()) {
+                background = glassBar(Color.argb(240, 40, 40, 46), Color.argb(235, 18, 18, 20))
+            } else {
+                setBackgroundColor(Color.BLACK)
+            }
             setPadding(dp(4), dp(2), dp(4), dp(2))
         }
         val tabs = listOf(
@@ -1281,24 +1295,69 @@ class MainActivity : Activity() {
     private fun glassOn(): Boolean =
         getPreferences(MODE_PRIVATE).getBoolean("setting_Glass effects", true)
 
-    /** The pre-v6 glass fill: translucent color + 1dp light stroke. */
-    private fun glassBg(radiusDp: Float, fill: Int, stroke: Int): GradientDrawable =
-        GradientDrawable().apply {
-            setColor(fill)
-            cornerRadius = dp(radiusDp.toInt()).toFloat()
+    /** Layered glass (0.6.3, WS-B): the 0.6.1 treatment — a flat
+     *  translucent near-black fill + a faint stroke — read as
+     *  SOLID black over the app's #121212 screens, so the field
+     *  verdict was "glass layers not showing" with the toggle on.
+     *  Glass reads as glass through LIGHT, not darkness: a
+     *  vertical lightening gradient (lit from above), a bright
+     *  sheen band across the top edge, and a clearly visible
+     *  rim stroke. Still zero runtime blur (perf law); still two
+     *  static drawables per surface, drawn once. */
+    private fun glassBg(
+        radiusDp: Float,
+        top: Int,
+        bottom: Int,
+        stroke: Int,
+        sheenAlpha: Int
+    ): Drawable {
+        val r = dp(radiusDp.toInt()).toFloat()
+        val body = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(top, bottom)
+        ).apply {
+            cornerRadius = r
             setStroke(dp(1), stroke)
         }
+        val sheen = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(
+                Color.argb(sheenAlpha, 255, 255, 255),
+                Color.argb((sheenAlpha * 0.4f).toInt(), 255, 255, 255),
+                Color.argb(0, 255, 255, 255),
+                Color.argb(0, 255, 255, 255)
+            )
+        ).apply { cornerRadius = r }
+        return LayerDrawable(arrayOf(body, sheen))
+    }
 
-    /** Glass for the floating chrome (mini player, sheets): dark
-     *  enough to stay readable over scrolling lists, light enough
-     *  that content ghosts through. */
-    private fun chromeGlass(radiusDp: Float): GradientDrawable =
-        glassBg(radiusDp, Color.argb(222, 33, 33, 36), Color.argb(42, 255, 255, 255))
+    /** Glass for the floating chrome (mini player, sheets): the
+     *  fill stays translucent enough for content to ghost through,
+     *  but the top of the surface is now lit at ~74/255 grey
+     *  instead of 33 — unmistakably a lit pane, not a black box. */
+    private fun chromeGlass(radiusDp: Float): Drawable =
+        glassBg(
+            radiusDp,
+            Color.argb(238, 66, 66, 74), Color.argb(228, 36, 36, 42),
+            Color.argb(120, 255, 255, 255), sheenAlpha = 110
+        )
 
     /** Glass over Now Playing's genuinely blurred backdrop: the
      *  art behind is already soft, so the fill can go lighter. */
-    private fun npGlass(radiusDp: Float): GradientDrawable =
-        glassBg(radiusDp, Color.argb(112, 24, 24, 28), Color.argb(48, 255, 255, 255))
+    private fun npGlass(radiusDp: Float): Drawable =
+        glassBg(
+            radiusDp,
+            Color.argb(150, 58, 58, 66), Color.argb(120, 30, 30, 36),
+            Color.argb(130, 255, 255, 255), sheenAlpha = 80
+        )
+
+    /** Full-width bar glass (tab bar / bottom bar): the same
+     *  vertical lightening, no radius or rim (edge-to-edge). */
+    private fun glassBar(top: Int, bottom: Int): GradientDrawable =
+        GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(top, bottom)
+        )
 
     /** Toggling glass rebuilds the shell + current screen (the
      *  same live-apply path as the theme accent): backgrounds are
@@ -7291,8 +7350,10 @@ class MainActivity : Activity() {
             visibility = View.GONE
             // Glass backdrop (0.6.1): the near-opaque black softens
             // so the screen behind ghosts through; solid when off.
+            // 0.6.3 (WS-B): lightened a step further (216 -> 198
+            // alpha) so the ghosting is actually perceptible.
             setBackgroundColor(
-                if (glassOn()) Color.argb(216, 8, 8, 10) else Color.argb(250, 0, 0, 0)
+                if (glassOn()) Color.argb(198, 10, 10, 13) else Color.argb(250, 0, 0, 0)
             )
         }
         val inner = LinearLayout(this).apply {
