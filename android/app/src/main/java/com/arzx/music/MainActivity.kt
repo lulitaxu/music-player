@@ -1780,42 +1780,68 @@ class MainActivity : Activity() {
             skelRows(resultsBox, 5)
             val mode = sourceMode()
             executor.execute {
-                val audius = fetch("/tracks/search?query=${URLEncoder.encode(q, "UTF-8")}&limit=25")
+                // 0.6.3 (audit S5): the five source calls are
+                // independent, but they used to run STRICTLY
+                // sequentially here, so search wall time was the
+                // SUM of five round trips. They now fly
+                // concurrently on the fetch pool and the results
+                // render ONCE, below, when all five have settled.
+                // Each call keeps its own guard and its own
+                // rendered error, and the composition that follows
+                // is unchanged.
+                val audiusF = fetchPool.submit<List<Track>?> {
+                    fetch("/tracks/search?query=${URLEncoder.encode(q, "UTF-8")}&limit=25")
+                }
+                val ytSongsF = if (mode == "audius") null else fetchPool.submit {
+                    try {
+                        YoutubeSource.searchSongs(q) to null as String?
+                    } catch (t: Throwable) {
+                        null to shortErr(t)
+                    }
+                }
+                val ytArtistsF = if (mode == "audius") null else fetchPool.submit {
+                    try {
+                        YtmApi.searchArtists(q) to null as String?
+                    } catch (t: Throwable) {
+                        null to shortErr(t)
+                    }
+                }
+                val ytAlbumsF = if (mode == "audius") null else fetchPool.submit {
+                    try {
+                        YtmApi.searchAlbums(q) to null as String?
+                    } catch (t: Throwable) {
+                        null to shortErr(t)
+                    }
+                }
+                val ytPlaylistsF = if (mode == "audius") null else fetchPool.submit {
+                    try {
+                        YtmApi.searchPlaylists(q) to null as String?
+                    } catch (t: Throwable) {
+                        null to shortErr(t)
+                    }
+                }
+                val audius = try {
+                    audiusF.get()
+                } catch (_: Exception) {
+                    null
+                }
                 // Every YouTube call is separately guarded and its
                 // failure is RENDERED below the results (v3 swallowed
                 // the exception and YouTube quietly never appeared).
-                var ytSongs: List<Track> = emptyList()
-                var ytNote: String? = null
-                var ytErr: String? = null
                 // Audius mode fires NO YouTube calls at all.
-                if (mode != "audius") try {
-                    val r = YoutubeSource.searchSongs(q)
-                    ytSongs = r.tracks
-                    ytNote = r.note
-                } catch (t: Throwable) {
-                    ytErr = shortErr(t)
-                }
-                var ytArtists: List<YtmArtistRef> = emptyList()
-                var ytArtistsErr: String? = null
-                if (mode != "audius") try {
-                    ytArtists = YtmApi.searchArtists(q)
-                } catch (t: Throwable) {
-                    ytArtistsErr = shortErr(t)
-                }
-                var ytAlbums: List<YtmAlbumRef> = emptyList()
-                var ytAlbumsErr: String? = null
-                if (mode != "audius") try {
-                    ytAlbums = YtmApi.searchAlbums(q)
-                } catch (t: Throwable) {
-                    ytAlbumsErr = shortErr(t)
-                }
-                var ytPlaylists: List<YtmPlaylistRef> = emptyList()
-                var ytPlaylistsErr: String? = null
-                if (mode != "audius") try {
-                    ytPlaylists = YtmApi.searchPlaylists(q)
-                } catch (t: Throwable) {
-                    ytPlaylistsErr = shortErr(t)
-                }
+                val ytSongsRes = ytSongsF?.get()
+                val ytSongs: List<Track> = ytSongsRes?.first?.tracks ?: emptyList()
+                val ytNote: String? = ytSongsRes?.first?.note
+                val ytErr: String? = ytSongsRes?.second
+                val ytArtistsRes = ytArtistsF?.get()
+                val ytArtists: List<YtmArtistRef> = ytArtistsRes?.first ?: emptyList()
+                val ytArtistsErr: String? = ytArtistsRes?.second
+                val ytAlbumsRes = ytAlbumsF?.get()
+                val ytAlbums: List<YtmAlbumRef> = ytAlbumsRes?.first ?: emptyList()
+                val ytAlbumsErr: String? = ytAlbumsRes?.second
+                val ytPlaylistsRes = ytPlaylistsF?.get()
+                val ytPlaylists: List<YtmPlaylistRef> = ytPlaylistsRes?.first ?: emptyList()
+                val ytPlaylistsErr: String? = ytPlaylistsRes?.second
                 // One merged song list, YouTube Music FIRST (it is
                 // the primary source now), Audius after — both fully
                 // present and playable, and next/previous playback
@@ -4485,7 +4511,7 @@ class MainActivity : Activity() {
         if (afterNextWarmedFor == pairKey) return
         afterNextWarmedFor = pairKey
         val quality = effectiveQuality()
-        playerExecutor.execute {
+        gaplessExecutor.execute {
             val resolved = try {
                 StreamResolver.resolveYoutube(after.id, quality)
             } catch (e: Exception) {
@@ -4573,7 +4599,7 @@ class MainActivity : Activity() {
                 prepareGapless(next, localFile.absolutePath, null)
             next.source == SOURCE_YOUTUBE -> {
                 val quality = effectiveQuality()
-                playerExecutor.execute {
+                gaplessExecutor.execute {
                     val resolved = try {
                         StreamResolver.resolveYoutube(next.id, quality)
                     } catch (e: Exception) {
