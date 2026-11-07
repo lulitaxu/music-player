@@ -225,7 +225,7 @@ class PlaybackService : Service() {
         val playing = s?.isPlaying == true
         // minSdk is 26, so the channel constructor is unconditional.
         val b = Notification.Builder(this, CHANNEL_ID)
-        b.setSmallIcon(R.drawable.ic_play)
+        b.setSmallIcon(R.drawable.ic_stat_logo)
             .setContentTitle(s?.title ?: "arzxsh")
             .setContentText(s?.artist ?: "")
             .setContentIntent(openIntent)

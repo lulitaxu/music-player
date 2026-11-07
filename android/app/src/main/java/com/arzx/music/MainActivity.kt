@@ -2434,6 +2434,11 @@ class MainActivity : Activity() {
         content.addView(setting("Reduce motion", false))
 
         content.addView(settingsGroupHeader("About"))
+        content.addView(ImageView(this).apply {
+            setImageResource(R.drawable.ic_logo)
+            layoutParams = LinearLayout.LayoutParams(dp(52), dp(52))
+            setPadding(0, dp(2), 0, dp(10))
+        })
         // Read from the build, never hardcoded (v4 shipped a stale
         // literal "Version 0.2.0" long after the app had moved on).
         val ver = try {
