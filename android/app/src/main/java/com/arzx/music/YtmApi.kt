@@ -99,6 +99,7 @@ object YtmApi {
     private const val PARAMS_SONGS = "EgWKAQIIAWoMEA4QChADEAQQCRAF"
     private const val PARAMS_ALBUMS = "EgWKAQIYAWoMEA4QChADEAQQCRAF"
     private const val PARAMS_ARTISTS = "EgWKAQIgAWoMEA4QChADEAQQCRAF"
+    private const val PARAMS_PLAYLISTS = "EgWKAQIoAWoMEA4QChADEAQQCRAF"
 
     private val durationRe = Regex("""^\d{1,3}:\d{2}(:\d{2})?$""")
     private val yearRe = Regex("""^(19|20)\d{2}$""")
@@ -560,6 +561,31 @@ object YtmApi {
                     artist = item.artistName ?: "",
                     artistId = item.artistId,
                     year = item.year,
+                    artworkSmall = item.artworkSmall,
+                    artworkLarge = item.artworkLarge
+                )
+            )
+            if (out.size >= limit) break
+        }
+        return out
+    }
+
+    /** Playlist search (0.6.1): same filtered-search shape as
+     *  artists/albums. Only real playlist browse ids ("VL…") pass,
+     *  and results open through the existing playlist page, so a
+     *  wrong-shaped item can only ever yield an empty section. */
+    fun searchPlaylists(query: String, limit: Int = 10): List<YtmPlaylistRef> {
+        val out = ArrayList<YtmPlaylistRef>()
+        for (item in searchItems(query, PARAMS_PLAYLISTS)) {
+            val bid = item.browseId ?: continue
+            if (item.videoId != null) continue
+            if (!bid.startsWith("VL")) continue
+            out.add(
+                YtmPlaylistRef(
+                    id = bid,
+                    title = item.title,
+                    subtitle = item.metaTexts.filter { !it.equals("Playlist", ignoreCase = true) }
+                        .joinToString(" • "),
                     artworkSmall = item.artworkSmall,
                     artworkLarge = item.artworkLarge
                 )
