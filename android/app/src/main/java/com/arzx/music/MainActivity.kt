@@ -356,6 +356,29 @@ object ArtworkLoader {
         val h = (src.height * (w.toFloat() / src.width)).toInt().coerceAtLeast(1)
         var bmp = Bitmap.createScaledBitmap(src, w, h, true)
         repeat(3) { bmp = boxBlur(bmp, 5) }
+        // 0.6.3 (audit S9): the backdrop darkening is BAKED IN —
+        // a per-row multiply from 0.72 (top) to 0.42 (bottom),
+        // reproducing what Now Playing's color filter (110/255
+        // flat) plus its separate full-screen shade gradient
+        // used to composite at draw time on every frame. The
+        // cached blur now IS the finished backdrop: the filter
+        // and the shade layer are deleted, so the NP backdrop
+        // stack renders one layer thinner. 28px wide; the cost
+        // is noise, paid once per track.
+        val px = IntArray(w * h)
+        bmp.getPixels(px, 0, w, 0, 0, w, h)
+        for (y in 0 until h) {
+            val f = if (h <= 1) 0.55f else 0.72f - 0.30f * (y.toFloat() / (h - 1))
+            for (x in 0 until w) {
+                val c = px[y * w + x]
+                px[y * w + x] = Color.rgb(
+                    (Color.red(c) * f).toInt(),
+                    (Color.green(c) * f).toInt(),
+                    (Color.blue(c) * f).toInt()
+                )
+            }
+        }
+        bmp.setPixels(px, 0, w, 0, 0, w, h)
         return bmp
     }
 
@@ -1056,6 +1079,25 @@ class MainActivity : Activity() {
         }
     }
 
+    /** The shell's root, kept so the overlay trees can attach to
+     *  it lazily (0.6.3, audit S7). */
+    private var shellRoot: FrameLayout? = null
+    private var overlaysBuilt = false
+
+    /** Builds the four overlay trees on first need (0.6.3, S7):
+     *  called at the top of every overlay entry point. A shell
+     *  rebuild (theme/glass change) resets the flag in showShell,
+     *  so the next open rebuilds them against the fresh shell. */
+    private fun ensureOverlays() {
+        if (overlaysBuilt) return
+        val root = shellRoot ?: return
+        overlaysBuilt = true
+        buildNowPlaying(root)
+        buildQueueOverlay(root)
+        buildLyricsOverlay(root)
+        buildMenuOverlay(root)
+    }
+
     // ---------------------------------------------------------------- shell
 
     private fun showShell() {
@@ -1220,10 +1262,16 @@ class MainActivity : Activity() {
         bottomBar.addView(nav, navLp)
         root.addView(bottomBar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
 
-        buildNowPlaying(root)
-        buildQueueOverlay(root)
-        buildLyricsOverlay(root)
-        buildMenuOverlay(root)
+        // 0.6.3 (audit S7): the four overlay trees (Now Playing,
+        // queue, lyrics, menu) are NOT built here anymore. They
+        // cost real tree-building time at every startup and shell
+        // rebuild for surfaces a session may never open.
+        // ensureOverlays() builds them on first open instead —
+        // every overlay entry point calls it, and the guarded
+        // readers (onBackPressed, refreshPlaybackUi, the state
+        // sync) already skip uninitialized overlays by design.
+        shellRoot = root
+        overlaysBuilt = false
         setContentView(root)
         setActiveTab("Home")
         // Re-fit on EVERY bar layout, not one posted runnable: the v4
@@ -3581,18 +3629,14 @@ class MainActivity : Activity() {
             visibility = View.GONE
             setBackgroundColor(bgColor)
         }
+        // 0.6.3 (audit S9): NO color filter and NO separate shade
+        // view — the loader's blurred backdrop is pre-darkened
+        // (see ArtworkLoader.blur), so this single layer is the
+        // whole backdrop treatment.
         npBackdrop = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
-            setColorFilter(Color.argb(110, 0, 0, 0))
         }
         nowPlaying.addView(npBackdrop, FrameLayout.LayoutParams(-1, -1))
-        val shade = View(this).apply {
-            background = GradientDrawable(
-                GradientDrawable.Orientation.TOP_BOTTOM,
-                intArrayOf(Color.argb(60, 0, 0, 0), Color.argb(150, 0, 0, 0))
-            )
-        }
-        nowPlaying.addView(shade, FrameLayout.LayoutParams(-1, -1))
         // Ambient glow layer (v6 refinement): a radial wash of the
         // artwork's dominant color, crossfaded on track change.
         npAmbient = View(this).apply { visibility = View.GONE }
@@ -3615,6 +3659,21 @@ class MainActivity : Activity() {
         }
         npScroll.onDrag = { dy -> nowPlaying.translationY = dy }
         npScroll.onDragEnd = { dy, v -> onNpDragEnd(dy, v) }
+        // The ambient wash steps aside while the panel scrolls
+        // (0.6.3, audit S9): a full-screen radial layer under a
+        // moving scroll is the NP frame budget's biggest tenant.
+        // It restores ~200ms after the scroll settles, through
+        // the same applyAmbient the track change uses.
+        val ambientRestore = Runnable {
+            if (::nowPlaying.isInitialized && nowPlaying.visibility == View.VISIBLE) {
+                applyAmbient(animate = false)
+            }
+        }
+        npScroll.setOnScrollChangeListener { _, _, _, _, _ ->
+            if (::npAmbient.isInitialized) npAmbient.visibility = View.GONE
+            handler.removeCallbacks(ambientRestore)
+            handler.postDelayed(ambientRestore, 200)
+        }
         val inner = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24), dp(36), dp(24), dp(30))
@@ -3658,7 +3717,16 @@ class MainActivity : Activity() {
         npArtwork = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
             roundedClip(this, 10)
-            elevation = dp(24).toFloat()
+            // 0.6.3 (audit S9): the real-time elevation shadow
+            // (dp(24) — a full-screen blur pass under the hero on
+            // every frame) is replaced by a static edge-light
+            // ring drawn as the view's foreground: zero shadow
+            // rendering, same "lifted card" read.
+            foreground = GradientDrawable().apply {
+                setColor(Color.TRANSPARENT)
+                cornerRadius = dp(10).toFloat()
+                setStroke(dp(1), Color.argb(60, 255, 255, 255))
+            }
         }
         val artLp = LinearLayout.LayoutParams(artSize, artSize)
         artLp.topMargin = dp(22)
@@ -3982,6 +4050,7 @@ class MainActivity : Activity() {
     }
 
     private fun showNowPlaying() {
+        ensureOverlays()
         nowPlaying.visibility = View.VISIBLE
         refreshPlaybackUi()
         if (reduceMotion()) {
@@ -6048,6 +6117,7 @@ class MainActivity : Activity() {
     /** Glass bottom-sheet menu used for track actions, the Now Playing
      *  more menu, and the sleep timer picker. */
     private fun showMenu(title: String?, items: List<Pair<String, () -> Unit>>) {
+        ensureOverlays()
         if (title.isNullOrEmpty()) {
             menuTitle.visibility = View.GONE
         } else {
@@ -7250,7 +7320,7 @@ class MainActivity : Activity() {
             Toast.makeText(this, "Nothing playing", Toast.LENGTH_SHORT).show()
             return
         }
-        if (!::lyricsOverlay.isInitialized) return
+        ensureOverlays()
         lyricsTrack = t
         // Ambient backdrop: the current artwork's color, solid;
         // the neutral background when the toggle is off or no
@@ -7449,6 +7519,7 @@ class MainActivity : Activity() {
     }
 
     private fun showQueue() {
+        ensureOverlays()
         queueList.removeAllViews()
         // Mode chips at the top of the queue (Apple puts the toggles
         // here), reflecting and driving the same player state.
@@ -7875,7 +7946,7 @@ class MainActivity : Activity() {
         val barSets: List<Array<View>>
     )
 
-    private val retainedRoots = HashMap<String, RetainedRoot>()
+    private val retainedRoots = LinkedHashMap<String, RetainedRoot>()
 
     /** The tab root currently on screen, or null on pushed
      *  screens, overlays and Settings. */
@@ -7927,6 +7998,17 @@ class MainActivity : Activity() {
             rootFingerprint(tab),
             ArrayList(visualizerBarSets)
         )
+        // Retention trim (0.6.3, audit S8): at most TWO tab trees
+        // stay resident — Home (the anchor) plus the most recent
+        // other tab. A third full tree (with its bitmaps) was
+        // memory the Helio G95 felt as GC pressure everywhere.
+        // An evicted tab simply rebuilds on next visit, exactly
+        // like a fingerprint miss today; restore semantics from
+        // the user's side are unchanged.
+        while (retainedRoots.size > 2) {
+            val victim = retainedRoots.keys.firstOrNull { it != "Home" && it != tab } ?: break
+            retainedRoots.remove(victim)
+        }
     }
 
     /** Cheap local fingerprints: if the underlying data changed
