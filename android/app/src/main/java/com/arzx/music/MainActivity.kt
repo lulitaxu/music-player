@@ -191,6 +191,61 @@ private object ArtworkLoader {
         }
     }
 
+    /** Dominant vibrant color of [url]'s artwork for the ambient
+     *  player glow, sampled from a 256px decode on the pool thread.
+     *  The callback fires on the main thread; null means "no usable
+     *  color" and the caller keeps the neutral background. One-shot
+     *  per artwork — no per-frame work. */
+    fun loadAmbientColor(url: String?, onColor: (Int?) -> Unit) {
+        if (url.isNullOrEmpty()) {
+            onColor(null)
+            return
+        }
+        pool.execute {
+            val bmp = decode(url, 256)
+            val color = bmp?.let { dominantVibrant(it) }
+            Handler(Looper.getMainLooper()).post { onColor(color) }
+        }
+    }
+
+    /** Saturation/value-weighted hue histogram over the bitmap:
+     *  near-gray and near-black/white pixels are ignored, the
+     *  winning hue bucket is re-emitted at a fixed deep, saturated
+     *  value so the glow reads as "the artwork's color, darkened"
+     *  (the inspo's indigo wash) under white text. */
+    private fun dominantVibrant(bmp: Bitmap): Int? {
+        val w = bmp.width
+        val h = bmp.height
+        if (w <= 0 || h <= 0) return null
+        val buckets = FloatArray(36)
+        val hsv = FloatArray(3)
+        var x = 0
+        while (x < w) {
+            var y = 0
+            while (y < h) {
+                Color.colorToHSV(bmp.getPixel(x, y), hsv)
+                val s = hsv[1]
+                val v = hsv[2]
+                if (s >= 0.25f && v >= 0.12f && v <= 0.95f) {
+                    val b = (hsv[0] / 10f).toInt().coerceIn(0, 35)
+                    buckets[b] += s * v
+                }
+                y += 4
+            }
+            x += 4
+        }
+        var best = -1
+        var bestW = 0f
+        for (i in buckets.indices) {
+            if (buckets[i] > bestW) {
+                bestW = buckets[i]
+                best = i
+            }
+        }
+        if (best < 0) return null
+        return Color.HSVToColor(floatArrayOf(best * 10f + 5f, 0.62f, 0.42f))
+    }
+
     private fun downloadBytes(url: String): ByteArray? = try {
         if (url.startsWith("file:")) {
             // Local artwork extracted at import time lives on disk.
@@ -373,7 +428,6 @@ class MainActivity : Activity() {
     private lateinit var npElapsed: TextView
     private lateinit var npRemaining: TextView
     private lateinit var npPlayButton: ImageView
-    private lateinit var npVolume: SeekBar
 
     private lateinit var audioManager: AudioManager
     private val handler = Handler(Looper.getMainLooper())
@@ -394,6 +448,8 @@ class MainActivity : Activity() {
     private lateinit var npDownloadBtn: ImageView
     private lateinit var npDownloadProgress: ProgressBar
     private lateinit var npSleepLabel: TextView
+    /** Sleep glyph in the v6 controls row (tints accent when armed). */
+    private lateinit var npSleepBtn: ImageView
     private lateinit var npError: TextView
     /** One-shot Now Playing notice (e.g. the Audius fallback line),
      *  shown when the next stream successfully prepares. */
@@ -492,6 +548,75 @@ class MainActivity : Activity() {
     private var lyricsKey: String? = null
     /** True while a lyrics fetch is in flight (double-tap guard). */
     private var lyricsLoading = false
+    /** Track the lyrics overlay is showing (offset controls act on it). */
+    private var lyricsTrack: Track? = null
+    /** Spinner shown in the lyrics header while a fetch runs. */
+    private lateinit var lyricsSpinner: ProgressBar
+    /** Offset row value label in the lyrics overlay. */
+    private lateinit var lyricsOffsetLabel: TextView
+
+    // ---- v6: Now Playing lyrics (above-title line + preview card) ----
+    private lateinit var npLyricLine: TextView
+    private lateinit var npLyricsCard: LinearLayout
+    private lateinit var npLyricsCardCur: TextView
+    private lateinit var npLyricsCardNext: TextView
+    private var npLyrics: LyricsData? = null
+    /** Downloads.key() of the track [npLyrics] belongs to. */
+    private var npLyricsKey: String? = null
+    private var npLyricIdx = -2
+    private var lastNpLyricText: String? = null
+
+    // ---- v6: "Playing from {context}" for the Now Playing top bar ----
+    private var npContextKind = ""
+    private var npContextName = ""
+    private lateinit var npContextSmall: TextView
+    private lateinit var npContextBig: TextView
+
+    /** Sets the Now Playing "Playing from" context (called by the
+     *  screens that own a queue: playlist, album, artist, search…). */
+    private fun setPlayContext(kind: String, name: String) {
+        npContextKind = kind
+        npContextName = name
+    }
+
+    // ---- v6: buffering state (mini player + Now Playing) ----
+    /** True between a play() request and the player reaching READY
+     *  (or BUFFERING in ExoPlayer terms). Drives the buffering
+     *  indicators; cleared on ready/error/completion paths. */
+    private var buffering = false
+    private lateinit var miniProgress: ProgressBar
+    private lateinit var npBuffering: ProgressBar
+    private var lastMiniProgress = -1
+
+    // ---- v6: skeleton loading placeholders ----
+    /** Placeholder blocks currently on screen, pulsed by ONE shared
+     *  animator (alpha only — GPU-cheap on the Helio G95). Cleared
+     *  whenever a screen rebuilds its content. */
+    private val skeletonViews = ArrayList<View>()
+    private var skeletonAnimator: ValueAnimator? = null
+
+    // ---- v6: library screen state ----
+    /** Active Library filter chip: all | playlists | liked |
+     *  downloaded | saved | local. */
+    private var libraryFilter = "all"
+    /** Library layout: true = 3-column grid (inspo), false = rows. */
+    private var libraryGrid = true
+
+    // ---- v6 refinement: ambient player color ----
+    /** Dominant vibrant color extracted from the current track's
+     *  hi-res artwork (darkened for background use); null until the
+     *  first extraction lands or when the artwork has no color. */
+    private var ambientColor: Int? = null
+    /** Downloads.key() of the track [ambientColor] belongs to. */
+    private var ambientKey: String? = null
+    /** Radial-glow layer inside Now Playing, above the blurred
+     *  backdrop and below the content. */
+    private lateinit var npAmbient: View
+    /** Small in-memory cache: artwork URL -> ambient color. */
+    private val ambientCache = HashMap<String, Int>()
+
+    private fun ambientOn(): Boolean =
+        getPreferences(MODE_PRIVATE).getBoolean("setting_Ambient color from artwork", true)
 
     /** Activity-result code for the local-file document picker. */
     private val reqImport = 4205
@@ -516,16 +641,42 @@ class MainActivity : Activity() {
     private val tabViews = mutableMapOf<String, Triple<LinearLayout, ImageView, TextView>>()
     private val categoryArtViews = mutableListOf<ImageView>()
 
-    private val accent = Color.rgb(252, 60, 68)
+    // ---- v6 Spotify palette (replaces the Apple-Music red era) ----
+    // The accent is a THEME VARIABLE (Arz: "dont lock the color
+    // fully"): Spotify green by default, changeable in Settings >
+    // Appearance via preset swatches or a 0–360 hue slider. Every
+    // accent use in the app reads this getter at view-build time,
+    // and changing the theme rebuilds the shell + current screen,
+    // so the new hue applies live, everywhere, with playback
+    // untouched. [accentColor] is seeded from prefs in onCreate.
+    private var accentColor: Int = Color.rgb(29, 185, 84) // Spotify green #1DB954
+    private val accent: Int get() = accentColor
+    private val errorColor = Color.rgb(243, 98, 110)
+    private val bgColor = Color.rgb(18, 18, 18) // #121212
+    private val surface = Color.rgb(26, 26, 26) // #1A1A1A
+    private val surface2 = Color.rgb(35, 35, 35) // #232323
     private val purple = Color.rgb(125, 42, 232)
-    private val white50 = Color.argb(128, 255, 255, 255)
-    private val white55 = Color.argb(140, 255, 255, 255)
+    private val white50 = Color.rgb(167, 167, 167)
+    private val white55 = Color.rgb(179, 179, 179) // #B3B3B3
     private val white75 = Color.argb(191, 255, 255, 255)
-    private val placeholder = Color.rgb(23, 23, 27)
+    private val placeholder = Color.rgb(35, 35, 35)
 
-    private val boldTf: Typeface = Typeface.create("sans-serif", Typeface.BOLD)
-    private val mediumTf: Typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-    private val regularTf: Typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+    // ---- v6 fonts: Poppins (SIL Open Font License 1.1), the
+    // closest free geometric sans to Spotify's proprietary Circular.
+    // Loaded once from assets; every label() in the app flows
+    // through these four faces.
+    private val boldTf: Typeface by lazy {
+        Typeface.createFromAsset(assets, "fonts/Poppins-Bold.ttf")
+    }
+    private val semiboldTf: Typeface by lazy {
+        Typeface.createFromAsset(assets, "fonts/Poppins-SemiBold.ttf")
+    }
+    private val mediumTf: Typeface by lazy {
+        Typeface.createFromAsset(assets, "fonts/Poppins-Medium.ttf")
+    }
+    private val regularTf: Typeface by lazy {
+        Typeface.createFromAsset(assets, "fonts/Poppins-Regular.ttf")
+    }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
@@ -575,8 +726,9 @@ class MainActivity : Activity() {
         // fact interrupted: the vault says so, on the record.
         Downloads.reconcileOnStart(this)
         backfillFavorites()
-        window.statusBarColor = Color.BLACK
-        window.navigationBarColor = Color.BLACK
+        loadAccentPref()
+        window.statusBarColor = bgColor
+        window.navigationBarColor = bgColor
         showShell()
         showHome()
         handler.post(ticker)
@@ -606,7 +758,7 @@ class MainActivity : Activity() {
     // ---------------------------------------------------------------- shell
 
     private fun showShell() {
-        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val root = FrameLayout(this).apply { setBackgroundColor(bgColor) }
 
         val scroll = ScrollView(this)
         content = LinearLayout(this).apply {
@@ -616,17 +768,21 @@ class MainActivity : Activity() {
         scroll.addView(content, LinearLayout.LayoutParams(-1, -2))
         root.addView(scroll, FrameLayout.LayoutParams(-1, -1))
 
-        bottomBar = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        bottomBar = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            // v6: the chrome sits on solid black (Spotify), not over
+            // scrolling content — the flat nav reads as one bar.
+            setBackgroundColor(Color.BLACK)
+        }
 
-        // ---- glass mini player ----
-        // Fill is near-opaque on purpose: the bars float over a
-        // full-screen ScrollView, and at glass alpha (~60%) list rows
-        // scrolling underneath stayed visible THROUGH the bars (v4
-        // on-device bug). The stroke highlight keeps the glass read.
+        // ---- mini player ----
+        // v6: a SOLID dark bar like the Spotify inspo (art, title,
+        // artist, play/next), replacing the glass pill. Real actions
+        // unchanged: tap opens Now Playing, swipe skips.
         mini = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = glassBg(16f, Color.argb(243, 38, 38, 40), Color.argb(31, 255, 255, 255))
+            background = solidBg(8f, surface2)
             setPadding(dp(8), dp(8), dp(12), dp(8))
             elevation = dp(10).toFloat()
             setOnClickListener { if (current != null) showNowPlaying() }
@@ -688,17 +844,32 @@ class MainActivity : Activity() {
                 else -> false
             }
         }
+        // Thin progress line along the mini player's bottom edge
+        // (inspo), plus the buffering state: while a track resolves
+        // or buffers, the line goes indeterminate.
+        val miniWrap = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val miniLp = LinearLayout.LayoutParams(-1, if (getPreferences(MODE_PRIVATE).getBoolean("setting_Compact mini-player", false)) dp(48) else dp(58))
-        miniLp.setMargins(dp(14), 0, dp(14), 0)
-        bottomBar.addView(mini, miniLp)
+        miniWrap.addView(mini, miniLp)
+        miniProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 1000
+            progress = 0
+            setPadding(0, 0, 0, 0)
+            progressTintList = ColorStateList.valueOf(accent)
+            progressBackgroundTintList = ColorStateList.valueOf(Color.argb(50, 255, 255, 255))
+        }
+        val mpLp = LinearLayout.LayoutParams(-1, dp(3))
+        mpLp.setMargins(dp(10), dp(1), dp(10), 0)
+        miniWrap.addView(miniProgress, mpLp)
+        val wrapLp = LinearLayout.LayoutParams(-1, -2)
+        wrapLp.setMargins(dp(8), dp(4), dp(8), 0)
+        bottomBar.addView(miniWrap, wrapLp)
 
-        // ---- glass pill tab bar ----
+        // ---- flat black tab bar (Spotify inspo) ----
         val nav = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            background = glassBg(999f, Color.argb(243, 30, 30, 32), Color.argb(36, 255, 255, 255))
-            setPadding(dp(8), 0, dp(8), 0)
-            elevation = dp(12).toFloat()
+            setBackgroundColor(Color.BLACK)
+            setPadding(dp(4), dp(2), dp(4), dp(2))
         }
         val tabs = listOf(
             Triple("Home", R.drawable.ic_home, Runnable { showHome() }),
@@ -725,8 +896,8 @@ class MainActivity : Activity() {
             nav.addView(box, LinearLayout.LayoutParams(0, dp(52), 1f))
             tabViews[name] = Triple(box, iv, tv)
         }
-        val navLp = LinearLayout.LayoutParams(-1, dp(64))
-        navLp.setMargins(dp(14), dp(10), dp(14), dp(14))
+        val navLp = LinearLayout.LayoutParams(-1, dp(58))
+        navLp.topMargin = dp(4)
         bottomBar.addView(nav, navLp)
         root.addView(bottomBar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
 
@@ -766,13 +937,13 @@ class MainActivity : Activity() {
     private fun setActiveTab(name: String) {
         activeTab = name
         tabViews.forEach { (tabName, views) ->
-            val (box, iv, tv) = views
+            val (_, iv, tv) = views
+            // Spotify treatment: no pill — active is pure white,
+            // inactive is #B3B3B3.
             if (tabName == name) {
-                box.background = glassBg(999f, Color.argb(33, 255, 255, 255), Color.argb(20, 255, 255, 255))
-                iv.setColorFilter(accent)
+                iv.setColorFilter(Color.WHITE)
                 tv.setTextColor(Color.WHITE)
             } else {
-                box.background = null
                 iv.setColorFilter(white55)
                 tv.setTextColor(white55)
             }
@@ -789,7 +960,7 @@ class MainActivity : Activity() {
                     cornerRadius = dp(999).toFloat()
                 }
             } else {
-                glassBg(999f, Color.argb(28, 255, 255, 255), Color.argb(20, 255, 255, 255))
+                solidBg(999f, surface2)
             }
             isClickable = true
             setOnClickListener { onClick() }
@@ -805,12 +976,221 @@ class MainActivity : Activity() {
         visibility = View.INVISIBLE
     }
 
-    private fun glassBg(radiusDp: Float, fill: Int, stroke: Int): GradientDrawable =
+    /** Solid rounded fill (Spotify surfaces are flat, not glass). */
+    private fun solidBg(radiusDp: Float, fill: Int): GradientDrawable =
         GradientDrawable().apply {
             setColor(fill)
             cornerRadius = dp(radiusDp.toInt()).toFloat()
-            setStroke(dp(1), stroke)
         }
+
+    // ------------------------------------------------------------ v6 theme color
+
+    private fun loadAccentPref() {
+        val p = getPreferences(MODE_PRIVATE)
+        if (p.contains("theme_accent")) {
+            accentColor = p.getInt("theme_accent", accentColor)
+        }
+    }
+
+    /**
+     * Applies a new theme accent: persists it, swaps the variable,
+     * and rebuilds the shell + current screen so every view picks
+     * the new hue up LIVE. Only views are rebuilt — the player
+     * engine, queue and downloads are untouched, and any open
+     * overlay (Now Playing, menus) closes.
+     */
+    private fun applyAccent(color: Int, hue: Float?) {
+        accentColor = color
+        val e = getPreferences(MODE_PRIVATE).edit().putInt("theme_accent", color)
+        if (hue != null) e.putFloat("theme_hue", hue)
+        e.apply()
+        val tab = activeTab
+        showShell()
+        when (tab) {
+            "Search" -> showSearch()
+            "Library" -> showLibrary()
+            "Downloads" -> showDownloads()
+            "Settings" -> showSettings()
+            else -> showHome()
+        }
+        setActiveTab(tab)
+        refreshPlaybackUi()
+    }
+
+    /** Display name of the current theme accent (Settings row). */
+    private fun themeName(): String = when (accentColor) {
+        Color.rgb(29, 185, 84) -> "Spotify Green"
+        Color.rgb(252, 60, 68) -> "arzxsh Red"
+        Color.rgb(125, 42, 232) -> "Violet"
+        Color.rgb(39, 136, 227) -> "Blue"
+        Color.rgb(255, 159, 10) -> "Amber"
+        Color.rgb(241, 91, 181) -> "Pink"
+        else -> "Custom hue"
+    }
+
+    /** Theme picker: preset swatches + a 0–360 hue slider. */
+    private fun showThemeSheet() {
+        val presets = listOf(
+            "Spotify Green" to Color.rgb(29, 185, 84),
+            "arzxsh Red" to Color.rgb(252, 60, 68),
+            "Violet" to Color.rgb(125, 42, 232),
+            "Blue" to Color.rgb(39, 136, 227),
+            "Amber" to Color.rgb(255, 159, 10),
+            "Pink" to Color.rgb(241, 91, 181)
+        )
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(8), dp(24), 0)
+        }
+        box.addView(label("Presets", 13f, white50, semiboldTf))
+        val swatchRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(10), 0, dp(4))
+        }
+        presets.forEach { (name, color) ->
+            val sw = View(this).apply {
+                background = GradientDrawable().apply {
+                    setColor(color)
+                    shape = GradientDrawable.OVAL
+                    if (color == accentColor) {
+                        setStroke(dp(2), Color.WHITE)
+                    }
+                }
+                contentDescription = name
+                isClickable = true
+                setOnClickListener {
+                    applyAccent(color, null)
+                    Toast.makeText(this@MainActivity, "Theme: $name", Toast.LENGTH_SHORT).show()
+                }
+            }
+            val lp = LinearLayout.LayoutParams(dp(40), dp(40))
+            lp.marginEnd = dp(12)
+            swatchRow.addView(sw, lp)
+        }
+        box.addView(swatchRow)
+        val hueNow = getPreferences(MODE_PRIVATE).getFloat("theme_hue", 145f)
+        val hueLabel = label("Custom hue · ${hueNow.toInt()}°", 13f, white50, semiboldTf)
+        val hlLp = LinearLayout.LayoutParams(-1, -2)
+        hlLp.topMargin = dp(16)
+        box.addView(hueLabel, hlLp)
+        val hueSeek = SeekBar(this).apply {
+            max = 360
+            progress = hueNow.toInt()
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                    hueLabel.text = "Custom hue · $progress°"
+                }
+
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {
+                    val h = progress.toFloat()
+                    // Vivid but readable on near-black: high value,
+                    // strong-but-not-neon saturation.
+                    val c = Color.HSVToColor(floatArrayOf(h, 0.72f, 0.92f))
+                    applyAccent(c, h)
+                }
+            })
+        }
+        box.addView(hueSeek, LinearLayout.LayoutParams(-1, -2))
+        box.addView(
+            label(
+                "Applies live to active states, progress, toggles and buttons. " +
+                    "Changing it closes any open player or menu view; playback keeps going.",
+                12.5f, white50
+            )
+        )
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Theme color")
+            .setView(box)
+            .setPositiveButton("Done") { _, _ -> showSettings() }
+            .show()
+    }
+
+    // ------------------------------------------------------------ v6 skeletons
+
+    /**
+     * One skeleton placeholder block. All blocks on screen pulse
+     * from ONE shared animator (alpha only, no layout, no bitmaps —
+     * cheap on the Helio G95); under Reduce Motion they sit static.
+     * Blocks must be added to a LinearLayout (their layout params
+     * are LinearLayout params).
+     */
+    private fun skelBlock(heightDp: Int, radiusDp: Int = 12, widthDp: Int = -1): View {
+        val v = View(this).apply {
+            background = solidBg(radiusDp.toFloat(), surface2)
+            alpha = 0.5f
+        }
+        v.layoutParams = if (widthDp > 0) {
+            LinearLayout.LayoutParams(dp(widthDp), dp(heightDp))
+        } else {
+            LinearLayout.LayoutParams(-1, dp(heightDp))
+        }
+        skeletonViews.add(v)
+        startSkeletonPulse()
+        return v
+    }
+
+    /** Skeleton twin of a track row: 52dp art square + two bars. */
+    private fun skelRow(): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        row.addView(skelBlock(52, 9, 52))
+        val text = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(13), 0, dp(8), 0)
+        }
+        text.addView(skelBlock(13, 6, 170))
+        val sub = skelBlock(11, 6, 110)
+        (sub.layoutParams as LinearLayout.LayoutParams).topMargin = dp(7)
+        text.addView(sub)
+        row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
+        return row
+    }
+
+    private fun skelRows(target: LinearLayout, count: Int) {
+        repeat(count) { i ->
+            if (i > 0) target.addView(hairline())
+            target.addView(skelRow())
+        }
+    }
+
+    /** Section-title-width bar + rows, mirroring a real section. */
+    private fun skelSection(target: LinearLayout, rows: Int) {
+        val title = skelBlock(20, 8, 150)
+        (title.layoutParams as LinearLayout.LayoutParams).topMargin = dp(24)
+        (title.layoutParams as LinearLayout.LayoutParams).bottomMargin = dp(10)
+        target.addView(title)
+        skelRows(target, rows)
+    }
+
+    private fun startSkeletonPulse() {
+        if (reduceMotion()) return
+        if (skeletonAnimator?.isRunning == true) return
+        val anim = skeletonAnimator ?: ValueAnimator.ofFloat(0f, (2 * Math.PI).toFloat()).apply {
+            duration = 1300
+            repeatCount = ValueAnimator.INFINITE
+            interpolator = LinearInterpolator()
+            addUpdateListener { a ->
+                if (skeletonViews.isEmpty()) {
+                    skeletonAnimator?.cancel()
+                    return@addUpdateListener
+                }
+                val phase = a.animatedValue as Float
+                val alpha = 0.38f + 0.3f * (0.5f + 0.5f * kotlin.math.sin(phase))
+                for (v in skeletonViews) v.alpha = alpha
+            }
+            skeletonAnimator = this
+        }
+        anim.start()
+    }
+
+    private fun clearSkeletons() {
+        skeletonViews.clear()
+        skeletonAnimator?.cancel()
+    }
 
     /** Clips a view's content to a rounded-rect outline with a placeholder fill. */
     private fun roundedClip(v: View, cornerDp: Int) {
@@ -844,8 +1224,15 @@ class MainActivity : Activity() {
     private fun showHome() {
         val gen = ++generation
         beginScreen("Listen Now", showAvatar = true)
-        val loading = label("Loading…", 16f, white50)
-        content.addView(loading)
+        // v6: skeleton twin of the real home layout (hero card +
+        // section rows at the same geometry), never a bare
+        // "Loading…" line.
+        val skeleton = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val heroSkel = skelBlock(196, 16)
+        (heroSkel.layoutParams as LinearLayout.LayoutParams).topMargin = dp(16)
+        skeleton.addView(heroSkel)
+        skelSection(skeleton, 4)
+        content.addView(skeleton)
         val mode = sourceMode()
         executor.execute {
             val audius = fetch("/tracks/trending?limit=25")
@@ -861,7 +1248,8 @@ class MainActivity : Activity() {
             }
             runOnUiThread {
                 if (gen != generation) return@runOnUiThread
-                content.removeView(loading)
+                content.removeView(skeleton)
+                clearSkeletons()
                 var any = false
                 if (audius != null && audius.isNotEmpty()) {
                     tracks.clear()
@@ -921,7 +1309,7 @@ class MainActivity : Activity() {
                         val mixBox = LinearLayout(this@MainActivity).apply {
                             orientation = LinearLayout.VERTICAL
                         }
-                        mixBox.addView(statusLine("Generating from your top plays…"))
+                        skelRows(mixBox, 3)
                         content.addView(mixBox)
                         any = true
                         executor.execute {
@@ -1035,7 +1423,7 @@ class MainActivity : Activity() {
             resultsBox.visibility = View.VISIBLE
             resultsBox.removeAllViews()
             resultsBox.addView(sectionTitle("Results for \"$q\""))
-            resultsBox.addView(label("Searching catalogs…", 14f, white50))
+            skelRows(resultsBox, 6)
             val mode = sourceMode()
             executor.execute {
                 val audius = fetch("/tracks/search?query=${URLEncoder.encode(q, "UTF-8")}&limit=25")
@@ -1115,7 +1503,7 @@ class MainActivity : Activity() {
                             resultsBox.addView(sectionTitle("Songs"))
                         }
                         setQueue(found)
-                        addRows(found, resultsBox, withHairlines = true)
+                        addRows(found, resultsBox, withHairlines = true, queueContext = found, contextLabel = "Search" to q)
                     }
                     // Source status: always on screen, success or failure.
                     val errors = listOfNotNull(
@@ -1223,7 +1611,7 @@ class MainActivity : Activity() {
         // Glass pill track, accent fill on the active segment.
         val segRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            background = glassBg(999f, Color.argb(28, 255, 255, 255), Color.argb(20, 255, 255, 255))
+            background = solidBg(999f, surface2)
             setPadding(dp(3), dp(3), dp(3), dp(3))
         }
         val segLp = LinearLayout.LayoutParams(-1, dp(40))
@@ -1234,13 +1622,14 @@ class MainActivity : Activity() {
             val active = sourceMode()
             segViews.forEach { (mode, tv) ->
                 val selected = mode == active
+                // Spotify chip treatment: white pill, black text.
                 tv.background = if (selected) {
                     GradientDrawable().apply {
-                        setColor(accent)
+                        setColor(Color.WHITE)
                         cornerRadius = dp(999).toFloat()
                     }
                 } else null
-                tv.setTextColor(if (selected) Color.WHITE else white55)
+                tv.setTextColor(if (selected) Color.BLACK else white55)
             }
         }
         listOf(
@@ -1311,73 +1700,7 @@ class MainActivity : Activity() {
         browseBox.addView(sectionTitle("Moods & Genres"))
         val moodsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         browseBox.addView(moodsBox)
-        if (sourceMode() == "audius") {
-            moodsBox.addView(
-                label("Moods live on YouTube Music — switch the source above to browse them.", 14.5f, white50)
-            )
-        } else {
-            moodsBox.addView(label("Loading moods…", 14.5f, white50))
-            executor.execute {
-                var cats: List<YtmMoodCategory>? = null
-                var err: String? = null
-                try {
-                    cats = YtmApi.moodCategories()
-                } catch (t: Throwable) {
-                    err = shortErr(t)
-                }
-                runOnUiThread {
-                    if (gen != generation) return@runOnUiThread
-                    moodsBox.removeAllViews()
-                    val list = cats
-                    if (list == null || list.isEmpty()) {
-                        moodsBox.addView(errorLine("Moods unavailable: ${err ?: "empty response"}"))
-                    } else {
-                        var lastGroup: String? = null
-                        var chipRow: LinearLayout? = null
-                        var inRow = 0
-                        list.forEach { cat ->
-                            if (cat.group != lastGroup) {
-                                lastGroup = cat.group
-                                chipRow = null
-                                inRow = 0
-                                if (cat.group.isNotEmpty()) {
-                                    moodsBox.addView(label(cat.group, 15f, Color.WHITE, boldTf).apply {
-                                        val lp = LinearLayout.LayoutParams(-1, -2)
-                                        lp.topMargin = dp(16)
-                                        lp.bottomMargin = dp(8)
-                                        layoutParams = lp
-                                    })
-                                }
-                            }
-                            if (chipRow == null || inRow >= 2) {
-                                chipRow = LinearLayout(this).apply {
-                                    orientation = LinearLayout.HORIZONTAL
-                                    setPadding(0, 0, 0, dp(10))
-                                }
-                                moodsBox.addView(chipRow)
-                                inRow = 0
-                            }
-                            val chip = label(cat.name, 14f, Color.WHITE, mediumTf).apply {
-                                gravity = Gravity.CENTER
-                                background = glassBg(
-                                    999f, Color.argb(28, 255, 255, 255),
-                                    Color.argb(20, 255, 255, 255)
-                                )
-                                setPadding(dp(10), dp(10), dp(10), dp(10))
-                                maxLines = 1
-                                ellipsize = TextUtils.TruncateAt.END
-                                isClickable = true
-                                setOnClickListener { showMoodPlaylists(cat) }
-                            }
-                            val cLp = LinearLayout.LayoutParams(0, -2, 1f)
-                            if (inRow == 0) cLp.marginEnd = dp(10)
-                            chipRow.addView(chip, cLp)
-                            inRow++
-                        }
-                    }
-                }
-            }
-        }
+        renderMoodsInto(moodsBox, gen, "Moods live on YouTube Music — switch the source above to browse them.")
         content.addView(browseBox)
 
         if (tracks.isEmpty()) {
@@ -1402,7 +1725,7 @@ class MainActivity : Activity() {
     private fun categoryCard(name: String, tint: Int, onClick: () -> Unit): FrameLayout {
         val card = FrameLayout(this).apply {
             background = GradientDrawable().apply {
-                setColor(Color.rgb(24, 24, 28))
+                setColor(surface)
                 cornerRadius = dp(13).toFloat()
             }
             clipToOutline = true
@@ -1493,6 +1816,56 @@ class MainActivity : Activity() {
         bytes >= 1024 * 1024 -> "%.1f MB".format(bytes / (1024.0 * 1024.0))
         bytes >= 1024 -> "${bytes / 1024} KB"
         else -> "$bytes B"
+    }
+
+    /** Signed seconds label for a lyric offset, e.g. "+0.3s". */
+    private fun fmtOffset(ms: Long): String {
+        val sign = if (ms < 0) "−" else "+"
+        return "$sign${"%.1f".format(kotlin.math.abs(ms) / 1000f)}s"
+    }
+
+    /** Global default lyric offset picker (Settings → Playback):
+     *  − / + steppers in 0.1s steps over ±5s + Reset. Applies to
+     *  every track without its own per-track offset. */
+    private fun showGlobalOffsetSheet() {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(10), dp(20), dp(4))
+        }
+        val value = label(fmtOffset(LyricOffsets.globalMs(this)), 20f, Color.WHITE, boldTf).apply {
+            gravity = Gravity.CENTER
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        fun stepper(txt: String, delta: Long): TextView =
+            label(txt, 26f, Color.WHITE, boldTf).apply {
+                gravity = Gravity.CENTER
+                isClickable = true
+                setPadding(dp(18), dp(8), dp(18), dp(8))
+                setOnClickListener {
+                    val now = (LyricOffsets.globalMs(this@MainActivity) + delta)
+                        .coerceIn(-5000L, 5000L)
+                    LyricOffsets.setGlobalMs(this@MainActivity, now)
+                    value.text = fmtOffset(now)
+                }
+            }
+        row.addView(stepper("−", -100L), LinearLayout.LayoutParams(0, -2, 1f))
+        row.addView(value, LinearLayout.LayoutParams(0, -2, 1.4f))
+        row.addView(stepper("+", 100L), LinearLayout.LayoutParams(0, -2, 1f))
+        box.addView(row)
+        box.addView(label("Reset", 15f, accent, mediumTf).apply {
+            gravity = Gravity.CENTER
+            isClickable = true
+            setPadding(0, dp(10), 0, dp(6))
+            setOnClickListener {
+                LyricOffsets.setGlobalMs(this@MainActivity, 0L)
+                value.text = fmtOffset(0L)
+            }
+        })
+        AlertDialog.Builder(this).setTitle("Lyrics sync offset").setView(box)
+            .setPositiveButton("Done") { _, _ -> showSettings() }.show()
     }
 
     /** Crossfade length picker: a real 0–12s slider (0 = off, the
@@ -1600,6 +1973,15 @@ class MainActivity : Activity() {
             first = false
         )
         block(
+            "Poppins (typeface)",
+            "Copyright 2020 The Poppins Project Authors (github.com/itfoundry/Poppins).\\n" +
+                "Licensed under the SIL Open Font License, Version 1.1. Poppins is the app's " +
+                "bundled typeface (Regular / Medium / SemiBold / Bold), fetched from the " +
+                "google/fonts repository.\\n" +
+                "License: scripts.sil.org/OFL",
+            first = false
+        )
+        block(
             "Trademarks",
             "YouTube and YouTube Music are trademarks of Google LLC. " +
                 "Audius is a trademark of Audius, Inc. arzxsh is not affiliated with or endorsed by either.",
@@ -1662,6 +2044,12 @@ class MainActivity : Activity() {
                 if (cfSec == 0) "Off · tracks hard-cut, as before" else "$cfSec seconds between tracks"
             ) { showCrossfadeSheet() }
         )
+        content.addView(
+            settingsRow(
+                "Lyrics sync offset",
+                "${fmtOffset(LyricOffsets.globalMs(this))} · default for tracks without their own offset"
+            ) { showGlobalOffsetSheet() }
+        )
 
         content.addView(settingsGroupHeader("Audio"))
         content.addView(settingsRow("Equalizer", "Opens the system audio effects panel") {
@@ -1676,7 +2064,7 @@ class MainActivity : Activity() {
             showDownloads()
         })
         if (dlCount > 0) {
-            content.addView(settingsRow("Remove all downloads", "Frees ${fmtBytes(dlBytes)}", accent) {
+            content.addView(settingsRow("Remove all downloads", "Frees ${fmtBytes(dlBytes)}", errorColor) {
                 showMenu(
                     "Remove all downloaded tracks?", listOf(
                         "Remove all" to {
@@ -1701,6 +2089,8 @@ class MainActivity : Activity() {
         })
 
         content.addView(settingsGroupHeader("Appearance & behavior"))
+        content.addView(settingsRow("Theme color", themeName()) { showThemeSheet() })
+        content.addView(setting("Ambient color from artwork", true) { applyAmbient(false) })
         content.addView(setting("Visualizer", true))
         content.addView(setting("Compact mini-player", false))
         content.addView(setting("Reduce motion", false))
@@ -1734,11 +2124,12 @@ class MainActivity : Activity() {
         list: List<Track>,
         target: LinearLayout = content,
         withHairlines: Boolean,
-        queueContext: List<Track>? = null
+        queueContext: List<Track>? = null,
+        contextLabel: Pair<String, String>? = null
     ) {
         list.forEachIndexed { i, track ->
             if (withHairlines && i > 0) target.addView(hairline())
-            addTrackRow(track, target, queueContext)
+            addTrackRow(track, target, queueContext, contextLabel = contextLabel)
         }
     }
 
@@ -1754,6 +2145,7 @@ class MainActivity : Activity() {
         track: Track,
         target: LinearLayout,
         queueContext: List<Track>? = null,
+        contextLabel: Pair<String, String>? = null,
         menuOverride: (() -> Unit)? = null
     ) {
         val openMenu = { if (menuOverride != null) menuOverride() else showTrackMenu(track) }
@@ -1764,6 +2156,7 @@ class MainActivity : Activity() {
             rippleRect()
             setOnClickListener {
                 if (queueContext != null) setQueue(queueContext)
+                if (contextLabel != null) setPlayContext(contextLabel.first, contextLabel.second)
                 play(track)
             }
             setOnLongClickListener {
@@ -1837,9 +2230,9 @@ class MainActivity : Activity() {
         return if (msg.isEmpty()) cls else "$cls: ${msg.take(140)}"
     }
 
-    /** Visible failure line: a dead YouTube section says why, in accent. */
+    /** Visible failure line: a dead YouTube section says why, in the error color. */
     private fun errorLine(text: String): TextView {
-        val tv = label(text, 13f, accent)
+        val tv = label(text, 13f, errorColor)
         val lp = LinearLayout.LayoutParams(-1, -2)
         lp.topMargin = dp(14)
         tv.layoutParams = lp
@@ -2006,9 +2399,9 @@ class MainActivity : Activity() {
     private fun showArtist(artistId: String, fallbackName: String? = null, fallbackArt: String? = null) {
         val gen = ++generation
         content.removeAllViews()
-        content.addView(label("Loading artist…", 16f, white50).apply {
-            setPadding(0, dp(28), 0, 0)
-        })
+        // Skeleton mirroring the artist page: banner, then rows.
+        content.addView(skelBlock(232, 16))
+        skelRows(content, 5)
         executor.execute {
             var page: YtmArtistPage? = null
             var err: String? = null
@@ -2019,6 +2412,7 @@ class MainActivity : Activity() {
             }
             runOnUiThread {
                 if (gen != generation) return@runOnUiThread
+                clearSkeletons()
                 content.removeAllViews()
                 val p = page
                 if (p == null) {
@@ -2075,12 +2469,14 @@ class MainActivity : Activity() {
                     aLp.topMargin = dp(18)
                     actions.layoutParams = aLp
                     val playPill = pillButton("Play", filled = true) {
+                        setPlayContext("Artist", p.name)
                         setQueue(p.topSongs)
                         play(p.topSongs.first())
                     }
                     actions.addView(playPill, LinearLayout.LayoutParams(dp(120), dp(40)))
                     val shufflePill = pillButton("Shuffle", filled = false) {
                         shuffleOn = true
+                        setPlayContext("Artist", p.name)
                         setQueue(p.topSongs)
                         refreshTransportStates()
                         play(p.topSongs[playOrder.firstOrNull() ?: 0])
@@ -2090,7 +2486,7 @@ class MainActivity : Activity() {
                     actions.addView(shufflePill, sLp)
                     content.addView(actions)
                     content.addView(sectionTitle("Top Songs"))
-                    addRows(p.topSongs, withHairlines = true, queueContext = p.topSongs)
+                    addRows(p.topSongs, withHairlines = true, queueContext = p.topSongs, contextLabel = "Artist" to p.name)
                 }
                 if (p.singles.isNotEmpty()) {
                     content.addView(sectionTitle("Singles & EPs"))
@@ -2116,9 +2512,9 @@ class MainActivity : Activity() {
     private fun showAlbum(ref: YtmAlbumRef) {
         val gen = ++generation
         content.removeAllViews()
-        content.addView(label("Loading album…", 16f, white50).apply {
-            setPadding(0, dp(28), 0, 0)
-        })
+        // Skeleton mirroring the album page: header art, then rows.
+        content.addView(skelBlock(150, 12))
+        skelRows(content, 6)
         executor.execute {
             var page: YtmAlbumPage? = null
             var err: String? = null
@@ -2129,6 +2525,7 @@ class MainActivity : Activity() {
             }
             runOnUiThread {
                 if (gen != generation) return@runOnUiThread
+                clearSkeletons()
                 content.removeAllViews()
                 val p = page
                 if (p == null) {
@@ -2182,10 +2579,11 @@ class MainActivity : Activity() {
                     aLp.bottomMargin = dp(6)
                     actions.layoutParams = aLp
                     val shuffleBtn = icon(R.drawable.ic_shuffle, Color.WHITE).apply {
-                        background = glassBg(999f, Color.argb(28, 255, 255, 255), Color.argb(20, 255, 255, 255))
+                        background = solidBg(999f, surface2)
                         setPadding(dp(10), dp(10), dp(10), dp(10))
                         setOnClickListener {
                             shuffleOn = true
+                            setPlayContext("Album", p.title)
                             setQueue(p.tracks)
                             refreshTransportStates()
                             play(p.tracks[playOrder.firstOrNull() ?: 0])
@@ -2193,6 +2591,7 @@ class MainActivity : Activity() {
                     }
                     actions.addView(shuffleBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
                     val playAll = pillButton("Play", filled = true) {
+                        setPlayContext("Album", p.title)
                         setQueue(p.tracks)
                         play(p.tracks.first())
                     }
@@ -2204,7 +2603,7 @@ class MainActivity : Activity() {
                         if (allDown) R.drawable.ic_downloaded else R.drawable.ic_download,
                         if (allDown) accent else Color.WHITE
                     ).apply {
-                        background = glassBg(999f, Color.argb(28, 255, 255, 255), Color.argb(20, 255, 255, 255))
+                        background = solidBg(999f, surface2)
                         setPadding(dp(10), dp(10), dp(10), dp(10))
                         setOnClickListener {
                             if (allDown) {
@@ -2217,7 +2616,7 @@ class MainActivity : Activity() {
                     }
                     actions.addView(dlBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
                     content.addView(actions)
-                    addRows(p.tracks, withHairlines = true, queueContext = p.tracks)
+                    addRows(p.tracks, withHairlines = true, queueContext = p.tracks, contextLabel = "Album" to p.title)
                 } else {
                     content.addView(label("No tracks listed for this album.", 15f, white50).apply {
                         setPadding(0, dp(18), 0, 0)
@@ -2229,15 +2628,103 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------- moods & remote playlists
 
+    /**
+     * Fills [box] with the Moods & Genres browse: grouped chips,
+     * each opening that category's playlist list. Shared by the
+     * Search screen and the Library's Moods tile. Skeleton chip
+     * rows while the catalog answers — never a bare loading text.
+     */
+    private fun renderMoodsInto(box: LinearLayout, gen: Int, audiusHint: String) {
+        box.removeAllViews()
+        if (sourceMode() == "audius") {
+            box.addView(label(audiusHint, 14.5f, white50))
+            return
+        }
+        repeat(3) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, 0, 0, dp(10))
+            }
+            val a = skelBlock(42, 999)
+            (a.layoutParams as LinearLayout.LayoutParams).apply {
+                width = 0; weight = 1f; marginEnd = dp(10)
+            }
+            val b = skelBlock(42, 999)
+            (b.layoutParams as LinearLayout.LayoutParams).apply {
+                width = 0; weight = 1f
+            }
+            row.addView(a)
+            row.addView(b)
+            box.addView(row)
+        }
+        executor.execute {
+            var cats: List<YtmMoodCategory>? = null
+            var err: String? = null
+            try {
+                cats = YtmApi.moodCategories()
+            } catch (t: Throwable) {
+                err = shortErr(t)
+            }
+            runOnUiThread {
+                if (gen != generation) return@runOnUiThread
+                box.removeAllViews()
+                clearSkeletons()
+                val list = cats
+                if (list == null || list.isEmpty()) {
+                    box.addView(errorLine("Moods unavailable: ${err ?: "empty response"}"))
+                } else {
+                    var lastGroup: String? = null
+                    var chipRow: LinearLayout? = null
+                    var inRow = 0
+                    list.forEach { cat ->
+                        if (cat.group != lastGroup) {
+                            lastGroup = cat.group
+                            chipRow = null
+                            inRow = 0
+                            if (cat.group.isNotEmpty()) {
+                                box.addView(label(cat.group, 15f, Color.WHITE, semiboldTf).apply {
+                                    val lp = LinearLayout.LayoutParams(-1, -2)
+                                    lp.topMargin = dp(16)
+                                    lp.bottomMargin = dp(8)
+                                    layoutParams = lp
+                                })
+                            }
+                        }
+                        if (chipRow == null || inRow >= 2) {
+                            chipRow = LinearLayout(this).apply {
+                                orientation = LinearLayout.HORIZONTAL
+                                setPadding(0, 0, 0, dp(10))
+                            }
+                            box.addView(chipRow)
+                            inRow = 0
+                        }
+                        val chip = label(cat.name, 14f, Color.WHITE, mediumTf).apply {
+                            gravity = Gravity.CENTER
+                            background = solidBg(999f, surface2)
+                            setPadding(dp(10), dp(10), dp(10), dp(10))
+                            maxLines = 1
+                            ellipsize = TextUtils.TruncateAt.END
+                            isClickable = true
+                            setOnClickListener { showMoodPlaylists(cat) }
+                        }
+                        val cLp = LinearLayout.LayoutParams(0, -2, 1f)
+                        if (inRow == 0) cLp.marginEnd = dp(10)
+                        chipRow.addView(chip, cLp)
+                        inRow++
+                    }
+                }
+            }
+        }
+    }
+
     /** Playlists inside one mood/genre category (real browse via
      *  FEmusic_moods_and_genres_category, not a search). */
     private fun showMoodPlaylists(cat: YtmMoodCategory) {
         val gen = ++generation
         beginScreen(cat.name, showAvatar = false)
-        val loading = label("Loading playlists…", 16f, white50).apply {
-            setPadding(0, dp(20), 0, 0)
-        }
-        content.addView(loading)
+        val skelBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        content.addView(skelBox)
+        skelRows(skelBox, 6)
         executor.execute {
             var list: List<YtmPlaylistRef>? = null
             var err: String? = null
@@ -2248,7 +2735,8 @@ class MainActivity : Activity() {
             }
             runOnUiThread {
                 if (gen != generation) return@runOnUiThread
-                content.removeView(loading)
+                clearSkeletons()
+                content.removeView(skelBox)
                 val l = list
                 if (l == null) {
                     content.addView(errorLine("YouTube unavailable: $err"))
@@ -2301,9 +2789,9 @@ class MainActivity : Activity() {
         val gen = ++generation
         visibleScreen = "YtmPlaylist"
         content.removeAllViews()
-        content.addView(label("Loading playlist…", 16f, white50).apply {
-            setPadding(0, dp(28), 0, 0)
-        })
+        // Skeleton mirroring the playlist page: header, then rows.
+        content.addView(skelBlock(150, 12))
+        skelRows(content, 6)
         executor.execute {
             var list: List<Track>? = null
             var err: String? = null
@@ -2314,6 +2802,7 @@ class MainActivity : Activity() {
             }
             runOnUiThread {
                 if (gen != generation) return@runOnUiThread
+                clearSkeletons()
                 content.removeAllViews()
                 val tracks = list
                 if (tracks == null) {
@@ -2360,10 +2849,11 @@ class MainActivity : Activity() {
                 aLp.bottomMargin = dp(6)
                 actions.layoutParams = aLp
                 val shuffleBtn = icon(R.drawable.ic_shuffle, Color.WHITE).apply {
-                    background = glassBg(999f, Color.argb(28, 255, 255, 255), Color.argb(20, 255, 255, 255))
+                    background = solidBg(999f, surface2)
                     setPadding(dp(10), dp(10), dp(10), dp(10))
                     setOnClickListener {
                         shuffleOn = true
+                        setPlayContext("Playlist", ref.title)
                         setQueue(tracks)
                         refreshTransportStates()
                         play(tracks[playOrder.firstOrNull() ?: 0])
@@ -2371,6 +2861,7 @@ class MainActivity : Activity() {
                 }
                 actions.addView(shuffleBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
                 val playAll = pillButton("Play", filled = true) {
+                    setPlayContext("Playlist", ref.title)
                     setQueue(tracks)
                     play(tracks.first())
                 }
@@ -2378,7 +2869,7 @@ class MainActivity : Activity() {
                 playLp.setMargins(dp(14), 0, dp(14), 0)
                 actions.addView(playAll, playLp)
                 content.addView(actions)
-                addRows(tracks, withHairlines = true, queueContext = tracks)
+                addRows(tracks, withHairlines = true, queueContext = tracks, contextLabel = "Playlist" to ref.title)
             }
         }
     }
@@ -2388,58 +2879,108 @@ class MainActivity : Activity() {
     private fun buildNowPlaying(root: FrameLayout) {
         nowPlaying = FrameLayout(this).apply {
             visibility = View.GONE
-            setBackgroundColor(Color.BLACK)
+            setBackgroundColor(bgColor)
         }
         npBackdrop = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
-            setColorFilter(Color.argb(96, 0, 0, 0))
+            setColorFilter(Color.argb(110, 0, 0, 0))
         }
         nowPlaying.addView(npBackdrop, FrameLayout.LayoutParams(-1, -1))
         val shade = View(this).apply {
             background = GradientDrawable(
                 GradientDrawable.Orientation.TOP_BOTTOM,
-                intArrayOf(Color.argb(38, 0, 0, 0), Color.argb(115, 0, 0, 0))
+                intArrayOf(Color.argb(60, 0, 0, 0), Color.argb(150, 0, 0, 0))
             )
         }
         nowPlaying.addView(shade, FrameLayout.LayoutParams(-1, -1))
+        // Ambient glow layer (v6 refinement): a radial wash of the
+        // artwork's dominant color, crossfaded on track change.
+        npAmbient = View(this).apply { visibility = View.GONE }
+        nowPlaying.addView(npAmbient, FrameLayout.LayoutParams(-1, -1))
 
+        // The player scrolls (v6 refinement): the Spotify top layout
+        // stays intact, and Lyrics preview + Related Songs live
+        // below the fold.
+        val scroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            isFillViewport = true
+        }
         val inner = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(30), dp(48), dp(30), dp(28))
+            setPadding(dp(24), dp(36), dp(24), dp(30))
         }
-        val grabber = View(this).apply {
-            background = GradientDrawable().apply {
-                setColor(Color.argb(89, 255, 255, 255))
-                cornerRadius = dp(3).toFloat()
-            }
+        scroll.addView(inner, LinearLayout.LayoutParams(-1, -2))
+        nowPlaying.addView(scroll, FrameLayout.LayoutParams(-1, -1))
+
+        // ---- top bar: chevron · "Playing from {context}" · ⋮ ----
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val chevron = icon(R.drawable.ic_chevron_down, Color.WHITE).apply {
+            contentDescription = "Close player"
             setOnClickListener { hideNowPlaying() }
         }
-        val grabLp = LinearLayout.LayoutParams(dp(38), dp(5))
-        grabLp.gravity = Gravity.CENTER_HORIZONTAL
-        grabLp.bottomMargin = dp(30)
-        inner.addView(grabber, grabLp)
+        topBar.addView(chevron, LinearLayout.LayoutParams(dp(40), dp(40)))
+        val ctxBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        npContextSmall = label("Playing from", 11.5f, white55).apply {
+            gravity = Gravity.CENTER
+        }
+        npContextBig = label("", 13.5f, Color.WHITE, semiboldTf).apply {
+            gravity = Gravity.CENTER
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        ctxBox.addView(npContextSmall)
+        ctxBox.addView(npContextBig)
+        topBar.addView(ctxBox, LinearLayout.LayoutParams(0, -2, 1f))
+        val npMore = icon(R.drawable.ic_more, Color.WHITE).apply {
+            contentDescription = "More options"
+            setOnClickListener { showNpMenu() }
+        }
+        topBar.addView(npMore, LinearLayout.LayoutParams(dp(40), dp(40)))
+        inner.addView(topBar)
 
-        val artSize = resources.displayMetrics.widthPixels - dp(60)
+        val artSize = resources.displayMetrics.widthPixels - dp(48)
         npArtwork = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
-            roundedClip(this, 14)
+            roundedClip(this, 10)
             elevation = dp(24).toFloat()
         }
-        inner.addView(npArtwork, LinearLayout.LayoutParams(artSize, artSize))
+        val artLp = LinearLayout.LayoutParams(artSize, artSize)
+        artLp.topMargin = dp(22)
+        inner.addView(npArtwork, artLp)
+
+        // Current synced lyric line, directly above the title
+        // (Spotify inspo). Tap opens the full lyrics view. Hidden
+        // until synced lyrics for this track actually exist.
+        npLyricLine = label("", 15.5f, Color.WHITE, semiboldTf).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            visibility = View.GONE
+            isClickable = true
+            setOnClickListener { showLyrics() }
+        }
+        val lyricLp = LinearLayout.LayoutParams(-1, dp(24))
+        lyricLp.topMargin = dp(20)
+        inner.addView(npLyricLine, lyricLp)
 
         val meta = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
         val metaLp = LinearLayout.LayoutParams(-1, -2)
-        metaLp.topMargin = dp(26)
+        metaLp.topMargin = dp(8)
         meta.layoutParams = metaLp
         val metaText = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        npTitle = label("", 21.5f, Color.WHITE, boldTf).apply {
+        npTitle = label("", 21f, Color.WHITE, boldTf).apply {
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
         }
-        npArtist = label("", 20f, white55).apply {
+        npArtist = label("", 16.5f, white55).apply {
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
             isClickable = true
@@ -2459,13 +3000,18 @@ class MainActivity : Activity() {
             setOnClickListener { toggleFavorite() }
         }
         meta.addView(npHeart, LinearLayout.LayoutParams(dp(38), dp(38)))
+        val npAdd = icon(R.drawable.ic_add_circle, white75).apply {
+            contentDescription = "Add to Playlist"
+            setOnClickListener { current?.let { showAddToPlaylist(it) } }
+        }
+        meta.addView(npAdd, LinearLayout.LayoutParams(dp(38), dp(38)))
         inner.addView(meta)
 
         // Playback failure surface: when a track cannot play, the real
         // reason (resolver outcomes, player error codes) is printed
         // here and stays on screen, instead of only flashing a generic
         // toast (v4's Dai Dai screenshot: toast, 0:00, no diagnosis).
-        npError = label("", 13f, accent).apply {
+        npError = label("", 13f, errorColor).apply {
             visibility = View.GONE
             setPadding(0, dp(8), 0, 0)
         }
@@ -2475,11 +3021,9 @@ class MainActivity : Activity() {
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
                     if (fromUser) {
-                        val dur = player?.durationMs ?: 0L
-                        if (dur > 0) {
-                            npElapsed.text = fmt(progress)
-                            npRemaining.text = "-" + fmt((dur - progress).coerceAtLeast(0L).toInt())
-                        }
+                        // Elapsed follows the thumb; the right-hand
+                        // label is the TOTAL and never moves (inspo).
+                        npElapsed.text = fmt(progress)
                     }
                 }
 
@@ -2490,30 +3034,32 @@ class MainActivity : Activity() {
                 override fun onStopTrackingTouch(sb: SeekBar?) {
                     seeking = false
                     player?.seekTo((sb?.progress ?: 0).toLong())
+                    updateNpLyricLine()
                 }
             })
         }
         val seekLp = LinearLayout.LayoutParams(-1, dp(26))
-        seekLp.topMargin = dp(20)
+        seekLp.topMargin = dp(14)
         inner.addView(npSeek, seekLp)
         val times = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         npElapsed = label("0:00", 12.5f, white55)
-        npRemaining = label("-0:00", 12.5f, white55)
+        npRemaining = label("0:00", 12.5f, white55)
         times.addView(npElapsed, LinearLayout.LayoutParams(0, -2, 1f))
         times.addView(npRemaining)
         inner.addView(times)
 
+        // ---- controls: shuffle · prev · BIG white play · next · sleep ----
         val controls = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(14), 0, dp(14), 0)
+            setPadding(dp(6), 0, dp(6), 0)
         }
         val controlsLp = LinearLayout.LayoutParams(-1, -2)
-        controlsLp.topMargin = dp(22)
+        controlsLp.topMargin = dp(14)
         controls.layoutParams = controlsLp
-        // Spotify state treatment for the v4 deviation (spec §2.1/§3):
-        // active = accent glyph + a dot beneath it; repeat-one adds the
-        // "1" worked into the glyph.
+        // Spotify state treatment (spec §2.1/§3): active = accent
+        // glyph + a dot beneath it; repeat-one works a "1" into the
+        // glyph.
         npShuffleBtn = icon(R.drawable.ic_shuffle, white55).apply {
             contentDescription = "Shuffle"
             setOnClickListener { toggleShuffle() }
@@ -2531,13 +3077,66 @@ class MainActivity : Activity() {
             contentDescription = "Previous track"
             setOnClickListener { playPrevious() }
         }
-        npPlayButton = icon(R.drawable.ic_play, Color.WHITE).apply {
+        // The big white circular play/pause (inspo): white disc,
+        // black glyph, buffering spinner overlaid while resolving.
+        val playSlot = FrameLayout(this)
+        npPlayButton = ImageView(this).apply {
+            setImageResource(R.drawable.ic_play)
+            setColorFilter(Color.BLACK)
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            background = GradientDrawable().apply {
+                setColor(Color.WHITE)
+                shape = GradientDrawable.OVAL
+            }
+            setPadding(dp(19), dp(19), dp(19), dp(19))
+            isClickable = true
+            isFocusable = true
             contentDescription = "Play"
             setOnClickListener { togglePlayback() }
         }
+        playSlot.addView(npPlayButton, FrameLayout.LayoutParams(dp(64), dp(64), Gravity.CENTER))
+        npBuffering = ProgressBar(this).apply {
+            isIndeterminate = true
+            visibility = View.GONE
+            indeterminateTintList = ColorStateList.valueOf(accent)
+        }
+        playSlot.addView(npBuffering, FrameLayout.LayoutParams(dp(30), dp(30), Gravity.CENTER))
         val nextBtn = icon(R.drawable.ic_skip_next, Color.WHITE).apply {
             contentDescription = "Next track"
             setOnClickListener { playNext() }
+        }
+        // Sleep timer takes the fifth slot (inspo); its glyph tints
+        // accent while a timer is armed.
+        npSleepBtn = icon(R.drawable.ic_sleep, white75).apply {
+            contentDescription = "Sleep timer"
+            setOnClickListener { showSleepMenu() }
+        }
+        controls.addView(shuffleBox, LinearLayout.LayoutParams(0, dp(48), 1f))
+        controls.addView(prevBtn, LinearLayout.LayoutParams(0, dp(52), 1f))
+        controls.addView(playSlot, LinearLayout.LayoutParams(0, dp(64), 1.2f))
+        controls.addView(nextBtn, LinearLayout.LayoutParams(0, dp(52), 1f))
+        controls.addView(npSleepBtn, LinearLayout.LayoutParams(0, dp(44), 1f))
+        inner.addView(controls)
+
+        npSleepLabel = label("", 12.5f, white55).apply {
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+        }
+        val sleepLp = LinearLayout.LayoutParams(-1, -2)
+        sleepLp.topMargin = dp(10)
+        inner.addView(npSleepLabel, sleepLp)
+
+        // ---- bottom row: lyrics · repeat · download · share · queue ----
+        val bottomRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(10), 0, dp(10), 0)
+        }
+        val bottomLp = LinearLayout.LayoutParams(-1, -2)
+        bottomLp.topMargin = dp(18)
+        bottomRow.layoutParams = bottomLp
+        val lyricsBtn = icon(R.drawable.ic_lyrics, white75).apply {
+            contentDescription = "Lyrics"
+            setOnClickListener { showLyrics() }
         }
         npRepeatBtn = icon(R.drawable.ic_repeat, white55).apply {
             contentDescription = "Repeat"
@@ -2548,66 +3147,10 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
         }
-        repeatBox.addView(npRepeatBtn, LinearLayout.LayoutParams(dp(30), dp(30)))
+        repeatBox.addView(npRepeatBtn, LinearLayout.LayoutParams(dp(28), dp(28)))
         val rpDotLp = LinearLayout.LayoutParams(dp(4), dp(4))
         rpDotLp.topMargin = dp(3)
         repeatBox.addView(npRepeatDot, rpDotLp)
-        controls.addView(shuffleBox, LinearLayout.LayoutParams(0, dp(44), 1f))
-        controls.addView(prevBtn, LinearLayout.LayoutParams(0, dp(52), 1f))
-        controls.addView(npPlayButton, LinearLayout.LayoutParams(0, dp(68), 1.2f))
-        controls.addView(nextBtn, LinearLayout.LayoutParams(0, dp(52), 1f))
-        controls.addView(repeatBox, LinearLayout.LayoutParams(0, dp(44), 1f))
-        inner.addView(controls)
-
-        val volRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        val volLp = LinearLayout.LayoutParams(-1, -2)
-        volLp.topMargin = dp(28)
-        volRow.layoutParams = volLp
-        volRow.addView(icon(R.drawable.ic_volume_low, white50), LinearLayout.LayoutParams(dp(17), dp(17)))
-        npVolume = styledSeek(R.drawable.seek_thumb_clear).apply {
-            max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-            progress = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
-                    if (fromUser) audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, progress, 0)
-                }
-
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {}
-            })
-        }
-        val npVolLp = LinearLayout.LayoutParams(0, dp(26), 1f)
-        npVolLp.setMargins(dp(12), 0, dp(12), 0)
-        volRow.addView(npVolume, npVolLp)
-        volRow.addView(icon(R.drawable.ic_volume_high, white50), LinearLayout.LayoutParams(dp(19), dp(19)))
-        inner.addView(volRow)
-
-        npSleepLabel = label("", 12.5f, white55).apply {
-            gravity = Gravity.CENTER
-            visibility = View.GONE
-        }
-        val sleepLp = LinearLayout.LayoutParams(-1, -2)
-        sleepLp.topMargin = dp(12)
-        inner.addView(npSleepLabel, sleepLp)
-
-        val bottomRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(22), 0, dp(22), 0)
-        }
-        val bottomLp = LinearLayout.LayoutParams(-1, -2)
-        bottomLp.topMargin = dp(24)
-        bottomRow.layoutParams = bottomLp
-        val lyricsBtn = icon(R.drawable.ic_lyrics, white75).apply {
-            contentDescription = "Lyrics"
-            setOnClickListener { showLyrics() }
-        }
-        val queueBtn = icon(R.drawable.ic_queue, white75).apply {
-            contentDescription = "Queue"
-            setOnClickListener { showQueue() }
-        }
         npDownloadBtn = icon(R.drawable.ic_download, white75).apply {
             contentDescription = "Download"
             setOnClickListener { downloadCurrent() }
@@ -2617,34 +3160,54 @@ class MainActivity : Activity() {
             visibility = View.GONE
             indeterminateTintList = ColorStateList.valueOf(accent)
         }
-        // Sleep gets its own recognizable glyph (crescent moon) instead
-        // of living only inside the overflow menu.
-        val sleepBtn = icon(R.drawable.ic_sleep, white75).apply {
-            contentDescription = "Sleep timer"
-            setOnClickListener { showSleepMenu() }
-        }
-        val shareBtn = icon(R.drawable.ic_share, white75).apply {
-            contentDescription = "Share"
-            setOnClickListener { shareTrack(current) }
-        }
-        val moreBtn = icon(R.drawable.ic_more, white75).apply {
-            contentDescription = "More options"
-            setOnClickListener { showNpMenu() }
-        }
-        bottomRow.addView(lyricsBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
-        bottomRow.addView(queueBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
         // Download slot: arrow (idle) -> indeterminate ring (working) ->
         // accent check (done), the three states in one footprint.
         val downloadSlot = FrameLayout(this)
         downloadSlot.addView(npDownloadBtn, FrameLayout.LayoutParams(dp(32), dp(32), Gravity.CENTER))
         downloadSlot.addView(npDownloadProgress, FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER))
-        bottomRow.addView(downloadSlot, LinearLayout.LayoutParams(0, dp(32), 1f))
-        bottomRow.addView(sleepBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
-        bottomRow.addView(shareBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
-        bottomRow.addView(moreBtn, LinearLayout.LayoutParams(0, dp(32), 1f))
+        val shareBtn = icon(R.drawable.ic_share, white75).apply {
+            contentDescription = "Share"
+            setOnClickListener { shareTrack(current) }
+        }
+        val queueBtn = icon(R.drawable.ic_queue, white75).apply {
+            contentDescription = "Queue"
+            setOnClickListener { showQueue() }
+        }
+        bottomRow.addView(lyricsBtn, LinearLayout.LayoutParams(0, dp(34), 1f))
+        bottomRow.addView(repeatBox, LinearLayout.LayoutParams(0, dp(34), 1f))
+        bottomRow.addView(downloadSlot, LinearLayout.LayoutParams(0, dp(34), 1f))
+        bottomRow.addView(shareBtn, LinearLayout.LayoutParams(0, dp(34), 1f))
+        bottomRow.addView(queueBtn, LinearLayout.LayoutParams(0, dp(34), 1f))
         inner.addView(bottomRow)
 
-        nowPlaying.addView(inner, FrameLayout.LayoutParams(-1, -1))
+        // ---- Lyrics preview card (inspo): current + next line ----
+        npLyricsCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = solidBg(14f, surface2)
+            setPadding(dp(16), dp(12), dp(16), dp(14))
+            visibility = View.GONE
+            isClickable = true
+            setOnClickListener { showLyrics() }
+        }
+        val cardLp = LinearLayout.LayoutParams(-1, -2)
+        cardLp.topMargin = dp(22)
+        npLyricsCard.layoutParams = cardLp
+        npLyricsCard.addView(label("LYRICS", 11f, white55, semiboldTf).apply {
+            letterSpacing = 0.12f
+        })
+        npLyricsCardCur = label("", 16.5f, Color.WHITE, semiboldTf).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(0, dp(5), 0, 0)
+        }
+        npLyricsCardNext = label("", 14.5f, white50).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        npLyricsCard.addView(npLyricsCardCur)
+        npLyricsCard.addView(npLyricsCardNext)
+        inner.addView(npLyricsCard)
+
         root.addView(nowPlaying, FrameLayout.LayoutParams(-1, -1))
     }
 
@@ -2658,10 +3221,6 @@ class MainActivity : Activity() {
     private fun showNowPlaying() {
         nowPlaying.visibility = View.VISIBLE
         refreshPlaybackUi()
-        try {
-            npVolume.progress = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-        } catch (_: Exception) {
-        }
         if (reduceMotion()) {
             nowPlaying.translationY = 0f
             return
@@ -2700,30 +3259,39 @@ class MainActivity : Activity() {
     }
 
     private fun updateProgress() {
+        val p = player ?: return
+        val dur = p.durationMs
+        if (dur <= 0) return
+        val pos = p.positionMs.coerceIn(0L, dur)
+        // The mini player's thin progress line tracks playback even
+        // while Now Playing is closed (it lives in the shell).
+        val mini = (pos * 1000 / dur).toInt()
+        if (mini != lastMiniProgress && ::miniProgress.isInitialized && !buffering) {
+            lastMiniProgress = mini
+            miniProgress.progress = mini
+        }
         if (!::nowPlaying.isInitialized || nowPlaying.visibility != View.VISIBLE || seeking) return
         updateSleepLabel()
-        val p = player ?: return
         // Jank pass: the 500ms ticker touches ONLY the seek bar and
         // the two time labels, and only when their rendered values
         // actually changed — no layout passes, no row re-binding.
-        val dur = p.durationMs
-        if (dur > 0) {
-            val pos = p.positionMs.coerceIn(0L, dur)
-            val durInt = dur.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-            if (npSeek.max != durInt) npSeek.max = durInt
-            val posInt = pos.toInt()
-            if (npSeek.progress != posInt) npSeek.progress = posInt
-            val elapsed = fmt(posInt)
-            if (elapsed != lastNpElapsed) {
-                lastNpElapsed = elapsed
-                npElapsed.text = elapsed
-            }
-            val remaining = "-" + fmt((dur - pos).coerceAtLeast(0L).toInt())
-            if (remaining != lastNpRemaining) {
-                lastNpRemaining = remaining
-                npRemaining.text = remaining
-            }
+        val durInt = dur.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        if (npSeek.max != durInt) npSeek.max = durInt
+        val posInt = pos.toInt()
+        if (npSeek.progress != posInt) npSeek.progress = posInt
+        val elapsed = fmt(posInt)
+        if (elapsed != lastNpElapsed) {
+            lastNpElapsed = elapsed
+            npElapsed.text = elapsed
         }
+        // Right-hand label is the TOTAL duration (Spotify inspo),
+        // not a countdown.
+        val total = fmt(durInt)
+        if (total != lastNpRemaining) {
+            lastNpRemaining = total
+            npRemaining.text = total
+        }
+        updateNpLyricLine()
     }
 
     private fun fmt(ms: Int): String {
@@ -2782,6 +3350,8 @@ class MainActivity : Activity() {
         // bank any accumulated listening time first.
         flushListened()
         PlayHistory.record(this, track)
+        buffering = true
+        updateBufferingUi()
         clearPlaybackError()
         refreshPlaybackUi()
         val token = ++playToken
@@ -3011,6 +3581,12 @@ class MainActivity : Activity() {
     /** Prints a playback failure on Now Playing and keeps it there. */
     private fun showPlaybackError(text: String) {
         if (!::npError.isInitialized) return
+        // Any printed outcome is terminal for the current resolve:
+        // the buffering indicators stand down.
+        if (buffering) {
+            buffering = false
+            updateBufferingUi()
+        }
         npError.text = text
         npError.visibility = View.VISIBLE
     }
@@ -3106,6 +3682,10 @@ class MainActivity : Activity() {
             override fun onPlaybackStateChanged(state: Int) {
                 if (holder.retired || player !== holder) return
                 when (state) {
+                    Player.STATE_BUFFERING -> {
+                        buffering = true
+                        updateBufferingUi()
+                    }
                     Player.STATE_READY -> if (!holder.readyFired) {
                         holder.readyFired = true
                         onPlayerReady(holder, old, forTrack, canFade, fadeMs, resolved)
@@ -3153,6 +3733,8 @@ class MainActivity : Activity() {
         fadeMs: Int,
         resolved: StreamResolver.Resolved?
     ) {
+        buffering = false
+        updateBufferingUi()
         if (resolved != null && forTrack != null) {
             StreamResolver.rememberGood(forTrack.id, ytQuality, resolved)
         }
@@ -3200,6 +3782,9 @@ class MainActivity : Activity() {
         sessionToken: Int,
         error: PlaybackException
     ) {
+        // Buffering is NOT cleared here: a ladder rejection retries
+        // with another client (still resolving); terminal failures
+        // clear it via showPlaybackError.
         if (player === holder) player = null
         holder.release()
         if (resolved != null && forTrack != null && sessionToken == playToken &&
@@ -3345,6 +3930,9 @@ class MainActivity : Activity() {
             continueAutoplay()
             return
         }
+        // Queue truly ended: nothing is resolving anymore.
+        buffering = false
+        updateBufferingUi()
         refreshPlaybackUi()
     }
 
@@ -3585,8 +4173,25 @@ class MainActivity : Activity() {
             npSeek.progress = 0
             npElapsed.text = "0:00"
             lastNpElapsed = "0:00"
-            npRemaining.text = "-" + fmt(t.duration * 1000)
+            npRemaining.text = fmt(t.duration * 1000)
             lastNpRemaining = npRemaining.text.toString()
+            // "Playing from {context}" top bar (v6): the owning
+            // screen set the context; fall back to the artist.
+            if (::npContextSmall.isInitialized) {
+                npContextSmall.text =
+                    if (npContextKind.isEmpty()) "Playing from" else "Playing from $npContextKind"
+                npContextBig.text = npContextName.ifEmpty { t.artist }
+            }
+            if (::miniProgress.isInitialized) {
+                lastMiniProgress = 0
+                if (!buffering) miniProgress.progress = 0
+            }
+            if (trackChanged) {
+                // New track: lyric line + preview card refetch, and
+                // the ambient glow retargets to the new artwork.
+                fetchNpLyrics(t)
+                requestAmbient(t)
+            }
         }
     }
 
@@ -3650,6 +4255,165 @@ class MainActivity : Activity() {
         npArtwork.scaleY = 0.965f
         npArtwork.animate().alpha(1f).scaleX(1f).scaleY(1f)
             .setDuration(340).setInterpolator(iosEase).start()
+    }
+
+    // ------------------------------------------------------------ v6: buffering indicators
+
+    /** Pushes [buffering] into the mini player progress bar (it goes
+     *  indeterminate) and the Now Playing play-button spinner. */
+    private fun updateBufferingUi() {
+        if (::miniProgress.isInitialized) {
+            miniProgress.isIndeterminate = buffering
+            if (!buffering) miniProgress.progress = lastMiniProgress.coerceAtLeast(0)
+        }
+        if (::npBuffering.isInitialized) {
+            npBuffering.visibility =
+                if (buffering && ::nowPlaying.isInitialized &&
+                    nowPlaying.visibility == View.VISIBLE
+                ) View.VISIBLE else View.GONE
+        }
+    }
+
+    // ------------------------------------------------------------ v6: ambient artwork color
+
+    /** Requests the ambient color for [t]'s artwork (cached per
+     *  track) and crossfades the Now Playing glow. Extraction runs
+     *  on the artwork pool thread; only the finished color crosses
+     *  to the UI thread. */
+    private fun requestAmbient(t: Track) {
+        val key = Downloads.key(t)
+        ambientKey = key
+        if (!ambientOn()) {
+            ambientColor = null
+            applyAmbient(animate = false)
+            return
+        }
+        val cached = ambientCache[key]
+        if (cached != null) {
+            ambientColor = cached
+            applyAmbient(animate = true)
+            return
+        }
+        ArtworkLoader.loadAmbientColor(heroArt(t) ?: t.artworkSmall) { color ->
+            if (ambientKey != key) return@loadAmbientColor
+            if (color != null) ambientCache[key] = color
+            ambientColor = color
+            applyAmbient(animate = true)
+        }
+    }
+
+    /** Renders the radial ambient glow behind Now Playing; the
+     *  lyrics overlay (when open) takes the solid ambient color.
+     *  Toggle OFF or no usable color = the neutral player. */
+    private fun applyAmbient(animate: Boolean) {
+        if (!::npAmbient.isInitialized) return
+        val c = if (ambientOn()) ambientColor else null
+        if (c == null) {
+            npAmbient.visibility = View.GONE
+            if (::lyricsOverlay.isInitialized && lyricsOverlay.visibility == View.VISIBLE) {
+                lyricsOverlay.setBackgroundColor(bgColor)
+            }
+            return
+        }
+        val glow = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            gradientType = GradientDrawable.RADIAL_GRADIENT
+            gradientCenter(0.5f, 0.30f)
+            gradientRadius = resources.displayMetrics.heightPixels * 0.75f
+            colors = intArrayOf(
+                Color.argb(235, Color.red(c), Color.green(c), Color.blue(c)),
+                Color.argb(120, Color.red(c), Color.green(c), Color.blue(c)),
+                bgColor
+            )
+        }
+        npAmbient.background = glow
+        npAmbient.visibility = View.VISIBLE
+        if (animate && !reduceMotion()) {
+            npAmbient.alpha = 0f
+            npAmbient.animate().alpha(1f).setDuration(450).setInterpolator(iosEase).start()
+        } else {
+            npAmbient.alpha = 1f
+        }
+        if (::lyricsOverlay.isInitialized && lyricsOverlay.visibility == View.VISIBLE) {
+            lyricsOverlay.setBackgroundColor(c)
+        }
+    }
+
+    // ------------------------------------------------------------ v6: Now Playing lyrics
+
+    /** The track's effective lyric offset: its own value when set,
+     *  else the global default from Settings. */
+    private fun npOffsetMs(t: Track): Long = LyricOffsets.effectiveMs(this, t)
+
+    /** Index of the synced line sounding at [posMs] with [offsetMs]
+     *  applied (effective line time = lineTimeMs − offsetMs). -1
+     *  before the first line. Reads real player position only —
+     *  no proportion-of-duration math anywhere. */
+    private fun currentLyricIndex(lines: List<LrcLine>, posMs: Long, offsetMs: Long): Int =
+        lines.indexOfLast { it.timeMs - offsetMs <= posMs }
+
+    /** Fetches (LRCLIB-cached) lyrics for the Now Playing surfaces:
+     *  the lyric line above the title and the preview card. Silent
+     *  on failure: the player never prints lyric errors. */
+    private fun fetchNpLyrics(t: Track) {
+        val key = Downloads.key(t)
+        if (key == npLyricsKey && npLyrics != null) {
+            updateNpLyricViews()
+            return
+        }
+        npLyricsKey = key
+        npLyrics = null
+        npLyricIdx = -2
+        lastNpLyricText = null
+        updateNpLyricViews()
+        lyricsExecutor.execute {
+            val data = try {
+                Lyrics.fetch(this@MainActivity, t)
+            } catch (_: Throwable) {
+                null
+            }
+            runOnUiThread {
+                if (npLyricsKey != key) return@runOnUiThread
+                npLyrics = data
+                npLyricIdx = -2
+                updateNpLyricViews()
+            }
+        }
+    }
+
+    /** Shows/hides the lyric line + preview card for the current
+     *  [npLyrics] state. */
+    private fun updateNpLyricViews() {
+        if (!::npLyricLine.isInitialized) return
+        val has = !npLyrics?.synced.isNullOrEmpty()
+        npLyricLine.visibility = if (has) View.VISIBLE else View.GONE
+        if (::npLyricsCard.isInitialized) {
+            npLyricsCard.visibility = if (has) View.VISIBLE else View.GONE
+        }
+        if (has) updateNpLyricLine()
+    }
+
+    /** Moves the Now Playing lyric line + preview card to the line
+     *  at the player's REAL position. Change-guarded: no view
+     *  writes when the sounding line did not change. Called from
+     *  the 500ms progress ticker and after seeks. */
+    private fun updateNpLyricLine() {
+        val t = current ?: return
+        val lines = npLyrics?.synced ?: return
+        if (lines.isEmpty() || !::npLyricLine.isInitialized) return
+        val pos = player?.positionMs ?: return
+        val idx = currentLyricIndex(lines, pos, npOffsetMs(t))
+        if (idx == npLyricIdx) return
+        npLyricIdx = idx
+        val cur = lines.getOrNull(idx)?.text?.ifEmpty { "♪" } ?: "♪"
+        if (cur != lastNpLyricText) {
+            lastNpLyricText = cur
+            npLyricLine.text = cur
+        }
+        if (::npLyricsCardCur.isInitialized) {
+            npLyricsCardCur.text = cur
+            npLyricsCardNext.text = lines.getOrNull(idx + 1)?.text?.ifEmpty { "♪" } ?: ""
+        }
     }
 
     // ------------------------------------------------------------ user settings (single read points)
@@ -3729,7 +4493,7 @@ class MainActivity : Activity() {
         }
         menuPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = glassBg(22f, Color.argb(242, 30, 30, 33), Color.argb(36, 255, 255, 255))
+            background = solidBg(22f, Color.rgb(40, 40, 40))
             setPadding(dp(8), dp(10), dp(8), dp(10))
             elevation = dp(16).toFloat()
             isClickable = true // absorb taps; only the dim backdrop dismisses
@@ -4320,10 +5084,11 @@ class MainActivity : Activity() {
             aLp.bottomMargin = dp(6)
             actions.layoutParams = aLp
             val shuffleBtn = icon(R.drawable.ic_shuffle, Color.WHITE).apply {
-                background = glassBg(999f, Color.argb(28, 255, 255, 255), Color.argb(20, 255, 255, 255))
+                background = solidBg(999f, surface2)
                 setPadding(dp(10), dp(10), dp(10), dp(10))
                 setOnClickListener {
                     shuffleOn = true
+                    setPlayContext("Playlist", p.name)
                     setQueue(p.tracks)
                     refreshTransportStates()
                     play(p.tracks[playOrder.firstOrNull() ?: 0])
@@ -4331,6 +5096,7 @@ class MainActivity : Activity() {
             }
             actions.addView(shuffleBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
             val playAll = pillButton("Play", filled = true) {
+                setPlayContext("Playlist", p.name)
                 setQueue(p.tracks)
                 play(p.tracks.first())
             }
@@ -4338,7 +5104,7 @@ class MainActivity : Activity() {
             playLp.setMargins(dp(14), 0, dp(14), 0)
             actions.addView(playAll, playLp)
             val menuBtn = icon(R.drawable.ic_more, Color.WHITE).apply {
-                background = glassBg(999f, Color.argb(28, 255, 255, 255), Color.argb(20, 255, 255, 255))
+                background = solidBg(999f, surface2)
                 setPadding(dp(10), dp(10), dp(10), dp(10))
                 setOnClickListener { showPlaylistMenu(p) }
             }
@@ -4349,7 +5115,7 @@ class MainActivity : Activity() {
             // UI has no drag framework; numbered moves are exact).
             p.tracks.forEachIndexed { i, track ->
                 if (i > 0) content.addView(hairline())
-                addTrackRow(track, content, p.tracks) { showPlaylistTrackMenu(p.id, track, i) }
+                addTrackRow(track, content, p.tracks, contextLabel = "Playlist" to p.name) { showPlaylistTrackMenu(p.id, track, i) }
             }
         } else {
             content.addView(label("This playlist is empty.", 15f, white50).apply {
@@ -4405,7 +5171,7 @@ class MainActivity : Activity() {
             content.addView(label("Tap the heart on Now Playing and the song lands here.", 15f, white50))
         } else {
             content.addView(sectionTitle("${liked.size} liked"))
-            addRows(liked, withHairlines = true, queueContext = liked)
+            addRows(liked, withHairlines = true, queueContext = liked, contextLabel = "Playlist" to "Liked Songs")
         }
     }
 
@@ -4763,7 +5529,9 @@ class MainActivity : Activity() {
     private fun buildLyricsOverlay(root: FrameLayout) {
         lyricsOverlay = FrameLayout(this).apply {
             visibility = View.GONE
-            setBackgroundColor(Color.argb(250, 0, 0, 0))
+            // Ambient artwork color when available (set again at
+            // show time); neutral app background otherwise.
+            setBackgroundColor(bgColor)
         }
         val inner = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -4789,6 +5557,59 @@ class MainActivity : Activity() {
         val stLp = LinearLayout.LayoutParams(-1, -2)
         stLp.topMargin = dp(4)
         inner.addView(lyricsStatus, stLp)
+        // Loading spinner + sync offset steppers (v6): the spinner
+        // replaces the old text-only "Loading lyrics…" state; the
+        // steppers shift THIS track's line timing by ±0.1s (the
+        // LyricOffsets sign convention applies it to the highlight
+        // and to tap-to-seek alike).
+        val ctrlRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val cLp = LinearLayout.LayoutParams(-1, -2)
+        cLp.topMargin = dp(8)
+        ctrlRow.layoutParams = cLp
+        lyricsSpinner = ProgressBar(this).apply {
+            isIndeterminate = true
+            visibility = View.GONE
+            indeterminateTintList = ColorStateList.valueOf(accent)
+        }
+        ctrlRow.addView(lyricsSpinner, LinearLayout.LayoutParams(dp(22), dp(22)))
+        val offBox = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        offBox.addView(label("Sync", 12.5f, white55, semiboldTf).apply {
+            setPadding(dp(10), 0, dp(4), 0)
+        })
+        fun offBtn(txt: String, delta: Long): TextView =
+            label(txt, 20f, Color.WHITE, boldTf).apply {
+                gravity = Gravity.CENTER
+                isClickable = true
+                setPadding(dp(10), dp(4), dp(10), dp(4))
+                setOnClickListener { adjustLyricOffset(delta) }
+            }
+        offBox.addView(offBtn("−", -100L))
+        lyricsOffsetLabel = label("+0.0s", 14f, Color.WHITE, semiboldTf).apply {
+            gravity = Gravity.CENTER
+            minWidth = dp(54)
+        }
+        offBox.addView(lyricsOffsetLabel)
+        offBox.addView(offBtn("+", 100L))
+        offBox.addView(label("Reset", 13f, accent, mediumTf).apply {
+            isClickable = true
+            setPadding(dp(8), dp(4), dp(4), dp(4))
+            setOnClickListener {
+                lyricsTrack?.let { LyricOffsets.clearTrack(this@MainActivity, it) }
+                refreshOffsetLabel()
+                lyricsActiveLine = -2
+                updateLyricsHighlight()
+                npLyricIdx = -2
+                updateNpLyricLine()
+            }
+        })
+        ctrlRow.addView(offBox, LinearLayout.LayoutParams(0, -2, 1f))
+        inner.addView(ctrlRow)
         lyricsScroll = ScrollView(this)
         lyricsList = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -4800,6 +5621,29 @@ class MainActivity : Activity() {
         inner.addView(lyricsScroll, sLp)
         lyricsOverlay.addView(inner, FrameLayout.LayoutParams(-1, -1))
         root.addView(lyricsOverlay, FrameLayout.LayoutParams(-1, -1))
+    }
+
+    /** Refreshes the lyrics overlay's offset readout for the
+     *  overlay's current track (its own offset, else the global). */
+    private fun refreshOffsetLabel() {
+        if (!::lyricsOffsetLabel.isInitialized) return
+        val t = lyricsTrack ?: return
+        lyricsOffsetLabel.text = fmtOffset(LyricOffsets.effectiveMs(this, t))
+    }
+
+    /** One stepper tap in the lyrics view: shift the track's own
+     *  offset by [deltaMs] (seeded from the effective value so the
+     *  first tap starts from what is actually applied), persist
+     *  immediately, and re-derive both highlights. */
+    private fun adjustLyricOffset(deltaMs: Long) {
+        val t = lyricsTrack ?: return
+        val now = (LyricOffsets.effectiveMs(this, t) + deltaMs).coerceIn(-5000L, 5000L)
+        LyricOffsets.setTrackMs(this, t, now)
+        refreshOffsetLabel()
+        lyricsActiveLine = -2
+        updateLyricsHighlight()
+        npLyricIdx = -2
+        updateNpLyricLine()
     }
 
     private fun hideLyrics() {
@@ -4832,7 +5676,15 @@ class MainActivity : Activity() {
             return
         }
         if (!::lyricsOverlay.isInitialized) return
+        lyricsTrack = t
+        // Ambient backdrop: the current artwork's color, solid;
+        // the neutral background when the toggle is off or no
+        // color was extracted.
+        lyricsOverlay.setBackgroundColor(
+            if (ambientOn() && ambientColor != null) ambientColor!! else bgColor
+        )
         lyricsOverlay.visibility = View.VISIBLE
+        refreshOffsetLabel()
         lyricsOverlay.alpha = 0f
         lyricsOverlay.animate().alpha(1f).setDuration(180).start()
         handler.removeCallbacks(lyricsTicker)
@@ -4848,7 +5700,8 @@ class MainActivity : Activity() {
         lyricsLineViews = emptyList()
         lyricsActiveLine = -2
         lyricsList.removeAllViews()
-        lyricsStatus.text = if (t.artist.isNotEmpty()) "${t.artist} · Loading lyrics…" else "Loading lyrics…"
+        lyricsStatus.text = t.artist
+        if (::lyricsSpinner.isInitialized) lyricsSpinner.visibility = View.VISIBLE
         lyricsLoading = true
         // Fine-cadence highlight driver, alive only while the
         // overlay is visible (see lyricsTicker).
@@ -4869,6 +5722,7 @@ class MainActivity : Activity() {
     }
 
     private fun renderLyrics(data: LyricsData?) {
+        if (::lyricsSpinner.isInitialized) lyricsSpinner.visibility = View.GONE
         lyricsList.removeAllViews()
         lyricsSyncedLines = emptyList()
         lyricsLineViews = emptyList()
@@ -4894,13 +5748,21 @@ class MainActivity : Activity() {
                 lyricsStatus.text = "Synced · ${data.source} · tap a line to jump"
                 val lines = data.synced
                 lyricsSyncedLines = lines
+                // Inspo screen 3: LARGE bold lines over the ambient
+                // hue; upcoming lines sit dim, the current line
+                // burns full-bright, sung lines dim further (the
+                // three states are applied in updateLyricsHighlight).
+                val seekOffset = lyricsTrack?.let { LyricOffsets.effectiveMs(this, it) } ?: 0L
                 val views = ArrayList<TextView>(lines.size)
                 lines.forEach { line ->
-                    val tv = label(line.text.ifEmpty { "♪" }, 17.5f, white50).apply {
-                        setPadding(0, dp(7), 0, dp(7))
+                    val tv = label(line.text.ifEmpty { "♪" }, 26f, Color.argb(120, 255, 255, 255), semiboldTf).apply {
+                        setPadding(0, dp(10), 0, dp(10))
                         isClickable = true
                         setOnClickListener {
-                            player?.seekTo(line.timeMs)
+                            // Tap-to-seek lands where the highlight
+                            // says the line is: offset applied.
+                            player?.seekTo((line.timeMs - seekOffset).coerceAtLeast(0L))
+                            lyricsActiveLine = -2
                             updateLyricsHighlight()
                         }
                     }
@@ -4928,17 +5790,35 @@ class MainActivity : Activity() {
         if (!::lyricsOverlay.isInitialized || lyricsOverlay.visibility != View.VISIBLE) return
         if (lyricsSyncedLines.isEmpty() || lyricsLineViews.isEmpty()) return
         val pos = player?.positionMs ?: return
-        val idx = lyricsSyncedLines.indexOfLast { it.timeMs <= pos }
+        // The offset shifts every line's effective start; the
+        // highlight reads the same adjusted timeline tap-to-seek
+        // uses, so the two can never disagree.
+        val offset = lyricsTrack?.let { LyricOffsets.effectiveMs(this, it) } ?: 0L
+        val idx = lyricsSyncedLines.indexOfLast { it.timeMs - offset <= pos }
         if (idx == lyricsActiveLine) return
-        lyricsLineViews.getOrNull(lyricsActiveLine)?.let {
-            it.setTextColor(white50)
-            it.typeface = regularTf
+        val prev = lyricsActiveLine
+        if (prev == -2 && idx > 0) {
+            // First derivation (open mid-song): everything before
+            // the current line is already sung.
+            for (i in 0 until idx.coerceAtMost(lyricsLineViews.size)) {
+                lyricsLineViews[i].setTextColor(Color.argb(64, 255, 255, 255))
+            }
+        }
+        lyricsLineViews.getOrNull(prev)?.let {
+            // Leaving a line by moving FORWARD = sung (dimmer);
+            // by seeking BACK = upcoming again (brighter dim).
+            it.setTextColor(
+                if (idx > prev) Color.argb(64, 255, 255, 255) else Color.argb(120, 255, 255, 255)
+            )
+            it.typeface = semiboldTf
         }
         lyricsActiveLine = idx
         val view = lyricsLineViews.getOrNull(idx) ?: return
         view.setTextColor(Color.WHITE)
         view.typeface = boldTf
-        val y = (view.top - dp(140)).coerceAtLeast(0)
+        // Keep the current line centered-ish (inspo): a third of
+        // the viewport down, not pinned to a fixed offset.
+        val y = (view.top - lyricsScroll.height / 3).coerceAtLeast(0)
         if (reduceMotion()) lyricsScroll.scrollTo(0, y) else lyricsScroll.smoothScrollTo(0, y)
     }
 
@@ -5021,11 +5901,11 @@ class MainActivity : Activity() {
     private fun modeChip(text: String, active: Boolean, onClick: () -> Unit): TextView {
         val chip = label(text, 13.5f, if (active) accent else white55, boldTf).apply {
             gravity = Gravity.CENTER
-            background = glassBg(
-                999f,
-                if (active) Color.argb(46, 252, 60, 68) else Color.argb(24, 255, 255, 255),
-                Color.argb(20, 255, 255, 255)
-            )
+            background = if (active) {
+                solidBg(999f, Color.argb(46, Color.red(accent), Color.green(accent), Color.blue(accent)))
+            } else {
+                solidBg(999f, Color.argb(24, 255, 255, 255))
+            }
             setPadding(dp(14), dp(7), dp(14), dp(7))
             isClickable = true
             setOnClickListener { onClick() }
@@ -5189,7 +6069,7 @@ class MainActivity : Activity() {
             setTextColor(Color.WHITE)
             val states = arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf())
             thumbTintList = ColorStateList(states, intArrayOf(accent, Color.argb(160, 255, 255, 255)))
-            trackTintList = ColorStateList(states, intArrayOf(Color.argb(120, 252, 60, 68), Color.argb(60, 255, 255, 255)))
+            trackTintList = ColorStateList(states, intArrayOf(Color.argb(120, Color.red(accent), Color.green(accent), Color.blue(accent)), Color.argb(60, 255, 255, 255)))
             isChecked = getPreferences(MODE_PRIVATE).getBoolean(key, default)
             setOnCheckedChangeListener { _, checked ->
                 getPreferences(MODE_PRIVATE).edit().putBoolean(key, checked).apply()
@@ -5271,6 +6151,7 @@ class MainActivity : Activity() {
     private fun beginScreen(title: String, showAvatar: Boolean) {
         visibleScreen = title
         visualizerBarSets.clear()
+        clearSkeletons()
         content.removeAllViews()
         val head = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL

@@ -60,7 +60,7 @@ data class LyricsData(
  * except [cacheBytes]/[clearCache].
  */
 object Lyrics {
-    private const val UA = "arzxsh/0.5.1 (personal music player; github.com/lulitaxu/music-player)"
+    private const val UA = "arzxsh/0.6.0 (personal music player; github.com/lulitaxu/music-player)"
     private const val MISS_TTL_MS = 7L * 24 * 3600 * 1000
     private const val CACHE_VER = 2
 
@@ -312,6 +312,16 @@ object Lyrics {
             var considered = 0
             var bestSim = 0
             var best: Pair<LyricsData, Double>? = null
+            // v6 sync fix: among SYNCED candidates the winner is the
+            // one whose duration is CLOSEST to the track's real
+            // duration — a synced file for a different edit of the
+            // song (radio edit, extended mix) drifts against the
+            // audio no matter how good its title match is. The old
+            // flat +5000 "has sync" bonus let a high-similarity but
+            // wrong-duration candidate beat the right one.
+            var bestSynced: LyricsData? = null
+            var bestSyncedDiff = Double.MAX_VALUE
+            var bestSyncedSim = -1
             for (i in 0 until arr.length()) {
                 val item = arr.optJSONObject(i) ?: continue
                 val data = fromLrclibRecord(item) ?: continue
@@ -325,9 +335,22 @@ object Lyrics {
                 } else {
                     30.0
                 }
+                if (data.synced != null &&
+                    (durDiff < bestSyncedDiff ||
+                        (durDiff == bestSyncedDiff && sim > bestSyncedSim))
+                ) {
+                    bestSynced = data
+                    bestSyncedDiff = durDiff
+                    bestSyncedSim = sim
+                }
                 val score = sim * 100.0 - durDiff * 15.0 +
                     (if (data.synced != null) 5000.0 else 0.0)
                 if (best == null || score > best!!.second) best = data to score
+            }
+            if (bestSynced != null) {
+                notes += "LRCLIB search ($tag): 200, ${arr.length()} candidates, " +
+                    "synced pick by closest duration (off by ${bestSyncedDiff.toInt()}s)"
+                return bestSynced
             }
             if (best == null) {
                 notes += "LRCLIB search ($tag): 200, ${arr.length()} candidates, " +
