@@ -2784,6 +2784,38 @@ class MainActivity : Activity() {
         return tv
     }
 
+    /**
+     * Page-level load failure, human first (0.6.3, WS-D Bug C):
+     * a plain-language headline that says what happened and what
+     * to do, the raw error kept as the small secondary line
+     * underneath (diagnostics stay available; they just stop
+     * BEING the message — 0.6.2's artist page headline was the
+     * raw "RuntimeException: Innertube browse HTTP 400"), and a
+     * working Retry.
+     */
+    private fun addPageError(box: LinearLayout, what: String, err: String?, retry: () -> Unit) {
+        val human = when {
+            err.isNullOrEmpty() -> "Something went wrong loading this $what."
+            err.contains("HTTP 400") || err.contains("HTTP 404") ->
+                "YouTube rejected this $what link — it may be out of date. " +
+                    "Go back and open it again from a fresh search, or retry."
+            err.contains("HTTP") ->
+                "YouTube's server answered with an error. Try again in a moment."
+            err.contains("UnknownHost") || err.contains("Socket") ||
+                err.contains("Connect") || err.contains("IO") ->
+                "Couldn't reach YouTube. Check your connection and try again."
+            else -> "YouTube couldn't load this $what right now. Try again in a moment."
+        }
+        box.addView(label(human, 15f, white75))
+        if (!err.isNullOrEmpty()) box.addView(errorLine(err))
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val lp = LinearLayout.LayoutParams(-2, -2)
+        lp.topMargin = dp(16)
+        row.layoutParams = lp
+        row.addView(pillButton("Retry", filled = true) { retry() })
+        box.addView(row)
+    }
+
     /** Small source-status line (counts, fallback notes). */
     private fun statusLine(text: String): TextView {
         val tv = label(text, 12.5f, white50)
@@ -2967,7 +2999,9 @@ class MainActivity : Activity() {
                 val p = page
                 if (p == null) {
                     content.addView(label(fallbackName ?: "Artist", 30f, Color.WHITE, boldTf))
-                    content.addView(errorLine("YouTube unavailable: $err"))
+                    addPageError(content, "artist page", err) {
+                        showArtist(artistId, fallbackName, fallbackArt)
+                    }
                     return@runOnUiThread
                 }
                 val banner = FrameLayout(this).apply {
@@ -3085,7 +3119,7 @@ class MainActivity : Activity() {
                 val p = page
                 if (p == null) {
                     content.addView(label(ref.title, 26f, Color.WHITE, boldTf))
-                    content.addView(errorLine("YouTube unavailable: $err"))
+                    addPageError(content, "album", err) { showAlbum(ref) }
                     return@runOnUiThread
                 }
                 val head = LinearLayout(this).apply {
@@ -3295,7 +3329,7 @@ class MainActivity : Activity() {
                 content.removeView(skelBox)
                 val l = list
                 if (l == null) {
-                    content.addView(errorLine("YouTube unavailable: $err"))
+                    addPageError(content, "category page", err) { showMoodPlaylists(cat) }
                     return@runOnUiThread
                 }
                 l.forEachIndexed { i, ref ->
@@ -3368,7 +3402,7 @@ class MainActivity : Activity() {
                 val tracks = list
                 if (tracks == null) {
                     content.addView(label(ref.title, 26f, Color.WHITE, boldTf))
-                    content.addView(errorLine("YouTube unavailable: $err"))
+                    addPageError(content, "playlist", err) { showYtmPlaylist(ref) }
                     return@runOnUiThread
                 }
                 val head = LinearLayout(this).apply {

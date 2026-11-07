@@ -190,7 +190,21 @@ object YtmApi {
         }
     }
 
-    private fun post(endpoint: String, body: JSONObject): JSONObject {
+    private fun post(endpoint: String, body: JSONObject): JSONObject =
+        post(endpoint, body, useVisitor = true)
+
+    /**
+     * [useVisitor] (0.6.3, WS-D Bug C): the visitor id is harvested
+     * once per process from the homepage HTML and never validated;
+     * a stale or region-mismatched value rides on every request.
+     * Browse is the strictest endpoint about context consistency
+     * (search tolerated the same context that browse rejected
+     * with HTTP 400 in the field), so callers get an anonymous
+     * retry shape. The HTTP error body is CAPTURED into the
+     * exception from now on — 0.6.2 threw it away, which made the
+     * field failure undiagnosable ("HTTP 400" and nothing else).
+     */
+    private fun post(endpoint: String, body: JSONObject, useVisitor: Boolean): JSONObject {
         val context = JSONObject()
             .put(
                 "client", JSONObject()
@@ -214,14 +228,20 @@ object YtmApi {
             setRequestProperty("X-Goog-Api-Format-Version", "1")
             setRequestProperty("X-YouTube-Client-Name", "67")
             setRequestProperty("X-YouTube-Client-Version", clientVersion())
-            visitorId()?.let { setRequestProperty("X-Goog-Visitor-Id", it) }
+            if (useVisitor) visitorId()?.let { setRequestProperty("X-Goog-Visitor-Id", it) }
             setRequestProperty("Accept-Encoding", "gzip")
         }
         conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
         val code = conn.responseCode
         val stream = if (code in 200..299) conn.inputStream else conn.errorStream
         val text = stream?.let { readBody(conn, it) } ?: ""
-        if (code !in 200..299) throw RuntimeException("Innertube $endpoint HTTP $code")
+        if (code !in 200..299) {
+            val detail = text.replace('\n', ' ').trim().take(180)
+            throw RuntimeException(
+                if (detail.isEmpty()) "Innertube $endpoint HTTP $code"
+                else "Innertube $endpoint HTTP $code: $detail"
+            )
+        }
         return JSONObject(text)
     }
 
@@ -597,8 +617,50 @@ object YtmApi {
 
     // ------------------------------------------------------------ artist page
 
+    /**
+     * The artist browse as a small LADDER (0.6.3, WS-D Bug C),
+     * mirroring the stream resolver's philosophy of never letting
+     * one context shape be a single point of failure:
+     *  1. the id as given, with the session visitor (the shape
+     *     that works for the overwhelming majority of artists);
+     *  2. on a 400/404, the same id WITHOUT the visitor header —
+     *     the visitor is harvested once per process, unvalidated,
+     *     and encodes the region it was harvested in, while the
+     *     client context claims gl=US; browse is the endpoint
+     *     that rejects that inconsistency (search/playback kept
+     *     working in the field report);
+     *  3. if the id carries the "MPLA" page prefix some endpoints
+     *     hand out, the bare channel id underneath it, anonymous.
+     * Every attempt's failure is collected and the LAST error —
+     * now carrying YouTube's own error body — is what surfaces.
+     */
+    private fun browseArtist(channelId: String): JSONObject {
+        val forms = ArrayList<String>()
+        forms.add(channelId)
+        if (channelId.startsWith("MPLA")) {
+            channelId.removePrefix("MPLA").takeIf { it.startsWith("UC") }?.let { forms.add(it) }
+        }
+        var last: Throwable? = null
+        for ((index, id) in forms.withIndex()) {
+            val visitorModes = if (index == 0) listOf(true, false) else listOf(false)
+            for (useVisitor in visitorModes) {
+                try {
+                    return post("browse", JSONObject().put("browseId", id), useVisitor)
+                } catch (t: Throwable) {
+                    last = t
+                    val msg = t.message ?: ""
+                    // Only a rejection (400/404) justifies trying
+                    // another shape; a transport failure would
+                    // fail identically and slower.
+                    if (!msg.contains("HTTP 400") && !msg.contains("HTTP 404")) throw t
+                }
+            }
+        }
+        throw last ?: RuntimeException("artist browse failed")
+    }
+
     fun artistPage(channelId: String): YtmArtistPage {
-        val resp = post("browse", JSONObject().put("browseId", channelId))
+        val resp = browseArtist(channelId)
         val header = findByKey(resp, "musicImmersiveHeaderRenderer")
         val name = header?.obj("title")?.let { runsText(it.arr("runs")) }?.takeIf { it.isNotEmpty() }
             ?: throw RuntimeException("artist response had no header")
