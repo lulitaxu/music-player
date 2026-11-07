@@ -27,6 +27,7 @@ import android.provider.OpenableColumns
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.text.TextUtils
 import android.util.LruCache
 import android.util.TypedValue
@@ -692,6 +693,9 @@ class MainActivity : Activity() {
      *  set is registered permanently. One shared ValueAnimator
      *  pulses them all while playing. */
     private val visualizerBarSets = ArrayList<Array<View>>()
+
+    /** Last decorative-pulse write (0.6.3): the ~30fps throttle. */
+    private var lastPulseWriteMs = 0L
     private var miniVisualizerBars: Array<View>? = null
     private var visualizerAnimator: ValueAnimator? = null
 
@@ -930,6 +934,18 @@ class MainActivity : Activity() {
 
     private val ticker = object : Runnable {
         override fun run() {
+            // Loop discipline (0.6.3, audit S4): backgrounded AND
+            // silent, the body sleeps — 0.6.2 ran the full pass
+            // (progress writes, lyrics sync, gapless checks) ~2x
+            // per second forever, screen off included. Playing in
+            // the background still runs it: gapless arming and
+            // listening accumulation are playback features, not
+            // UI refresh. The 500ms cadence itself is kept so a
+            // resume is instant.
+            if (activityStopped && !isPlayingSafe()) {
+                handler.postDelayed(this, 500)
+                return
+            }
             accumulateListening()
             updateProgress()
             updateLyricsHighlight()
@@ -938,6 +954,11 @@ class MainActivity : Activity() {
             handler.postDelayed(this, 500)
         }
     }
+
+    /** True between onStop and onStart: the activity is not
+     *  visible. Drives the ticker's sleep (see [ticker]). */
+    @Volatile
+    private var activityStopped = false
 
     /**
      * Listening-time accumulation for the stats screen: while audio
@@ -2742,9 +2763,14 @@ class MainActivity : Activity() {
         queueContext: List<Track>? = null,
         contextLabel: Pair<String, String>? = null
     ) {
+        // One downloaded-keys snapshot per list build (0.6.3,
+        // audit S6): rows test set membership instead of running
+        // a linear index scan + File.exists() per row on the
+        // main thread (a 200-row playlist paid 200 stats).
+        val dlKeys = Downloads.downloadedKeys(this)
         list.forEachIndexed { i, track ->
             if (withHairlines && i > 0) target.addView(hairline())
-            addTrackRow(track, target, queueContext, contextLabel = contextLabel)
+            addTrackRow(track, target, queueContext, contextLabel = contextLabel, dlKeys = dlKeys)
         }
     }
 
@@ -2761,7 +2787,8 @@ class MainActivity : Activity() {
         target: LinearLayout,
         queueContext: List<Track>? = null,
         contextLabel: Pair<String, String>? = null,
-        menuOverride: (() -> Unit)? = null
+        menuOverride: (() -> Unit)? = null,
+        dlKeys: Set<String>? = null
     ) {
         val openMenu = { if (menuOverride != null) menuOverride() else showTrackMenu(track) }
         val row = LinearLayout(this).apply {
@@ -2807,7 +2834,14 @@ class MainActivity : Activity() {
         // No source badges in rows (product decision, 2026-11-06):
         // Track.source is still tracked internally for playback
         // resolution, radio and downloads, just never displayed.
-        if (Downloads.isDownloaded(this, track)) {
+        // Downloaded badge: set membership when the list builder
+        // snapshotted the keys (S6), single stat-check otherwise.
+        val isDown = if (dlKeys != null) {
+            Downloads.key(track) in dlKeys
+        } else {
+            Downloads.isDownloaded(this, track)
+        }
+        if (isDown) {
             val doneIcon = icon(R.drawable.ic_downloaded, accent)
             val dLp = LinearLayout.LayoutParams(dp(19), dp(19))
             dLp.marginStart = dp(8)
@@ -3257,7 +3291,8 @@ class MainActivity : Activity() {
                     val playLp = LinearLayout.LayoutParams(dp(132), dp(40))
                     playLp.setMargins(dp(14), 0, dp(14), 0)
                     actions.addView(playAll, playLp)
-                    val allDown = p.tracks.all { Downloads.isDownloaded(this, it) }
+                    val pageDlKeys = Downloads.downloadedKeys(this)
+                    val allDown = p.tracks.all { Downloads.key(it) in pageDlKeys }
                     val dlBtn = icon(
                         if (allDown) R.drawable.ic_downloaded else R.drawable.ic_download,
                         if (allDown) accent else Color.WHITE
@@ -3268,7 +3303,7 @@ class MainActivity : Activity() {
                             if (allDown) {
                                 Toast.makeText(this@MainActivity, "Already downloaded", Toast.LENGTH_SHORT).show()
                             } else {
-                                p.tracks.filter { !Downloads.isDownloaded(this@MainActivity, it) }
+                                p.tracks.filter { Downloads.key(it) !in pageDlKeys }
                                     .forEach { startDownload(it) }
                             }
                         }
@@ -5634,7 +5669,11 @@ class MainActivity : Activity() {
             }
         }
         applyVizLevels(miniVisualizerBars)
-        for (set in visualizerBarSets) applyVizLevels(set)
+        // Attached sets only (0.6.3, S4): a set whose row is in a
+        // discarded tree draws nothing; writing it was pure cost.
+        for (set in visualizerBarSets) {
+            if (set.firstOrNull()?.isAttachedToWindow == true) applyVizLevels(set)
+        }
     }
 
     private fun applyVizLevels(bars: Array<View>?) {
@@ -5669,9 +5708,20 @@ class MainActivity : Activity() {
                 repeatCount = ValueAnimator.INFINITE
                 interpolator = LinearInterpolator()
                 addUpdateListener { a ->
+                    // The decorative pulse writes at ~30fps, not
+                    // the animator's ~60 (0.6.3, audit S4): half
+                    // the transform writes, visually identical at
+                    // a 1150ms period, kind on the G95.
+                    val now = SystemClock.uptimeMillis()
+                    if (now - lastPulseWriteMs < 33) return@addUpdateListener
+                    lastPulseWriteMs = now
                     val phase = a.animatedValue as Float
                     applyVisualizerPhase(miniVisualizerBars, phase)
-                    for (set in visualizerBarSets) applyVisualizerPhase(set, phase)
+                    for (set in visualizerBarSets) {
+                        if (set.firstOrNull()?.isAttachedToWindow == true) {
+                            applyVisualizerPhase(set, phase)
+                        }
+                    }
                 }
                 visualizerAnimator = this
             }
@@ -6360,6 +6410,16 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------- v6.1: lifecycle hooks
 
+    override fun onStart() {
+        super.onStart()
+        activityStopped = false
+    }
+
+    override fun onStop() {
+        activityStopped = true
+        super.onStop()
+    }
+
     /** Capture never runs while the app is backgrounded: the
      *  Visualizer is released here and re-created by the state
      *  sync on resume if playback is still going. */
@@ -6639,9 +6699,15 @@ class MainActivity : Activity() {
             // Rows with playlist-specific menus: reorder happens
             // through explicit Move Up / Move Down items (the list
             // UI has no drag framework; numbered moves are exact).
+            val playlistDlKeys = Downloads.downloadedKeys(this)
             p.tracks.forEachIndexed { i, track ->
                 if (i > 0) content.addView(hairline())
-                addTrackRow(track, content, p.tracks, contextLabel = "Playlist" to p.name) { showPlaylistTrackMenu(p.id, track, i) }
+                addTrackRow(
+                    track, content, p.tracks,
+                    contextLabel = "Playlist" to p.name,
+                    menuOverride = { showPlaylistTrackMenu(p.id, track, i) },
+                    dlKeys = playlistDlKeys
+                )
             }
         } else {
             content.addView(label("This playlist is empty.", 15f, white50).apply {
@@ -7680,6 +7746,18 @@ class MainActivity : Activity() {
             // registry so detached sets don't accumulate.
             if (visualizerBarSets.size > 24) visualizerBarSets.clear()
             visualizerBarSets.add(arr)
+            // Registry hygiene (0.6.3, audit S4): a set leaves
+            // the registry when its row leaves the window, so
+            // the ~30fps writers never animate discarded trees.
+            // Tab retention snapshots the registry BEFORE the
+            // detach and re-registers on restore, so retained
+            // rows keep their sets across tab switches.
+            layout.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) {}
+                override fun onViewDetachedFromWindow(v: View) {
+                    visualizerBarSets.remove(arr)
+                }
+            })
         }
         return layout
     }
