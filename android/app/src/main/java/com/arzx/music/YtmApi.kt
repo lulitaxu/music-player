@@ -204,14 +204,19 @@ object YtmApi {
      * exception from now on — 0.6.2 threw it away, which made the
      * field failure undiagnosable ("HTTP 400" and nothing else).
      */
-    private fun post(endpoint: String, body: JSONObject, useVisitor: Boolean): JSONObject {
+    private fun post(
+        endpoint: String,
+        body: JSONObject,
+        useVisitor: Boolean,
+        gl: String = "US"
+    ): JSONObject {
         val context = JSONObject()
             .put(
                 "client", JSONObject()
                     .put("clientName", "WEB_REMIX")
                     .put("clientVersion", clientVersion())
                     .put("hl", "en")
-                    .put("gl", "US")
+                    .put("gl", gl)
             )
             .put("user", JSONObject())
         body.put("context", context)
@@ -783,16 +788,23 @@ object YtmApi {
     }
 
     /**
-     * Global YouTube Music charts: the daily chart playlist's songs plus
-     * the chart artists carousel. Throws when the response carries no
-     * usable sections, so the caller can show the failure instead of an
-     * empty hole.
+     * YouTube Music charts, pinned to Bangladesh (0.6.5, Arz's phone
+     * test: Home led with the global chart — a Hanuman Chalisa video
+     * and an India-weighted "global" mix). The request now expresses
+     * BD in both region fields: the form's country selection (was
+     * "ZZ" = Global) and the context gl (was the shared "US"). The
+     * form selection is the field that verifiably moves this surface
+     * (probed from the VM: US→US charts, IN→"Trending 20 India",
+     * ID→Indonesia charts, ZZ→Global). Scope: charts only — search,
+     * other browses and the playback ladder keep their contexts.
+     * Throws when the response carries no usable sections, so the
+     * caller can show the failure instead of an empty hole.
      */
     fun charts(): YtmCharts {
         val body = JSONObject()
             .put("browseId", "FEmusic_charts")
-            .put("formData", JSONObject().put("selectedValues", JSONArray().put("ZZ")))
-        val resp = post("browse", body)
+            .put("formData", JSONObject().put("selectedValues", JSONArray().put("BD")))
+        val resp = post("browse", body, gl = "BD")
         val sections = browseSections(resp)
         var dailyPlaylistId: String? = null
         var artists: List<YtmArtistRef> = emptyList()
