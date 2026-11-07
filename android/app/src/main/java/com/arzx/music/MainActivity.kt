@@ -828,6 +828,7 @@ class MainActivity : Activity() {
             updateProgress()
             updateLyricsHighlight()
             maybeArmGapless()
+            maybeWarmAfterNext()
             handler.postDelayed(this, 500)
         }
     }
@@ -1180,6 +1181,9 @@ class MainActivity : Activity() {
      *  same live-apply path as the theme accent): backgrounds are
      *  chosen at build time, and playback is never touched. */
     private fun applyGlassChange() {
+        // Same rule as the accent: glass fills are chosen at build
+        // time, so retained trees retire on a glass toggle.
+        retainedRoots.clear()
         val tab = activeTab
         showShell()
         when (tab) {
@@ -1210,6 +1214,9 @@ class MainActivity : Activity() {
      * overlay (Now Playing, menus) closes.
      */
     private fun applyAccent(color: Int, hue: Float?) {
+        // Retained trees carry build-time accent tints: a theme
+        // change retires them all.
+        retainedRoots.clear()
         accentColor = color
         val e = getPreferences(MODE_PRIVATE).edit().putInt("theme_accent", color)
         if (hue != null) e.putFloat("theme_hue", hue)
@@ -1433,17 +1440,47 @@ class MainActivity : Activity() {
 
     private fun showHome() {
         navRoot("tab:home") { showHome() }
+        // Retention (0.6.1): a built Home returns INSTANTLY — no
+        // fetch, no skeleton. Past the ~30 min TTL it still
+        // returns instantly, and a background refresh swaps fresh
+        // data in when ready (stale-while-revalidate): a warm
+        // screen is never blanked.
+        if (restoreRoot("Home")) {
+            val entry = retainedRoots["Home"]
+            if (entry != null &&
+                System.currentTimeMillis() - entry.builtAtMs > homeTtlMs
+            ) {
+                buildHome(warmRefresh = true)
+            }
+            return
+        }
+        buildHome(warmRefresh = false)
+    }
+
+    private fun buildHome(warmRefresh: Boolean) {
+        navRoot("tab:home") { showHome() }
         val gen = ++generation
-        beginScreen("Listen Now", showAvatar = true)
-        // v6: skeleton twin of the real home layout (hero card +
-        // section rows at the same geometry), never a bare
-        // "Loading…" line.
-        val skeleton = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val heroSkel = skelBlock(196, 16)
-        (heroSkel.layoutParams as LinearLayout.LayoutParams).topMargin = dp(16)
-        skeleton.addView(heroSkel)
-        skelSection(skeleton, 4)
-        content.addView(skeleton)
+        val warmToken = if (warmRefresh) ++homeWarmToken else homeWarmToken
+        // Cold builds show the v6 skeleton twin of the real home
+        // layout (hero card + section rows at the same geometry),
+        // never a bare "Loading…" line. Warm refreshes build NO
+        // skeleton: the retained tree stays on screen untouched
+        // until the swap.
+        val skeleton: LinearLayout? = if (warmRefresh) {
+            null
+        } else {
+            beginScreen("Listen Now", showAvatar = true)
+            displayedRootTab = "Home"
+            homeMainDone = false
+            homeMixPending = false
+            val sk = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            val heroSkel = skelBlock(196, 16)
+            (heroSkel.layoutParams as LinearLayout.LayoutParams).topMargin = dp(16)
+            sk.addView(heroSkel)
+            skelSection(sk, 4)
+            content.addView(sk)
+            sk
+        }
         val mode = sourceMode()
         executor.execute {
             val audius = fetch("/tracks/trending?limit=25")
@@ -1458,9 +1495,28 @@ class MainActivity : Activity() {
                 }
             }
             runOnUiThread {
-                if (gen != generation) return@runOnUiThread
-                content.removeView(skeleton)
-                clearSkeletons()
+                if (warmRefresh) {
+                    // SWR swap: only while the warm Home is still
+                    // on screen, and only for the latest refresh.
+                    // The wipe + render happen inside this one
+                    // block, so no blank or skeleton frame exists.
+                    if (warmToken != homeWarmToken || displayedRootTab != "Home") {
+                        return@runOnUiThread
+                    }
+                    retainedRoots["Home"]?.builtAtMs = System.currentTimeMillis()
+                    beginScreen("Listen Now", showAvatar = true)
+                    displayedRootTab = "Home"
+                    homeMixPending = false
+                } else {
+                    if (gen != generation) return@runOnUiThread
+                    if (skeleton != null) content.removeView(skeleton)
+                    clearSkeletons()
+                }
+                // The render below runs to completion inside this
+                // block (UI-thread atomic), so "main done" can be
+                // set now: a tab switch can only be processed after
+                // the render has fully landed.
+                homeMainDone = true
                 var any = false
                 if (audius != null && audius.isNotEmpty()) {
                     tracks.clear()
@@ -1523,6 +1579,7 @@ class MainActivity : Activity() {
                         skelRows(mixBox, 3)
                         content.addView(mixBox)
                         any = true
+                        homeMixPending = true
                         executor.execute {
                             var mix: List<Track>? = null
                             var mixErr: String? = null
@@ -1533,6 +1590,7 @@ class MainActivity : Activity() {
                             }
                             runOnUiThread {
                                 if (gen != generation) return@runOnUiThread
+                                homeMixPending = false
                                 mixBox.removeAllViews()
                                 val m = mix
                                 if (m == null || m.isEmpty()) {
@@ -1620,8 +1678,13 @@ class MainActivity : Activity() {
 
     private fun showSearch() {
         navRoot("tab:search") { showSearch() }
+        // Retention (0.6.1): query text + results survive the tab
+        // switch — the retained tree IS the search screen.
+        if (restoreRoot("Search")) return
+        searchEpoch++
         val gen = ++generation
         beginScreen("Search", showAvatar = true)
+        displayedRootTab = "Search"
         categoryArtViews.clear()
 
         lateinit var resultsBox: LinearLayout
@@ -1631,6 +1694,8 @@ class MainActivity : Activity() {
         fun runSearch(query: String) {
             val q = query.trim()
             if (q.isEmpty()) return
+            searchInFlight = true
+            val myEpoch = searchEpoch
             browseBox.visibility = View.GONE
             resultsBox.visibility = View.VISIBLE
             resultsBox.removeAllViews()
@@ -1700,7 +1765,8 @@ class MainActivity : Activity() {
                     }
                 }
                 runOnUiThread {
-                    if (gen != generation) return@runOnUiThread
+                    searchInFlight = false
+                    if (myEpoch != searchEpoch) return@runOnUiThread
                     resultsBox.removeAllViews()
                     resultsBox.addView(sectionTitle("Results for \"$q\""))
                     val nothing = found.isEmpty() && ytArtists.isEmpty() &&
@@ -2333,6 +2399,7 @@ class MainActivity : Activity() {
                     "Remove all downloaded tracks?", listOf(
                         "Remove all" to {
                             Downloads.removeAll(this@MainActivity)
+                            retainedRoots.remove("Downloads")
                             Toast.makeText(this@MainActivity, "Downloads removed", Toast.LENGTH_SHORT).show()
                             showSettings()
                         },
@@ -2733,6 +2800,8 @@ class MainActivity : Activity() {
 
     private fun showArtist(artistId: String, fallbackName: String? = null, fallbackArt: String? = null) {
         pushNav("artist:$artistId") { showArtist(artistId, fallbackName, fallbackArt) }
+        saveCurrentRoot()
+        searchEpoch++
         val gen = ++generation
         content.removeAllViews()
         addScreenBackArrow()
@@ -2849,6 +2918,8 @@ class MainActivity : Activity() {
 
     private fun showAlbum(ref: YtmAlbumRef) {
         pushNav("album:${ref.id}") { showAlbum(ref) }
+        saveCurrentRoot()
+        searchEpoch++
         val gen = ++generation
         content.removeAllViews()
         addScreenBackArrow()
@@ -3129,6 +3200,8 @@ class MainActivity : Activity() {
      *  album page. */
     private fun showYtmPlaylist(ref: YtmPlaylistRef) {
         pushNav("ytplaylist:${ref.id}") { showYtmPlaylist(ref) }
+        saveCurrentRoot()
+        searchEpoch++
         val gen = ++generation
         visibleScreen = "YtmPlaylist"
         content.removeAllViews()
@@ -3722,6 +3795,10 @@ class MainActivity : Activity() {
             getPreferences(MODE_PRIVATE).getBoolean("fav_${t.id}", false)
 
     private fun toggleFavorite() {
+        // The Library root shows the Liked count: its retained
+        // tree is stale the moment a heart flips.
+        retainedRoots.remove("Library")
+
         val t = current ?: return
         val prefs = getPreferences(MODE_PRIVATE)
         val now = !isFavorite(t)
@@ -4290,6 +4367,59 @@ class MainActivity : Activity() {
         }
     }
 
+    /** Pair key ("<next>><afterNext>") whose after-next warm
+     *  resolve already ran; one warm per pair, re-armed when the
+     *  pair changes. */
+    private var afterNextWarmedFor: String? = null
+
+    /**
+     * Warms the track AFTER next (0.6.1 refinement, Arz: "the next
+     * one queue is already cached"): a bare stream resolution —
+     * no player, no buffering — whose only product is a warm entry
+     * in the resolver's session cache, so a double-skip or the
+     * following transition starts at the ladder's CACHE stage
+     * instead of a cold context walk. Exactly one level deep:
+     * queue-wide caching would burn data and battery on
+     * skip-heavy listening. The prepared NEXT player (which does
+     * buffer its head via prepare()) is [prepareGapless]'s job.
+     */
+    private fun maybeWarmAfterNext() {
+        if (!gaplessOn() || crossfadeSec() > 0) return
+        if (current == null) return
+        val nextIdx = expectedNextIndex() ?: return
+        val pos = currentOrderPos()
+        if (pos < 0 || playOrder.isEmpty()) return
+        val size = playOrder.size
+        val nextPos = if (pos + 1 < size) pos + 1 else 0
+        var afterPos = nextPos + 1
+        if (afterPos >= size) {
+            if (repeatMode != 1) return
+            afterPos = 0
+        }
+        val afterIdx = playOrder[afterPos]
+        if (afterIdx == queueIndex || afterIdx == nextIdx) return
+        val after = queue.getOrNull(afterIdx) ?: return
+        // Only YouTube tracks resolve at all; a downloaded copy
+        // plays instantly and needs no warm cache.
+        if (after.source != SOURCE_YOUTUBE) return
+        if (Downloads.localFile(this, after) != null) return
+        val next = queue.getOrNull(nextIdx) ?: return
+        val pairKey = Downloads.key(next) + ">" + Downloads.key(after)
+        if (afterNextWarmedFor == pairKey) return
+        afterNextWarmedFor = pairKey
+        val quality = effectiveQuality()
+        playerExecutor.execute {
+            val resolved = try {
+                StreamResolver.resolveYoutube(after.id, quality)
+            } catch (e: Exception) {
+                null
+            }
+            if (resolved?.url != null) {
+                StreamResolver.rememberGood(after.id, quality, resolved)
+            }
+        }
+    }
+
     /** Drops any prepared/armed next track. The prepared player is
      *  released (unless it already activated — activation clears
      *  [gaplessPrep] first, so this never kills the live player). */
@@ -4308,7 +4438,10 @@ class MainActivity : Activity() {
      * next stream is pre-resolved on the player executor (YouTube:
      * the one-shot resolver — session cache + context walk +
      * NewPipe, same machinery the foreground ladder walks stage by
-     * stage) and a second player is built and prepared. When the
+     * stage) and a second player is built and PREPARED — ExoPlayer
+     * buffers the stream's head, not merely resolves its URL: a
+     * resolved-but-unprepared stream could still stall the seam.
+     * When the
      * boundary comes within ~1.5s and the prep is READY, a one-shot
      * timer is armed for the exact remaining time.
      *
@@ -4346,7 +4479,12 @@ class MainActivity : Activity() {
             discardGaplessPrep()
         }
         if (gaplessArmingFor == nextKey) return // resolution in flight
-        if (remaining > 32_000) return // arm window opens at ~30s left
+        // Arm window: ~30s out normally; for SHORT tracks (under
+        // ~90s total) arming starts at track start — waiting for
+        // the last 30s of a 60-second song would leave the
+        // resolution + prepare no runway at all.
+        val armWindow = if (dur <= 90_000) Long.MAX_VALUE else 32_000L
+        if (remaining > armWindow) return
         gaplessArmingFor = nextKey
         val localFile = Downloads.localFile(this, next)
         when {
@@ -4380,8 +4518,13 @@ class MainActivity : Activity() {
                     }
                 }
             }
-            else -> // Audius: the track URL streams directly.
-                prepareGapless(next, next.streamUrl, null)
+            else -> // Audius: the canonical stream endpoint, the
+                // same URL play() starts for an Audius track.
+                prepareGapless(
+                    next,
+                    "https://api.audius.co/v1/tracks/${next.id}/stream?app_name=arzxsh",
+                    null
+                )
         }
     }
 
@@ -4519,16 +4662,16 @@ class MainActivity : Activity() {
         current = next
         player = prep.holder
         activePlayerTrack = next
-        trackFullyPlayed = false
-        listenedMs = 0L
-        lastListenTickAt = 0L
         buffering = false
         if (old != null && old !== prep.holder) {
             if (fadeSource === old) fadeSource = null
             old.release()
         }
         prep.holder.play()
-        // Same per-track surface resets a foreground play performs.
+        // Per-track surfaces: refreshPlaybackUi's track-change
+        // branch refetches NP lyrics + ambient for the new track
+        // (the same funnel a foreground play uses); an open lyrics
+        // overlay is re-opened on the new track.
         npLyrics = null
         npLyricsKey = null
         if (::lyricsOverlay.isInitialized && lyricsOverlay.visibility == View.VISIBLE) {
@@ -4537,8 +4680,6 @@ class MainActivity : Activity() {
         }
         npLyricIdx = -2
         lastNpLyricText = null
-        fetchLyricsAsync(next)
-        requestAmbient(next)
         refreshPlaybackUi()
     }
 
@@ -5777,9 +5918,11 @@ class MainActivity : Activity() {
 
     private fun showLibrary() {
         navRoot("tab:library") { showLibrary() }
+        if (restoreRoot("Library")) return
         visibleScreen = "Library"
         generation++
         beginScreen("Library", showAvatar = false)
+        displayedRootTab = "Library"
 
         content.addView(sectionTitle("Playlists"))
         val playlists = Playlists.all(this)
@@ -6425,8 +6568,10 @@ class MainActivity : Activity() {
 
     private fun showDownloads() {
         navRoot("tab:downloads") { showDownloads() }
+        if (restoreRoot("Downloads")) return
         generation++
         beginScreen("Downloads", showAvatar = false)
+        displayedRootTab = "Downloads"
         dlProgressViews.clear()
         val entries = Downloads.entries(this)
         val pending = Downloads.pendingRows(this)
@@ -7280,7 +7425,126 @@ class MainActivity : Activity() {
         content.addView(row)
     }
 
+    // ------------------------------------------------- v6.1: tab-root retention
+
+    /**
+     * A retained tab-root screen: its detached view tree, scroll
+     * position, build time, data fingerprint and visualizer bar
+     * registrations. Retention is BOUNDED by design: at most the
+     * four roots Home / Search / Library / Downloads. Pushed pages
+     * are never retained, and Settings is deliberately excluded —
+     * it has no fetch cost and its switches must always render
+     * live state.
+     */
+    private class RetainedRoot(
+        val children: List<View>,
+        val scrollY: Int,
+        var builtAtMs: Long,
+        val fingerprint: Int,
+        val barSets: List<Array<View>>
+    )
+
+    private val retainedRoots = HashMap<String, RetainedRoot>()
+
+    /** The tab root currently on screen, or null on pushed
+     *  screens, overlays and Settings. */
+    private var displayedRootTab: String? = null
+
+    /** Home is retained only when SETTLED: main render landed and
+     *  no Made-for-You mix fetch still in flight — a retained
+     *  skeleton would be a frozen lie. */
+    private var homeMainDone = false
+    private var homeMixPending = false
+    private var homeWarmToken = 0
+
+    /** Search is retained only when no search is in flight. */
+    private var searchInFlight = false
+
+    /** Incremented whenever a render replaces the content
+     *  (beginScreen) and on every fresh Search build: a search
+     *  completion renders only while its captured epoch is still
+     *  current. Unlike the build-time generation, the epoch is a
+     *  FIELD — searches started from a restored Search screen
+     *  capture the live value and can complete. */
+    private var searchEpoch = 0
+
+    private val homeTtlMs = 30L * 60L * 1000L
+
+    /** Detaches the displayed tab root's tree into the retention
+     *  cache. Called whenever a render is about to replace the
+     *  content (beginScreen + the custom-header screens). */
+    private fun saveCurrentRoot() {
+        val tab = displayedRootTab ?: return
+        displayedRootTab = null
+        val settled = when (tab) {
+            "Home" -> homeMainDone && !homeMixPending
+            "Search" -> !searchInFlight
+            else -> true
+        }
+        if (!settled) {
+            retainedRoots.remove(tab)
+            return
+        }
+        val kids = ArrayList<View>(content.childCount)
+        for (i in 0 until content.childCount) kids.add(content.getChildAt(i))
+        content.removeAllViews()
+        val sv = content.parent as? ScrollView
+        retainedRoots[tab] = RetainedRoot(
+            kids,
+            sv?.scrollY ?: 0,
+            System.currentTimeMillis(),
+            rootFingerprint(tab),
+            ArrayList(visualizerBarSets)
+        )
+    }
+
+    /** Cheap local fingerprints: if the underlying data changed
+     *  while the tab was away, the retained tree is dropped and
+     *  the tab rebuilds. No network involved in any of these. */
+    private fun rootFingerprint(tab: String): Int = when (tab) {
+        "Library" -> {
+            val ps = Playlists.all(this)
+            ps.size * 131 + ps.sumOf { it.tracks.size } * 17 + Favorites.liked(this).size
+        }
+        "Downloads" ->
+            Downloads.entries(this).size * 131 +
+                (Downloads.storageBytes(this) % 100000).toInt()
+        "Search" -> sourceMode().hashCode()
+        else -> 0
+    }
+
+    /** Re-attaches a retained root: instant, no fetch, no
+     *  skeleton. False when there is no usable entry and the
+     *  caller must rebuild. */
+    private fun restoreRoot(tab: String): Boolean {
+        // The outgoing root (if any) is saved first: restore never
+        // destroys a sibling tab's retained tree.
+        saveCurrentRoot()
+        val entry = retainedRoots[tab] ?: return false
+        if (tab == "Downloads" && downloading.isNotEmpty()) return false
+        if (entry.fingerprint != rootFingerprint(tab)) {
+            retainedRoots.remove(tab)
+            return false
+        }
+        generation++
+        content.removeAllViews()
+        entry.children.forEach { content.addView(it) }
+        visualizerBarSets.clear()
+        visualizerBarSets.addAll(entry.barSets)
+        visibleScreen = when (tab) {
+            "Home" -> "Listen Now"
+            else -> tab
+        }
+        val sv = content.parent as? ScrollView
+        val y = entry.scrollY
+        if (sv != null) sv.post { sv.scrollTo(0, y) }
+        displayedRootTab = tab
+        return true
+    }
+
     private fun beginScreen(title: String, showAvatar: Boolean) {
+        saveCurrentRoot()
+        searchEpoch++
         visibleScreen = title
         visualizerBarSets.clear()
         clearSkeletons()
