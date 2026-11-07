@@ -580,6 +580,33 @@ class MainActivity : Activity() {
     private var seeking = false
     private var generation = 0
     private var playToken = 0
+
+    /** Process-ownership id (0.6.3, WS-D Bug A): claimed first
+     *  thing in onCreate from [PlayerRegistry]. Every player this
+     *  instance creates registers its release against it, and the
+     *  async playback entry points refuse to run for a stale id —
+     *  a dead instance can neither keep nor mint a player. */
+    private var instanceId = 0
+
+    /** This instance's bridge controls, identity-kept so a stale
+     *  instance's onDestroy never unregisters a NEWER instance's
+     *  controls from under it. */
+    private var myControls: PlaybackBridge.Controls? = null
+
+    /** A stop/pause intent that arrived while a tap-to-play was
+     *  still resolving (0.6.3, WS-C): the pending start consumes
+     *  it and lands prepared-and-paused instead of autoplaying
+     *  against the user's explicit stop. Cleared by the next
+     *  explicit play() and consumed by startPlaybackInternal. */
+    @Volatile
+    private var suppressAutoPlay = false
+
+    /** Set by stopPlayback (0.6.3): while stopped, the bridge
+     *  stays silent — refreshPlaybackUi must not re-push a paused
+     *  snapshot and resurrect the notification the stop just
+     *  ended. Cleared by the next real start. */
+    @Volatile
+    private var bridgeMuted = false
     private var activeTab = "Home"
     private var shuffleOn = false
     private var repeatMode = 0 // 0 = off, 1 = all, 2 = one
@@ -933,6 +960,16 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 0.6.3 (WS-D Bug A — the zombie player): before anything
+        // else, take process ownership of playback. The claim
+        // releases EVERY player a previous instance of this
+        // activity left behind — its onDestroy is not guaranteed
+        // to run before the process is reused, and the pre-0.6.3
+        // teardown never released the fade-out source at all —
+        // and the dead owner's bridge snapshot is dropped so the
+        // service stops mirroring a ghost in the shade.
+        instanceId = PlayerRegistry.claim()
+        PlaybackBridge.clearState()
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         recentTracks.addAll(loadRecents())
         // Last-good Innertube client memory persists on disk so the
@@ -950,12 +987,15 @@ class MainActivity : Activity() {
         // — the very same functions the mini player uses. The
         // engine stays here in the activity; the service only
         // renders state (see PlaybackService).
-        PlaybackBridge.controls = PlaybackBridge.Controls(
+        val controls = PlaybackBridge.Controls(
             toggle = { togglePlayback() },
             next = { playNext() },
             prev = { playPrevious() },
-            seekTo = { ms -> player?.seekTo(ms) }
+            seekTo = { ms -> player?.seekTo(ms) },
+            stop = { stopPlayback() }
         )
+        myControls = controls
+        PlaybackBridge.controls = controls
         showShell()
         showHome()
         handler.post(ticker)
@@ -3929,6 +3969,10 @@ class MainActivity : Activity() {
     // ---------------------------------------------------------------- playback wiring (engine unchanged)
 
     private fun play(track: Track) {
+        // An explicit new play is a fresh intent: any stop/pause
+        // recorded against an EARLIER resolution (0.6.3, WS-C)
+        // must not leak into this one and mute it.
+        suppressAutoPlay = false
         // A foreground play supersedes any gapless prep for the old
         // track's boundary (manual skip, row tap, error advance):
         // the prepared next is stale the moment this runs.
@@ -4239,6 +4283,15 @@ class MainActivity : Activity() {
         userAgent: String?,
         resolved: StreamResolver.Resolved?
     ) {
+        // 0.6.3 (WS-D Bug A): a resolution that outlived its
+        // activity instance must never build a player here. This
+        // was the zombie mint: teardown released the old player,
+        // then the late completion ran in the DEAD instance,
+        // built a fresh ExoPlayer and pressed play — audio with
+        // no live UI owning it and no notification controlling
+        // it (the service had already been stopped).
+        if (!PlayerRegistry.isOwner(instanceId)) return
+        bridgeMuted = false
         val old = player
         val forTrack = current
         val sessionToken = playToken
@@ -4259,6 +4312,10 @@ class MainActivity : Activity() {
             .build()
         val holder = EnginePlayer(exo)
         player = holder
+        // 0.6.3: this player belongs to the process registry —
+        // a future instance's claim or this instance's teardown
+        // releases it even if every other path forgets it.
+        PlayerRegistry.register(instanceId) { holder.release() }
         activePlayerTrack = forTrack
         // 0.6.1 (background playback): keep the network/CPU path
         // awake while streaming, so a screen-off phone does not
@@ -4323,7 +4380,14 @@ class MainActivity : Activity() {
         try {
             exo.setMediaItem(item)
             exo.prepare()
-            exo.play()
+            if (suppressAutoPlay) {
+                // Stopped or paused mid-resolution (0.6.3, WS-C):
+                // the start lands PREPARED AND SILENT — the
+                // user's stop is never overridden by a late READY.
+                suppressAutoPlay = false
+            } else {
+                exo.play()
+            }
         } catch (e: Exception) {
             showPlaybackError("Player error: ${shortErr(e)}")
             refreshPlaybackUi()
@@ -4635,6 +4699,9 @@ class MainActivity : Activity() {
      *  Its listener only marks readiness until activation; after
      *  activation it behaves like a normal player listener. */
     private fun prepareGapless(next: Track, uriString: String, resolved: StreamResolver.Resolved?) {
+        // 0.6.3 (WS-D): a dead instance arms nothing — an armed
+        // prep in a ghost instance is a player waiting to fire.
+        if (!PlayerRegistry.isOwner(instanceId)) return
         // Construction mirrors startPlaybackInternal EXACTLY (the
         // matched-UA HTTP factory is the v5.1 playback fix; a prep
         // built any other way would be rejected by googlevideo):
@@ -4659,6 +4726,10 @@ class MainActivity : Activity() {
         )
         exo.setWakeMode(C.WAKE_MODE_NETWORK)
         val holder = EnginePlayer(exo)
+        // 0.6.3: registered like every player — a claim or
+        // teardown releases an armed prep instead of leaving a
+        // prepared player behind in a dead instance.
+        PlayerRegistry.register(instanceId) { holder.release() }
         val prep = GaplessPrep(next, holder, resolved)
         gaplessPrep = prep
         val listener = object : Player.Listener {
@@ -5065,13 +5136,47 @@ class MainActivity : Activity() {
         // A tap mid-crossfade settles the fade instantly, so pause /
         // resume always acts on ONE player at full volume.
         if (outPlayer != null) finishCrossfadeNow()
-        val active = player ?: return
+        val active = player
+        if (active == null) {
+            // 0.6.3 (WS-C): a pause/stop intent while a tap-to-play
+            // is still RESOLVING used to evaporate here, and the
+            // track then autoplayed on READY against the user's
+            // explicit pause ("after stopping it doesnt stop").
+            // The intent is now recorded; the pending start
+            // consumes it and lands paused.
+            if (buffering || current != null) suppressAutoPlay = true
+            return
+        }
+        if (active.retired) {
+            // This instance lost process ownership earlier (a
+            // newer instance claimed it and the registry released
+            // this player): restart the track honestly through
+            // the normal play path instead of poking a corpse.
+            val t = current
+            if (t != null) play(t)
+            return
+        }
         if (active.isPlaying) {
             active.pause()
+            // A pause DISARMS the gapless boundary timer (0.6.3,
+            // WS-C): fireGapless's own isPlaying revalidation is
+            // the second lock; this is the first, so a paused
+            // player can never be swapped out from under the user.
+            gaplessFire?.let { handler.removeCallbacks(it) }
+            gaplessFire = null
         } else {
             // ExoPlayer play() at the ENDED state is a no-op (unlike
             // MediaPlayer's start(), which restarted): rewind first.
             if (active.isEnded) active.seekTo(0)
+            if (bridgeMuted) {
+                // Resuming after an explicit stop (0.6.3): the
+                // service + bridge mirror restart WITH the audio —
+                // never one without the other (WS-D Bug B's rule).
+                bridgeMuted = false
+                lastPushedTrackKey = null
+                lastPushedPlaying = null
+                PlaybackService.start(this)
+            }
             active.play()
         }
         // Small scale pop on the glyph swap (spec §13.4), transform-only.
@@ -5082,6 +5187,47 @@ class MainActivity : Activity() {
                 }
                 .start()
         }
+        refreshPlaybackUi()
+    }
+
+    /**
+     * The one conclusive STOP (0.6.3, WS-C + WS-D). Media-session
+     * stop, the service's ACTION_STOP and any future stop surface
+     * all land here. End state, every time: no player playing, no
+     * armed gapless prep able to fire, no pending resolution able
+     * to start, the bridge snapshot cleared and the service ended
+     * — audio and its controlling notification live and die
+     * together, never one without the other.
+     */
+    private fun stopPlayback() {
+        if (outPlayer != null) finishCrossfadeNow()
+        // Disarm the boundary: prep released, fire timer removed.
+        discardGaplessPrep()
+        gaplessFire?.let { handler.removeCallbacks(it) }
+        gaplessFire = null
+        // A stop while a NEW track is still resolving: the retired
+        // outgoing player (audible during the fade window) dies
+        // too, and the pending start is cancelled outright.
+        fadeSource?.let { src ->
+            src.pause()
+            src.release()
+        }
+        fadeSource = null
+        val p = player
+        if (p != null) {
+            p.pause()
+        } else if (buffering || current != null) {
+            // Nothing built yet: cancel the pending start so the
+            // late READY cannot autoplay (same rule as the
+            // mid-resolution pause in togglePlayback).
+            suppressAutoPlay = true
+            playToken++
+        }
+        lastPushedTrackKey = null
+        lastPushedPlaying = null
+        bridgeMuted = true
+        PlaybackBridge.clearState()
+        PlaybackService.stop(this)
         refreshPlaybackUi()
     }
 
@@ -5173,6 +5319,14 @@ class MainActivity : Activity() {
     private var notifPermRequested = false
 
     private fun pushPlaybackState() {
+        // A stale instance never writes the bridge (0.6.3, WS-D):
+        // its snapshots are how a ghost track kept rendering as
+        // PLAYING in the shade over the live "Nothing playing".
+        if (!PlayerRegistry.isOwner(instanceId)) return
+        // Nor does a stopped one (WS-C): the stop cleared the
+        // bridge on purpose; nothing re-renders until a real
+        // start un-mutes it.
+        if (bridgeMuted) return
         val t = current ?: return
         val playing = isPlayingSafe()
         val key = Downloads.key(t)
@@ -5894,6 +6048,11 @@ class MainActivity : Activity() {
      *  (spec §6), instead of hard-cutting. A crossfade's outgoing
      *  player is silenced and released too — sleep wins over fade. */
     private fun fadeOutAndPause() {
+        // The boundary timer must never fire mid-fade (0.6.3,
+        // WS-C): the player is still AUDIBLE for the ~2s fade,
+        // and an armed prep swapping in would land at full
+        // volume against the sleep timer's whole point.
+        discardGaplessPrep()
         val p = player ?: return
         val out = outPlayer
         if (out != null) {
@@ -7731,19 +7890,42 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        // Invalidate in-flight playback work FIRST (0.6.3, WS-D
+        // Bug A): resolution completions and ladder steps check
+        // playToken, and after this bump none of them may build
+        // or start a player inside this dying instance.
+        playToken++
+        suppressAutoPlay = true
         handler.removeCallbacks(ticker)
         handler.removeCallbacks(lyricsTicker)
         visualizerAnimator?.cancel()
         flushListened()
         handler.removeCallbacks(crossfadeTick)
-        outPlayer?.release()
-        player?.release()
-        // The engine dies with the activity, so the playback
-        // service (its notification + session) ends too.
+        handler.removeCallbacks(sleepFire)
         discardGaplessPrep()
         stopLiveViz()
-        PlaybackBridge.controls = null
-        PlaybackService.stop(this)
+        // Release EVERY player this instance created — the main
+        // player, the crossfade partner, the ARMED GAPLESS PREP
+        // and the fade-out source — through the process registry.
+        // The pre-0.6.3 teardown released the first two by hand
+        // and never touched fadeSource at all; the registry list
+        // is written at creation time, so nothing can be missed.
+        PlayerRegistry.releaseOwner(instanceId)
+        outPlayer = null
+        player = null
+        fadeSource = null
+        // End the bridge + service ONLY if they are still mine:
+        // when a newer instance has already claimed the process,
+        // its controls and its service are not mine to kill (a
+        // stale destroy unplugging the live instance was the
+        // other half of the split-brain).
+        if (myControls != null && PlaybackBridge.controls === myControls) {
+            PlaybackBridge.controls = null
+        }
+        if (PlayerRegistry.isOwner(instanceId)) {
+            PlaybackBridge.clearState()
+            PlaybackService.stop(this)
+        }
         executor.shutdownNow()
         playerExecutor.shutdownNow()
         lyricsExecutor.shutdownNow()

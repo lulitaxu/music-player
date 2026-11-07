@@ -36,7 +36,13 @@ object PlaybackBridge {
         val toggle: () -> Unit,
         val next: () -> Unit,
         val prev: () -> Unit,
-        val seekTo: (Long) -> Unit
+        val seekTo: (Long) -> Unit,
+        /** The conclusive stop (0.6.3): pause + disarm every
+         *  pending start + end the service. Media-session stop,
+         *  notification stop actions and swipe paths land here —
+         *  before 0.6.3 they stopped the SERVICE only and the
+         *  player played on (WS-D Bug B: audio with no card). */
+        val stop: () -> Unit
     )
 
     data class State(
@@ -65,6 +71,76 @@ object PlaybackBridge {
     fun push(s: State) {
         state = s
         listener?.invoke()
+    }
+
+    /** Drops the snapshot entirely (0.6.3): the service renders
+     *  NOTHING for a null state and ends itself — a dead owner's
+     *  last frame must never linger in the shade as if it were
+     *  live (WS-D Bug A: card showed the old track PLAYING while
+     *  the live UI said "Nothing playing"). */
+    fun clearState() {
+        state = null
+        listener?.invoke()
+    }
+}
+
+/**
+ * Process-level player ownership (0.6.3, WS-D Bug A — the zombie
+ * player). The engine lives in MainActivity, and MainActivity has
+ * NO single-instance guarantee (standard launchMode, no
+ * configChanges shield): instances can be recreated or stacked,
+ * and Android does not guarantee onDestroy runs before the
+ * process is reused. In 0.6.2 each instance built its own
+ * ExoPlayers and nothing connected them, so a player created by
+ * (or left behind by) a dead instance could keep — or start —
+ * playing audio the live UI did not own, next to the live
+ * instance's own player.
+ *
+ * The registry makes ownership singular and enforced at CREATION
+ * time, not just at teardown:
+ *  - [claim] runs first in every new instance's onCreate and
+ *    releases EVERY player any previous instance registered —
+ *    including the ones onDestroy never covered (the fade-out
+ *    source) or never got to run for.
+ *  - [register] attaches each new player's release to the
+ *    current owner; registering for a stale owner releases the
+ *    player immediately, so a late async completion in a dead
+ *    instance cannot mint a zombie.
+ *  - [releaseOwner] is the owner's own teardown path.
+ * All calls happen on the main thread (ExoPlayer's contract);
+ * the synchronization is belt-and-braces only.
+ */
+object PlayerRegistry {
+    private var currentOwner = 0
+    private val releases = ArrayList<() -> Unit>()
+
+    @Synchronized
+    fun claim(): Int {
+        val stale = releases.toList()
+        releases.clear()
+        currentOwner += 1
+        stale.forEach { try { it() } catch (_: Exception) {} }
+        return currentOwner
+    }
+
+    @Synchronized
+    fun register(owner: Int, release: () -> Unit) {
+        if (owner != currentOwner || owner == 0) {
+            try { release() } catch (_: Exception) {}
+            return
+        }
+        releases.add(release)
+    }
+
+    @Synchronized
+    fun isOwner(owner: Int): Boolean = owner == currentOwner && owner != 0
+
+    @Synchronized
+    fun releaseOwner(owner: Int) {
+        if (owner != currentOwner) return
+        val mine = releases.toList()
+        releases.clear()
+        mine.forEach { try { it() } catch (_: Exception) {} }
     }
 }
 
@@ -97,6 +173,13 @@ class PlaybackService : Service() {
      *  shared loader only when the track changes. */
     @Volatile
     private var artBitmap: Bitmap? = null
+
+    /** True once a real snapshot has been rendered: distinguishes
+     *  the transient null of the first-play race (the service is
+     *  started a beat before the first push; the foreground call
+     *  is still owed within ~5s) from the owner clearing its
+     *  state for good, which ends the service. */
+    private var renderedStateOnce = false
     @Volatile
     private var artForKey: String? = null
 
@@ -135,6 +218,15 @@ class PlaybackService : Service() {
             override fun onSeekTo(pos: Long) {
                 PlaybackBridge.controls?.seekTo?.invoke(pos)
             }
+
+            /** System stop (0.6.3): headsets, watches and the
+             *  system's own media UI send this when playback
+             *  should END. 0.6.2 had no override — a no-op — so a
+             *  system stop left the player playing. It routes to
+             *  the same conclusive stop as every other path. */
+            override fun onStop() {
+                PlaybackBridge.controls?.stop?.invoke()
+            }
         })
         session.isActive = true
         PlaybackBridge.listener = { render() }
@@ -147,10 +239,26 @@ class PlaybackService : Service() {
             ACTION_NEXT -> PlaybackBridge.controls?.next?.invoke()
             ACTION_PREV -> PlaybackBridge.controls?.prev?.invoke()
             ACTION_STOP -> {
+                // 0.6.3 (WS-C/WS-D): STOP means the PLAYBACK
+                // stops, not just the service. The activity's
+                // conclusive stop runs first (it ends this
+                // service itself); the lines below are the
+                // backstop for when no live owner exists.
+                PlaybackBridge.controls?.stop?.invoke()
                 stopForeground(true)
                 stopSelf()
                 return START_NOT_STICKY
             }
+        }
+        if (PlaybackBridge.controls == null && intent?.action != null) {
+            // A transport action arrived with no live activity
+            // owning playback (the owner died without its
+            // teardown reaching us): there is nothing legitimate
+            // left to control — end the service rather than
+            // re-foregrounding a stale snapshot.
+            stopForeground(true)
+            stopSelf()
+            return START_NOT_STICKY
         }
         // (Re)assert the foreground state with the latest snapshot:
         // startForegroundService demands this within ~5 seconds.
@@ -175,7 +283,18 @@ class PlaybackService : Service() {
     private fun render() {
         if (destroyed) return
         val s = PlaybackBridge.state
+        if (s == null && renderedStateOnce) {
+            // The owner cleared its snapshot (it stopped, or a
+            // new instance claimed the process): no live player
+            // exists to mirror, so the service ends instead of
+            // lingering on a dead frame (WS-D Bug B: the shade
+            // card must never outlive the playback it controls).
+            stopForeground(true)
+            stopSelf()
+            return
+        }
         if (s != null) {
+            renderedStateOnce = true
             session.setMetadata(
                 MediaMetadata.Builder()
                     .putString(MediaMetadata.METADATA_KEY_TITLE, s.title)
@@ -188,7 +307,8 @@ class PlaybackService : Service() {
             )
             val actions = PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or
                 PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_SKIP_TO_NEXT or
-                PlaybackState.ACTION_SKIP_TO_PREVIOUS or PlaybackState.ACTION_SEEK_TO
+                PlaybackState.ACTION_SKIP_TO_PREVIOUS or PlaybackState.ACTION_SEEK_TO or
+                PlaybackState.ACTION_STOP
             session.setPlaybackState(
                 PlaybackState.Builder()
                     .setActions(actions)
