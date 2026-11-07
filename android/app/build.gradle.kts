@@ -66,6 +66,12 @@ kotlin {
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
+    // RecyclerView (0.6.3, audit S1): the queue overlay is the
+    // one list that owns its viewport, so it gets true view
+    // recycling. (Shell screens live inside one big ScrollView
+    // where an expanded RecyclerView would bind every row
+    // anyway — see the 0.6.3 notes in MainActivity.addRows.)
+    implementation("androidx.recyclerview:recyclerview:1.3.2")
     // Media3 ExoPlayer: googlevideo stream URLs are bound to the
     // client that requested them, so playback must send the SAME
     // User-Agent as the Innertube context that produced the URL.
