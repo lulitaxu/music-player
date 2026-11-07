@@ -4,8 +4,10 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.InterruptedIOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.Executors
 
 /**
  * Offline download store: audio files in the app's private files dir
@@ -35,6 +37,207 @@ object Downloads {
 
     /** Thrown by [downloadSync] when the caller's stop flag fires. */
     class StoppedException : RuntimeException("stopped")
+
+    // ------------------------------------------------------------ download manager (0.6.3, WS-D Bug D)
+
+    /**
+     * Downloads run HERE, on a process-lifetime executor owned by
+     * this store object — NEVER on an activity executor. 0.6.2 ran
+     * transfers on MainActivity's shared executor, whose
+     * shutdownNow() in onDestroy INTERRUPTED the transfer thread
+     * mid-stream: the field failure was a toast reading
+     * "Download failed: InterruptedIOException: Thread
+     * interrupted", and the download died with the screen. This
+     * executor is never shut down; activity death cannot touch a
+     * transfer, and neither can a second instance's lifecycle.
+     */
+    private val dlExecutor = Executors.newSingleThreadExecutor()
+
+    /** Keys with a transfer running or queued on [dlExecutor]. */
+    private val activeKeys = HashSet<String>()
+
+    /** Pending stop intents per key: "pause" / "remove". Polled by
+     *  the transfer loop (the StoppedException path), exactly as
+     *  the activity-side map was — it just lives at process level
+     *  now, next to the transfers it controls. */
+    private val stopModes = HashMap<String, String>()
+
+    /**
+     * UI event sink, registered by the live activity: (trackKey,
+     * event) with event in "progress" / "done" / "paused" /
+     * "removed" / "failed". Invoked from the download thread; the
+     * activity hops to the UI thread itself. Null when no UI is
+     * alive — the vault states remain the source of truth and the
+     * Downloads screen renders them on next open.
+     */
+    @Volatile
+    var uiListener: ((String, String) -> Unit)? = null
+
+    private fun notifyUi(key: String, event: String) {
+        try {
+            uiListener?.invoke(key, event)
+        } catch (_: Exception) {
+        }
+    }
+
+    @Synchronized
+    fun isActive(track: Track): Boolean = activeKeys.contains(key(track))
+
+    @Synchronized
+    fun anyActive(): Boolean = activeKeys.isNotEmpty()
+
+    /** Human failure text for the Downloads row. The raw exception
+     *  NEVER reaches the UI (0.6.2 toasted it verbatim). */
+    private fun humanError(t: Throwable): String {
+        val msg = t.message ?: ""
+        return when {
+            msg.startsWith("HTTP ") -> "Server error ($msg) — try again later"
+            msg.contains("stream resolution failed") ->
+                "Couldn't resolve the stream — try again"
+            t is java.net.UnknownHostException || t is java.net.ConnectException ||
+                t is java.net.SocketTimeoutException || t is java.net.SocketException ->
+                "Network error — check your connection and tap Retry"
+            else -> "Download failed — tap Retry"
+        }
+    }
+
+    /**
+     * Starts (or queues) a download. All state writes, progress
+     * and completion handling happen on [dlExecutor]; returns
+     * immediately. Re-starting an already-active key is a no-op.
+     */
+    fun start(ctx: Context, track: Track, quality: String) {
+        val appCtx = ctx.applicationContext
+        val key = key(track)
+        synchronized(this) {
+            if (!activeKeys.add(key)) return
+            stopModes.remove(key)
+            setStatus(
+                appCtx, track,
+                if (activeKeys.size > 1) ST_QUEUED else ST_DOWNLOADING, 0
+            )
+        }
+        notifyUi(key, "progress")
+        dlExecutor.execute {
+            var lastPct = 0
+            var err: Throwable? = null
+            var interrupted = false
+            var stopped = false
+            setStatus(appCtx, track, ST_DOWNLOADING, 0)
+            notifyUi(key, "progress")
+            try {
+                downloadSync(
+                    appCtx, track, quality,
+                    shouldContinue = { synchronized(this) { !stopModes.containsKey(key) } },
+                    onProgress = { pct ->
+                        lastPct = pct
+                        if (pct % 10 == 0) {
+                            setStatus(appCtx, track, ST_DOWNLOADING, pct)
+                            notifyUi(key, "progress")
+                        }
+                    }
+                )
+            } catch (e: StoppedException) {
+                stopped = true
+            } catch (e: InterruptedIOException) {
+                interrupted = true
+            } catch (e: InterruptedException) {
+                interrupted = true
+            } catch (t: Throwable) {
+                // An interrupt surfacing in another wrapper still
+                // means "interrupted", never "failed".
+                if (t.cause is InterruptedIOException || t.cause is InterruptedException) {
+                    interrupted = true
+                } else {
+                    err = t
+                }
+            }
+            val mode: String?
+            synchronized(this) {
+                activeKeys.remove(key)
+                mode = stopModes.remove(key)
+            }
+            when {
+                stopped && mode == "pause" -> {
+                    setStatus(appCtx, track, ST_PAUSED, lastPct)
+                    notifyUi(key, "paused")
+                }
+                stopped -> {
+                    clearStatus(appCtx, key)
+                    notifyUi(key, "removed")
+                }
+                interrupted -> {
+                    // Survival rule: an interruption is a PAUSE
+                    // with its progress kept, resumable from the
+                    // Downloads row — never a raw failure.
+                    setStatus(appCtx, track, ST_PAUSED, lastPct)
+                    notifyUi(key, "paused")
+                }
+                err != null -> {
+                    setStatus(appCtx, track, ST_FAILED, lastPct, humanError(err))
+                    notifyUi(key, "failed")
+                }
+                else -> notifyUi(key, "done")
+            }
+        }
+    }
+
+    /** Pause: an in-flight transfer stops at its next chunk check
+     *  and lands as [ST_PAUSED]; an idle row is re-labeled now. */
+    fun pause(ctx: Context, track: Track) {
+        val key = key(track)
+        val active = synchronized(this) {
+            if (activeKeys.contains(key)) {
+                stopModes[key] = "pause"
+                true
+            } else {
+                false
+            }
+        }
+        if (!active) {
+            setStatus(ctx, track, ST_PAUSED, statusOf(ctx, track)?.progress ?: 0)
+            notifyUi(key, "paused")
+        }
+    }
+
+    /** Remove: an in-flight transfer aborts and its row is
+     *  dropped on completion; an idle row is dropped now. */
+    fun removePending(ctx: Context, track: Track) {
+        val key = key(track)
+        val active = synchronized(this) {
+            if (activeKeys.contains(key)) {
+                stopModes[key] = "remove"
+                true
+            } else {
+                false
+            }
+        }
+        if (!active) {
+            clearStatus(ctx, key)
+            notifyUi(key, "removed")
+        }
+    }
+
+    /**
+     * Startup survival (0.6.3): transfers left at queued /
+     * downloading by a dead process RESUME automatically instead
+     * of being stamped failed. (A user-paused row is a different
+     * persisted state and is never auto-resumed.) Orphaned .part
+     * files are cleaned first — a resumed transfer restarts from
+     * zero, as the row copy already states.
+     */
+    fun resumeInterruptedAsync(ctx: Context, quality: String) {
+        val appCtx = ctx.applicationContext
+        dlExecutor.execute {
+            dir(appCtx).listFiles()?.forEach { if (it.name.endsWith(".part")) it.delete() }
+            val tracks = statusTrackMap(appCtx)
+            statusMap(appCtx).forEach { (k, s) ->
+                if (s.state == ST_QUEUED || s.state == ST_DOWNLOADING) {
+                    tracks[k]?.let { start(appCtx, it, quality) }
+                }
+            }
+        }
+    }
 
     private const val PREFS = "arzxsh_downloads"
 
@@ -315,25 +518,6 @@ object Downloads {
                     else -> 3
                 }
             }
-    }
-
-    /**
-     * Startup reconciliation: a state left at queued/downloading by
-     * a dead process means the transfer was interrupted. Mark it
-     * failed with the reason — never let it pose as in-progress or
-     * (worse) downloaded.
-     */
-    fun reconcileOnStart(ctx: Context) {
-        val tracks = statusTrackMap(ctx)
-        statusMap(ctx).forEach { (k, s) ->
-            if (s.state == ST_QUEUED || s.state == ST_DOWNLOADING) {
-                tracks[k]?.let { t ->
-                    setStatus(ctx, t, ST_FAILED, s.progress, "Interrupted before it finished")
-                }
-            }
-        }
-        // Orphaned partial files from a killed process.
-        dir(ctx).listFiles()?.forEach { if (it.name.endsWith(".part")) it.delete() }
     }
 
     private fun writeAll(ctx: Context, list: List<Entry>) {

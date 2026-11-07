@@ -611,7 +611,6 @@ class MainActivity : Activity() {
     private var shuffleOn = false
     private var repeatMode = 0 // 0 = off, 1 = all, 2 = one
     private var playOrder: List<Int> = emptyList()
-    private val downloading = mutableSetOf<String>()
     private var sleepDeadline = 0L
 
     private lateinit var npShuffleBtn: ImageView
@@ -699,10 +698,16 @@ class MainActivity : Activity() {
     private var lastSleepLabel = ""
 
     // ---- v5: downloads vault glue ----
-    /** key -> "pause" | "remove": how an in-flight download should end. */
-    private val dlStopModes = mutableMapOf<String, String>()
+    // (0.6.3: the in-flight set + stop modes moved INTO the
+    // Downloads store, next to the process-lifetime executor that
+    // runs the transfers — see Downloads.start. What stays here
+    // is purely view state:)
     /** Progress views of the visible Downloads rows, by track key. */
     private val dlProgressViews = mutableMapOf<String, Pair<ProgressBar, TextView>>()
+    /** This instance's downloads UI listener, identity-kept so a
+     *  stale instance's onDestroy never unregisters a newer
+     *  instance's listener (same rule as myControls). */
+    private var myDlListener: ((String, String) -> Unit)? = null
 
     // ---- v5: listening stats accumulation ----
     private var sessionListenedMs = 0L
@@ -975,9 +980,15 @@ class MainActivity : Activity() {
         // Last-good Innertube client memory persists on disk so the
         // stream resolver tries the working context first.
         YtmApi.initStore(this)
-        // Any download left "downloading" by a dead process was in
-        // fact interrupted: the vault says so, on the record.
-        Downloads.reconcileOnStart(this)
+        // Downloads live at process level now (0.6.3, WS-D Bug
+        // D): this instance just lends the manager its UI ears,
+        // and anything a dead process left mid-transfer RESUMES
+        // on the manager's own executor instead of being stamped
+        // failed (the old reconcileOnStart behavior).
+        val dlListener: (String, String) -> Unit = { key, event -> onDownloadEvent(key, event) }
+        myDlListener = dlListener
+        Downloads.uiListener = dlListener
+        Downloads.resumeInterruptedAsync(this, effectiveQuality())
         backfillFavorites()
         loadAccentPref()
         window.statusBarColor = bgColor
@@ -2748,7 +2759,7 @@ class MainActivity : Activity() {
             // Playing indicator only while actually playing — the same
             // single source of truth as the mini player.
             row.addView(visualizer())
-        } else if (downloading.contains(Downloads.key(track))) {
+        } else if (Downloads.isActive(track)) {
             // In-flight download: a spinner stands in for the ⋯ menu
             // (the menu stays reachable by long-press). Static at
             // render time; the Downloads tab carries live progress.
@@ -6727,7 +6738,7 @@ class MainActivity : Activity() {
     private fun refreshDownloadButton() {
         if (!::npDownloadBtn.isInitialized) return
         val t = current ?: return
-        val busy = downloading.contains(Downloads.key(t))
+        val busy = Downloads.isActive(t)
         if (::npDownloadProgress.isInitialized) {
             npDownloadProgress.visibility = if (busy) View.VISIBLE else View.GONE
         }
@@ -6763,103 +6774,80 @@ class MainActivity : Activity() {
             Toast.makeText(this, "Already downloaded", Toast.LENGTH_SHORT).show()
             return
         }
-        val key = Downloads.key(track)
-        if (!downloading.add(key)) return
-        dlStopModes.remove(key)
-        // The executor is single-threaded: a second start waits its
-        // turn and is honestly labeled Queued until it really runs.
-        Downloads.setStatus(
-            this, track,
-            if (downloading.size > 1) Downloads.ST_QUEUED else Downloads.ST_DOWNLOADING, 0
-        )
+        // 0.6.3 (WS-D Bug D): the transfer runs on the Downloads
+        // store's own process-lifetime executor. 0.6.2 ran it on
+        // THIS activity's executor, whose shutdownNow() in
+        // onDestroy interrupted the transfer thread mid-stream —
+        // the field report's "Download failed:
+        // InterruptedIOException: Thread interrupted" toast, and
+        // a download that died whenever the screen did. Leaving,
+        // recreating or stacking activities cannot touch it now;
+        // events come back through onDownloadEvent.
+        Downloads.start(this, track, effectiveQuality())
         refreshDownloadButton()
         if (visibleScreen == "Downloads") showDownloads()
-        Toast.makeText(this, "Downloading ${track.title}…", Toast.LENGTH_SHORT).show()
-        val quality = effectiveQuality()
-        executor.execute {
-            var lastPct = 0
-            var err: String? = null
-            var stopped = false
-            Downloads.setStatus(this@MainActivity, track, Downloads.ST_DOWNLOADING, 0)
-            try {
-                Downloads.downloadSync(
-                    this@MainActivity, track, quality,
-                    shouldContinue = { !dlStopModes.containsKey(key) },
-                    onProgress = { pct ->
-                        lastPct = pct
-                        if (pct % 10 == 0) {
-                            Downloads.setStatus(
-                                this@MainActivity, track, Downloads.ST_DOWNLOADING, pct
-                            )
-                        }
-                        runOnUiThread {
-                            dlProgressViews[key]?.let { (bar, tv) ->
-                                bar.isIndeterminate = pct <= 0
-                                if (pct > 0) bar.progress = pct
-                                tv.text = "Downloading · $pct%"
-                            }
-                        }
-                    }
-                )
-            } catch (e: Downloads.StoppedException) {
-                stopped = true
-            } catch (e: Throwable) {
-                err = shortErr(e)
-            }
-            runOnUiThread {
-                downloading.remove(key)
-                val mode = dlStopModes.remove(key)
-                when {
-                    stopped && mode == "pause" -> {
-                        // Pause keeps the state row (and its percent);
-                        // the partial file is gone — resume restarts
-                        // from zero, and the row says so.
-                        Downloads.setStatus(this@MainActivity, track, Downloads.ST_PAUSED, lastPct)
-                        Toast.makeText(this@MainActivity, "Paused: ${track.title}", Toast.LENGTH_SHORT).show()
-                    }
-                    stopped -> {
-                        Downloads.clearStatus(this@MainActivity, key)
-                        Toast.makeText(this@MainActivity, "Download removed", Toast.LENGTH_SHORT).show()
-                    }
-                    err != null -> {
-                        Downloads.setStatus(this@MainActivity, track, Downloads.ST_FAILED, lastPct, err)
-                        Toast.makeText(this@MainActivity, "Download failed: $err", Toast.LENGTH_LONG).show()
-                    }
-                    else -> {
-                        Toast.makeText(this@MainActivity, "Downloaded: ${track.title}", Toast.LENGTH_SHORT).show()
-                    }
+        Toast.makeText(this, "Downloading ${track.title}\u2026", Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * Download events from the process-level manager (0.6.3):
+     * fired on the download thread; everything here hops to the
+     * UI thread and re-reads the vault, so rows and buttons
+     * always render the store's state, never a cached copy. The
+     * failure toast is human — the row carries the reason; the
+     * raw exception never reaches the screen.
+     */
+    private fun onDownloadEvent(key: String, event: String) {
+        runOnUiThread {
+            if (isFinishing || isDestroyed) return@runOnUiThread
+            val pending = Downloads.pendingRows(this@MainActivity)
+                .firstOrNull { Downloads.key(it.first) == key }
+            if (event == "progress") {
+                val st = pending?.second
+                dlProgressViews[key]?.let { (bar, tv) ->
+                    val pct = st?.progress ?: 0
+                    bar.isIndeterminate = pct <= 0
+                    if (pct > 0) bar.progress = pct
+                    tv.text = "Downloading \u00b7 $pct%"
                 }
-                refreshPlaybackUi()
-                if (visibleScreen == "Downloads") showDownloads()
+                refreshDownloadButton()
+                return@runOnUiThread
             }
+            val entry = Downloads.entries(this).firstOrNull { Downloads.key(it.track) == key }
+            val title = entry?.track?.title ?: pending?.first?.title
+            when (event) {
+                "done" -> Toast.makeText(
+                    this, "Downloaded: ${title ?: "track"}", Toast.LENGTH_SHORT
+                ).show()
+                "paused" -> Toast.makeText(
+                    this, "Paused: ${title ?: "track"}", Toast.LENGTH_SHORT
+                ).show()
+                "removed" -> Toast.makeText(
+                    this, "Download removed", Toast.LENGTH_SHORT
+                ).show()
+                "failed" -> Toast.makeText(
+                    this, "Download failed. Open Downloads for details",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            refreshDownloadButton()
+            refreshPlaybackUi()
+            if (visibleScreen == "Downloads") showDownloads()
         }
     }
 
     /** Pause: an in-flight transfer stops at the next chunk check;
      *  a queued one is simply re-labeled. */
     private fun pauseDownload(track: Track) {
-        val key = Downloads.key(track)
-        if (downloading.contains(key)) {
-            dlStopModes[key] = "pause"
-        } else {
-            Downloads.setStatus(
-                this, track, Downloads.ST_PAUSED,
-                Downloads.statusOf(this, track)?.progress ?: 0
-            )
-            if (visibleScreen == "Downloads") showDownloads()
-        }
+        Downloads.pause(this, track)
+        if (visibleScreen == "Downloads") showDownloads()
     }
 
     /** Remove: an in-flight transfer aborts and its state row is
      *  dropped on completion; an idle row is dropped immediately. */
     private fun cancelDownload(track: Track) {
-        val key = Downloads.key(track)
-        if (downloading.contains(key)) {
-            dlStopModes[key] = "remove"
-        } else {
-            Downloads.clearStatus(this, key)
-            if (visibleScreen == "Downloads") showDownloads()
-        }
+        Downloads.removePending(this, track)
+        if (visibleScreen == "Downloads") showDownloads()
     }
 
     private fun showDownloads() {
@@ -7827,7 +7815,7 @@ class MainActivity : Activity() {
         // destroys a sibling tab's retained tree.
         saveCurrentRoot()
         val entry = retainedRoots[tab] ?: return false
-        if (tab == "Downloads" && downloading.isNotEmpty()) return false
+        if (tab == "Downloads" && Downloads.anyActive()) return false
         if (entry.fingerprint != rootFingerprint(tab)) {
             retainedRoots.remove(tab)
             return false
@@ -7955,6 +7943,9 @@ class MainActivity : Activity() {
         // other half of the split-brain).
         if (myControls != null && PlaybackBridge.controls === myControls) {
             PlaybackBridge.controls = null
+        }
+        if (myDlListener != null && Downloads.uiListener === myDlListener) {
+            Downloads.uiListener = null
         }
         if (PlayerRegistry.isOwner(instanceId)) {
             PlaybackBridge.clearState()
