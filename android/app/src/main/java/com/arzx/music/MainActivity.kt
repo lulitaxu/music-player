@@ -4082,14 +4082,18 @@ class MainActivity : Activity() {
         // Current synced lyric line, directly above the title
         // (Spotify inspo). Tap opens the full lyrics view. Hidden
         // until synced lyrics for this track actually exist.
+        // 0.6.5: the line NEVER truncates (Arz's phone test: a long
+        // line ellipsized mid-sentence) — no ellipsize, wraps to at
+        // most 3 lines at wrap-content height. The NP content is a
+        // scroll column, so the extra height is absorbed by the
+        // scroll; artwork and controls keep their layout.
         npLyricLine = label("", 15.5f, Color.WHITE, semiboldTf).apply {
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
+            maxLines = 3
             visibility = View.GONE
             isClickable = true
             setOnClickListener { showLyrics() }
         }
-        val lyricLp = LinearLayout.LayoutParams(-1, dp(24))
+        val lyricLp = LinearLayout.LayoutParams(-1, -2)
         lyricLp.topMargin = dp(20)
         inner.addView(npLyricLine, lyricLp)
 
@@ -4338,14 +4342,14 @@ class MainActivity : Activity() {
         npLyricsCard.addView(label("LYRICS", 11f, white55, semiboldTf).apply {
             letterSpacing = 0.12f
         })
+        // 0.6.5: same no-truncation rule as the above-title line —
+        // lyric text wraps fully (up to 3 lines), never ellipsizes.
         npLyricsCardCur = label("", 16.5f, Color.WHITE, semiboldTf).apply {
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
+            maxLines = 3
             setPadding(0, dp(5), 0, 0)
         }
         npLyricsCardNext = label("", 14.5f, white50).apply {
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
+            maxLines = 3
         }
         npLyricsCard.addView(npLyricsCardCur)
         npLyricsCard.addView(npLyricsCardNext)
