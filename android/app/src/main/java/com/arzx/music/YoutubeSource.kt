@@ -194,9 +194,9 @@ object YoutubeSource {
      * ~192kbps, "high" = best available). Null when nothing directly
      * playable is exposed — note YouTube serves most audio as DASH,
      * which this filter excludes on purpose because the URL goes
-     * straight to MediaPlayer; that scarcity is exactly why the
-     * Innertube resolver in [StreamResolver] runs first. Throws on
-     * extraction/network failure.
+     * straight to the player as a plain file; that scarcity is
+     * exactly why the Innertube resolver in [StreamResolver] runs
+     * first. Throws on extraction/network failure.
      */
     fun resolveAudioUrl(videoId: String, quality: String = "high"): String? {
         ensureInit()
@@ -222,16 +222,32 @@ object YoutubeSource {
 
 /**
  * The one YouTube stream-resolution path for playback AND downloads.
- * Primary: the app's own Innertube player layer ([YtmApi.resolveStream]),
+ * Primary: the app's own Innertube layer ([YtmApi.resolveStream]),
  * the same transport that already loads the catalog from the device —
  * the embedded ANDROID_MUSIC / IOS contexts expose direct audio file
- * URLs that MediaPlayer can play as-is. Fallback: NewPipeExtractor.
- * When both fail, [Resolved.report] carries BOTH outcomes so the UI
- * can print the real reason instead of a generic failure.
- * Background thread only.
+ * URLs. Fallback: NewPipeExtractor. When both fail, [Resolved.report]
+ * carries BOTH outcomes so the UI can print the real reason instead
+ * of a generic failure. Background thread only.
+ *
+ * [Resolved.userAgent] is not decoration: googlevideo binds a stream
+ * URL to the client that requested it, so whoever fetches the URL
+ * (ExoPlayer for playback, HttpURLConnection for downloads) must
+ * send the UA of the context that produced it, or the URL is
+ * rejected — v5's bare-MediaPlayer -38 error was exactly that.
  */
 object StreamResolver {
-    data class Resolved(val url: String?, val report: String)
+    data class Resolved(
+        val url: String?,
+        val report: String,
+        val userAgent: String? = null,
+        val clientLabel: String? = null
+    )
+
+    /** NewPipe extracts through the plain web client, so its stream
+     *  URLs are paired with a desktop-browser UA. */
+    const val LABEL_NEWPIPE = "NEWPIPE"
+    private const val NEWPIPE_UA =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
     fun resolveYoutube(videoId: String, quality: String): Resolved {
         val inner = try {
@@ -239,7 +255,9 @@ object StreamResolver {
         } catch (t: Throwable) {
             null
         }
-        if (inner?.url != null) return Resolved(inner.url, "Innertube ${inner.report}")
+        if (inner?.url != null) {
+            return Resolved(inner.url, "Innertube ${inner.report}", inner.userAgent, inner.clientLabel)
+        }
         val innerReport = inner?.report ?: "Innertube: resolver error"
         var npError: String? = null
         val npUrl = try {
@@ -248,8 +266,74 @@ object StreamResolver {
             npError = "${t.javaClass.simpleName}: ${t.message?.replace('\n', ' ')?.take(120) ?: ""}".trim()
             null
         }
-        if (npUrl != null) return Resolved(npUrl, "NewPipe")
+        if (npUrl != null) return Resolved(npUrl, "NewPipe", NEWPIPE_UA, LABEL_NEWPIPE)
         val npReport = npError ?: "NewPipe: no direct progressive stream exposed"
         return Resolved(null, "Innertube: $innerReport · $npReport")
+    }
+
+    // ------------------------------------------------------------ playback ladder stages
+
+    /**
+     * Attempt order for live playback: the Innertube contexts in
+     * [YtmApi.streamAttemptLabels] order (last-good first), NewPipe
+     * as the final stage. The player drives one stage at a time so a
+     * stream the player REJECTS can advance to the next context
+     * instead of failing the track outright (v5.1 retry ladder).
+     */
+    fun youtubeStageLabels(): List<String> = YtmApi.streamAttemptLabels() + LABEL_NEWPIPE
+
+    /** Resolves exactly ONE ladder stage. */
+    fun resolveYoutubeStage(videoId: String, quality: String, label: String): Resolved {
+        if (label == LABEL_NEWPIPE) {
+            return try {
+                val url = YoutubeSource.resolveAudioUrl(videoId, quality)
+                if (url != null) Resolved(url, "NewPipe OK", NEWPIPE_UA, LABEL_NEWPIPE)
+                else Resolved(null, "NewPipe: no direct progressive stream exposed")
+            } catch (t: Throwable) {
+                Resolved(
+                    null,
+                    "NewPipe: ${t.javaClass.simpleName}: ${t.message?.replace('\n', ' ')?.take(120) ?: ""}".trim()
+                )
+            }
+        }
+        val r = try {
+            YtmApi.resolveStreamAttempt(videoId, quality, label)
+        } catch (t: Throwable) {
+            null
+        }
+        return if (r != null) Resolved(r.url, r.report, r.userAgent, r.clientLabel)
+        else Resolved(null, "$label: resolver error")
+    }
+
+    // ------------------------------------------------------------ known-good session cache
+
+    private data class CachedGood(val resolved: Resolved, val atMs: Long)
+
+    private val goodCache = java.util.concurrent.ConcurrentHashMap<String, CachedGood>()
+
+    /** A resolution stays reusable for a few minutes — long enough
+     *  to make replays, repeat-one and queue returns instant, short
+     *  enough to never serve a stale googlevideo URL for long. A
+     *  player rejection evicts the entry immediately. */
+    private const val GOOD_TTL_MS = 5 * 60_000L
+
+    private fun goodKey(videoId: String, quality: String) = "$videoId|$quality"
+
+    fun cachedGood(videoId: String, quality: String): Resolved? {
+        val hit = goodCache[goodKey(videoId, quality)] ?: return null
+        if (System.currentTimeMillis() - hit.atMs > GOOD_TTL_MS) {
+            goodCache.remove(goodKey(videoId, quality))
+            return null
+        }
+        return hit.resolved
+    }
+
+    fun rememberGood(videoId: String, quality: String, resolved: Resolved) {
+        if (resolved.url == null) return
+        goodCache[goodKey(videoId, quality)] = CachedGood(resolved, System.currentTimeMillis())
+    }
+
+    fun forgetGood(videoId: String, quality: String) {
+        goodCache.remove(goodKey(videoId, quality))
     }
 }
