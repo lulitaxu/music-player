@@ -3610,7 +3610,7 @@ class MainActivity : Activity() {
      *  animator's own value). Stops flat (scaleY 1) when off;
      *  Reduce Motion keeps the bars static. */
     private fun setVisualizerPulsing(on: Boolean) {
-        if (on && !reduceMotion) {
+        if (on && !reduceMotion()) {
             if (visualizerAnimator?.isRunning == true) return
             val anim = visualizerAnimator ?: ValueAnimator.ofFloat(0f, (2 * Math.PI).toFloat()).apply {
                 duration = 1150
@@ -3643,7 +3643,7 @@ class MainActivity : Activity() {
      *  with iOS easing over ~340ms — a real animator, not ticker
      *  steps. Skipped under Reduce Motion. */
     private fun fadeInNpArtwork() {
-        if (reduceMotion || !::npArtwork.isInitialized) return
+        if (reduceMotion() || !::npArtwork.isInitialized) return
         npArtwork.animate().cancel()
         npArtwork.alpha = 0f
         npArtwork.scaleX = 0.965f
