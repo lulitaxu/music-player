@@ -14,6 +14,12 @@
          WAKE_MODE_NETWORK so screen-off streaming does not stall. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- In-app updates (0.6.3): lets the system installer take an
+         APK this app downloaded from its own GitHub releases. The
+         per-app "allow installs from arzxsh" grant is still the
+         user's to give in system Settings; installs are never
+         silent. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <application
         android:theme="@style/AppTheme"
         android:label="arzxsh"
@@ -42,5 +48,17 @@
             android:name=".PlaybackService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
+        <!-- Shares ONLY the downloaded update APK with the system
+             installer (cache/updates via res/xml/file_paths).
+             Not exported; grants are per-intent. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>
