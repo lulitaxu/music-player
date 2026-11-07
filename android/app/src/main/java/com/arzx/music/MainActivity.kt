@@ -29,7 +29,10 @@ import android.text.TextUtils
 import android.util.LruCache
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.VelocityTracker
 import android.view.View
+import android.view.ViewConfiguration
 import android.animation.ValueAnimator
 import android.view.animation.AccelerateInterpolator
 import android.view.animation.DecelerateInterpolator
@@ -384,6 +387,77 @@ private class EnginePlayer(val exo: ExoPlayer) {
     }
 }
 
+/**
+ * Now Playing's ScrollView with drag-to-dismiss (0.6.1). A downward
+ * drag that starts in the header/artwork zone WHILE the scroll is
+ * at its very top is intercepted and handed to the activity, which
+ * translates the whole Now Playing panel with the finger; every
+ * other gesture scrolls exactly as a stock ScrollView. Taps are
+ * never stolen: interception only happens on a MOVE that has
+ * already passed the touch slop downward, so header buttons keep
+ * their clicks (a stolen gesture just sends them CANCEL, like any
+ * scroll). Velocity is tracked for the fling decision.
+ */
+private class NpScrollView(context: android.content.Context) : ScrollView(context) {
+    /** Zone test, in this view's viewport coordinates: is [y] in
+     *  the grabbable header/artwork band? Supplied by the activity
+     *  from the real laid-out views. */
+    var zoneTest: ((Float) -> Boolean)? = null
+    /** Total downward displacement (px) while dragging. */
+    var onDrag: ((Float) -> Unit)? = null
+    /** Drag released: total displacement + Y velocity (px/s). */
+    var onDragEnd: ((Float, Float) -> Unit)? = null
+
+    private var downY = 0f
+    private var dragging = false
+    private var tracker: VelocityTracker? = null
+    private val slop = ViewConfiguration.get(context).scaledTouchSlop
+
+    override fun onInterceptTouchEvent(e: MotionEvent): Boolean {
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downY = e.y
+                dragging = false
+                tracker?.recycle()
+                tracker = VelocityTracker.obtain()
+                tracker?.addMovement(e)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                tracker?.addMovement(e)
+                if (!dragging && scrollY == 0 && e.y - downY > slop &&
+                    zoneTest?.invoke(downY) == true
+                ) {
+                    dragging = true
+                    return true
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                tracker?.recycle()
+                tracker = null
+            }
+        }
+        return if (dragging) true else super.onInterceptTouchEvent(e)
+    }
+
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (!dragging) return super.onTouchEvent(e)
+        tracker?.addMovement(e)
+        when (e.actionMasked) {
+            MotionEvent.ACTION_MOVE -> onDrag?.invoke((e.y - downY).coerceAtLeast(0f))
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                val dy = (e.y - downY).coerceAtLeast(0f)
+                tracker?.computeCurrentVelocity(1000)
+                val v = tracker?.yVelocity ?: 0f
+                tracker?.recycle()
+                tracker = null
+                dragging = false
+                onDragEnd?.invoke(dy, v)
+            }
+        }
+        return true
+    }
+}
+
 @UnstableApi
 class MainActivity : Activity() {
     private val executor = Executors.newSingleThreadExecutor()
@@ -629,6 +703,74 @@ class MainActivity : Activity() {
     private lateinit var menuTitle: TextView
     private lateinit var menuList: LinearLayout
 
+    // ---- v6.1: content back-stack ----
+    /** One entry per content (sub-)screen: a stable [key] (so a
+     *  re-render of the same screen replaces, never duplicates) and
+     *  a [restore] that re-renders the screen from scratch — the
+     *  same way tab switches already rebuild screens here. The
+     *  bottom entry is always the owning tab's root screen. */
+    private class NavEntry(val key: String, val restore: () -> Unit)
+    private val navStack = ArrayList<NavEntry>()
+    /** True while a pop is re-rendering its target, so the target's
+     *  own push/root-reset calls stay out of the way. */
+    private var navRestoring = false
+
+    // ---- v6.1: Now Playing drag-to-dismiss + pinned chrome ----
+    /** The Now Playing ScrollView (drag-aware subclass). */
+    private lateinit var npScroll: NpScrollView
+    /** Pinned chevron-down: lives OUTSIDE the scroll content, so it
+     *  is reachable no matter how far the player is scrolled. */
+    private lateinit var npCloseBtn: ImageView
+
+    // ---- v6.1: live (audio-reactive) visualizer ----
+    /** The audiofx Visualizer bound to the audible player's
+     *  session; null whenever live levels are not flowing. */
+    private var liveViz: android.media.audiofx.Visualizer? = null
+    /** Session [liveViz] is bound to; -1 = none. */
+    private var liveVizSession = -1
+    /** True while FFT levels (not the decorative pulse) drive the
+     *  bars. */
+    private var liveVizActive = false
+    /** Session whose Visualizer creation/polling already failed:
+     *  never retried (the decorative pulse covers it), so a broken
+     *  OEM Visualizer can't loop the state sync. */
+    private var liveVizFailedSession = -1
+    /** RECORD_AUDIO asked at most once per process; the system
+     *  dialog (or the Settings row) is the re-ask path. */
+    private var vizPermRequested = false
+    /** Preallocated FFT buffer: no per-frame allocation. */
+    private val vizFft = ByteArray(2048)
+    /** Smoothed per-band levels (fast attack, slow decay). */
+    private val vizLevels = FloatArray(4)
+    private val vizTick = object : Runnable {
+        override fun run() {
+            if (!liveVizActive) return
+            pollVizFft()
+            handler.postDelayed(this, if (reduceMotion()) 66L else 33L)
+        }
+    }
+
+    // ---- v6.1: gapless playback (crossfade-off path) ----
+    /** A fully-built second player for the definite next track,
+     *  prepared (not playing) ahead of the boundary. [activated]
+     *  flips when the boundary swap installs it as [player]; the
+     *  prep listener behaves accordingly. [resolved] is kept so a
+     *  player rejection after activation can still advance the
+     *  YouTube ladder. */
+    private class GaplessPrep(
+        val track: Track,
+        val holder: EnginePlayer,
+        val resolved: StreamResolver.Resolved?
+    ) {
+        @Volatile var ready = false
+        @Volatile var activated = false
+    }
+    private var gaplessPrep: GaplessPrep? = null
+    /** Track key the in-flight preload belongs to (double-arm guard). */
+    private var gaplessArmingFor: String? = null
+    /** One-shot boundary timer; fires the swap at duration − position. */
+    private var gaplessFire: Runnable? = null
+
     private lateinit var queueOverlay: FrameLayout
     private lateinit var queueList: LinearLayout
 
@@ -685,6 +827,7 @@ class MainActivity : Activity() {
             accumulateListening()
             updateProgress()
             updateLyricsHighlight()
+            maybeArmGapless()
             handler.postDelayed(this, 500)
         }
     }
@@ -729,6 +872,17 @@ class MainActivity : Activity() {
         loadAccentPref()
         window.statusBarColor = bgColor
         window.navigationBarColor = bgColor
+        // Background playback (0.6.1): register the transport
+        // controls the media notification + session call back into
+        // — the very same functions the mini player uses. The
+        // engine stays here in the activity; the service only
+        // renders state (see PlaybackService).
+        PlaybackBridge.controls = PlaybackBridge.Controls(
+            toggle = { togglePlayback() },
+            next = { playNext() },
+            prev = { playPrevious() },
+            seekTo = { ms -> player?.seekTo(ms) }
+        )
         showShell()
         showHome()
         handler.post(ticker)
@@ -770,19 +924,23 @@ class MainActivity : Activity() {
 
         bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            // v6: the chrome sits on solid black (Spotify), not over
-            // scrolling content — the flat nav reads as one bar.
-            setBackgroundColor(Color.BLACK)
+            // v6: the chrome sits on solid black (Spotify). 0.6.1:
+            // with glass on, the bar goes translucent so scrolling
+            // content ghosts through its margins.
+            if (glassOn()) setBackgroundColor(Color.argb(228, 10, 10, 12))
+            else setBackgroundColor(Color.BLACK)
         }
 
         // ---- mini player ----
         // v6: a SOLID dark bar like the Spotify inspo (art, title,
-        // artist, play/next), replacing the glass pill. Real actions
+        // artist, play/next). 0.6.1: glass effects (Settings,
+        // default on) swap the solid fill for the pre-v6 fake
+        // glass; off restores the solid bar exactly. Real actions
         // unchanged: tap opens Now Playing, swipe skips.
         mini = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = solidBg(8f, surface2)
+            background = if (glassOn()) chromeGlass(8f) else solidBg(8f, surface2)
             setPadding(dp(8), dp(8), dp(12), dp(8))
             elevation = dp(10).toFloat()
             setOnClickListener { if (current != null) showNowPlaying() }
@@ -865,10 +1023,12 @@ class MainActivity : Activity() {
         bottomBar.addView(miniWrap, wrapLp)
 
         // ---- flat black tab bar (Spotify inspo) ----
+        // 0.6.1: translucent glass-dark while glass is on.
         val nav = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setBackgroundColor(Color.BLACK)
+            if (glassOn()) setBackgroundColor(Color.argb(233, 14, 14, 16))
+            else setBackgroundColor(Color.BLACK)
             setPadding(dp(4), dp(2), dp(4), dp(2))
         }
         val tabs = listOf(
@@ -982,6 +1142,56 @@ class MainActivity : Activity() {
             setColor(fill)
             cornerRadius = dp(radiusDp.toInt()).toFloat()
         }
+
+    // ------------------------------------------------------------ v6.1: glass
+
+    /** Glass effects toggle (Settings > Appearance, default ON).
+     *  When ON, the chrome surfaces (mini player, bottom bar, menu
+     *  sheets, queue backdrop) and Now Playing's card/control zone
+     *  use the pre-v6 fake-glass treatment: a translucent fill plus
+     *  a thin light stroke, with content subtly visible behind.
+     *  NO runtime blur is ever rendered on scrolling surfaces —
+     *  the only real blur in the app is Now Playing's precomputed
+     *  artwork backdrop. When OFF, the v6 solid Spotify surfaces
+     *  apply, exactly as 0.6.0 shipped. */
+    private fun glassOn(): Boolean =
+        getPreferences(MODE_PRIVATE).getBoolean("setting_Glass effects", true)
+
+    /** The pre-v6 glass fill: translucent color + 1dp light stroke. */
+    private fun glassBg(radiusDp: Float, fill: Int, stroke: Int): GradientDrawable =
+        GradientDrawable().apply {
+            setColor(fill)
+            cornerRadius = dp(radiusDp.toInt()).toFloat()
+            setStroke(dp(1), stroke)
+        }
+
+    /** Glass for the floating chrome (mini player, sheets): dark
+     *  enough to stay readable over scrolling lists, light enough
+     *  that content ghosts through. */
+    private fun chromeGlass(radiusDp: Float): GradientDrawable =
+        glassBg(radiusDp, Color.argb(222, 33, 33, 36), Color.argb(42, 255, 255, 255))
+
+    /** Glass over Now Playing's genuinely blurred backdrop: the
+     *  art behind is already soft, so the fill can go lighter. */
+    private fun npGlass(radiusDp: Float): GradientDrawable =
+        glassBg(radiusDp, Color.argb(112, 24, 24, 28), Color.argb(48, 255, 255, 255))
+
+    /** Toggling glass rebuilds the shell + current screen (the
+     *  same live-apply path as the theme accent): backgrounds are
+     *  chosen at build time, and playback is never touched. */
+    private fun applyGlassChange() {
+        val tab = activeTab
+        showShell()
+        when (tab) {
+            "Search" -> showSearch()
+            "Library" -> showLibrary()
+            "Downloads" -> showDownloads()
+            "Settings" -> showSettings()
+            else -> showHome()
+        }
+        setActiveTab(tab)
+        refreshPlaybackUi()
+    }
 
     // ------------------------------------------------------------ v6 theme color
 
@@ -1222,6 +1432,7 @@ class MainActivity : Activity() {
     // ---------------------------------------------------------------- home
 
     private fun showHome() {
+        navRoot("tab:home") { showHome() }
         val gen = ++generation
         beginScreen("Listen Now", showAvatar = true)
         // v6: skeleton twin of the real home layout (hero card +
@@ -1408,6 +1619,7 @@ class MainActivity : Activity() {
     // ---------------------------------------------------------------- search
 
     private fun showSearch() {
+        navRoot("tab:search") { showSearch() }
         val gen = ++generation
         beginScreen("Search", showAvatar = true)
         categoryArtViews.clear()
@@ -1423,7 +1635,12 @@ class MainActivity : Activity() {
             resultsBox.visibility = View.VISIBLE
             resultsBox.removeAllViews()
             resultsBox.addView(sectionTitle("Results for \"$q\""))
-            skelRows(resultsBox, 6)
+            // Skeleton mirrors the results layout (0.6.1): a hero
+            // block where the Top result card lands, then rows.
+            val heroSkel = skelBlock(100, 14)
+            (heroSkel.layoutParams as LinearLayout.LayoutParams).bottomMargin = dp(16)
+            resultsBox.addView(heroSkel)
+            skelRows(resultsBox, 5)
             val mode = sourceMode()
             executor.execute {
                 val audius = fetch("/tracks/search?query=${URLEncoder.encode(q, "UTF-8")}&limit=25")
@@ -1455,6 +1672,13 @@ class MainActivity : Activity() {
                 } catch (t: Throwable) {
                     ytAlbumsErr = shortErr(t)
                 }
+                var ytPlaylists: List<YtmPlaylistRef> = emptyList()
+                var ytPlaylistsErr: String? = null
+                if (mode != "audius") try {
+                    ytPlaylists = YtmApi.searchPlaylists(q)
+                } catch (t: Throwable) {
+                    ytPlaylistsErr = shortErr(t)
+                }
                 // One merged song list, YouTube Music FIRST (it is
                 // the primary source now), Audius after — both fully
                 // present and playable, and next/previous playback
@@ -1479,13 +1703,26 @@ class MainActivity : Activity() {
                     if (gen != generation) return@runOnUiThread
                     resultsBox.removeAllViews()
                     resultsBox.addView(sectionTitle("Results for \"$q\""))
-                    val nothing = found.isEmpty() && ytArtists.isEmpty() && ytAlbums.isEmpty()
+                    val nothing = found.isEmpty() && ytArtists.isEmpty() &&
+                        ytAlbums.isEmpty() && ytPlaylists.isEmpty()
                     if (nothing) {
                         if (audius == null && ytErr != null) {
                             resultsBox.addView(label("Playable results are unavailable right now.", 14f, white50))
                         } else {
                             resultsBox.addView(label("No results", 18f, Color.WHITE, boldTf))
                         }
+                    }
+                    // Section order (0.6.1): Top result → Songs →
+                    // Artists → Albums → Playlists. Songs used to
+                    // render LAST, below the fold, behind Artists and
+                    // Albums — a title search made the user scroll
+                    // and hunt for the actual song.
+                    if (found.isNotEmpty()) {
+                        resultsBox.addView(sectionTitle("Top result"))
+                        resultsBox.addView(topResultCard(found.first(), found, q))
+                        resultsBox.addView(sectionTitle("Songs"))
+                        setQueue(found)
+                        addRows(found, resultsBox, withHairlines = true, queueContext = found, contextLabel = "Search" to q)
                     }
                     if (ytArtists.isNotEmpty()) {
                         resultsBox.addView(sectionTitle("Artists"))
@@ -1498,18 +1735,19 @@ class MainActivity : Activity() {
                             resultsBox.addView(albumResultRow(album))
                         }
                     }
-                    if (found.isNotEmpty()) {
-                        if (ytArtists.isNotEmpty() || ytAlbums.isNotEmpty()) {
-                            resultsBox.addView(sectionTitle("Songs"))
+                    if (ytPlaylists.isNotEmpty()) {
+                        resultsBox.addView(sectionTitle("Playlists"))
+                        ytPlaylists.forEachIndexed { i, ref ->
+                            if (i > 0) resultsBox.addView(hairline())
+                            resultsBox.addView(ytmPlaylistRow(ref))
                         }
-                        setQueue(found)
-                        addRows(found, resultsBox, withHairlines = true, queueContext = found, contextLabel = "Search" to q)
                     }
                     // Source status: always on screen, success or failure.
                     val errors = listOfNotNull(
                         ytErr?.let { "songs: $it" },
                         ytArtistsErr?.let { "artists: $it" },
-                        ytAlbumsErr?.let { "albums: $it" }
+                        ytAlbumsErr?.let { "albums: $it" },
+                        ytPlaylistsErr?.let { "playlists: $it" }
                     )
                     if (errors.isNotEmpty()) {
                         resultsBox.addView(errorLine("YouTube unavailable: " + errors.joinToString(" · ")))
@@ -1529,7 +1767,7 @@ class MainActivity : Activity() {
                     if (mode != "audius" && errors.isEmpty() && ytNote == null) {
                         resultsBox.addView(
                             statusLine(
-                                "YouTube Music: ${ytSongs.size} songs · ${ytArtists.size} artists · ${ytAlbums.size} albums"
+                                "YouTube Music: ${ytSongs.size} songs · ${ytArtists.size} artists · ${ytAlbums.size} albums · ${ytPlaylists.size} playlists"
                             )
                         )
                     }
@@ -1794,6 +2032,8 @@ class MainActivity : Activity() {
         title: String,
         subtitle: String?,
         titleColor: Int = Color.WHITE,
+        iconRes: Int? = null,
+        iconTint: Int = white55,
         onClick: () -> Unit
     ): LinearLayout {
         val row = LinearLayout(this).apply {
@@ -1803,6 +2043,14 @@ class MainActivity : Activity() {
             rippleRect()
             isClickable = true
             setOnClickListener { onClick() }
+        }
+        // Leading glyph (0.6.1 icon pass): 22dp, secondary tint —
+        // accent only where the row itself is accent-relevant
+        // (Theme color passes iconTint = accent).
+        if (iconRes != null) {
+            val ivLp = LinearLayout.LayoutParams(dp(22), dp(22))
+            ivLp.marginEnd = dp(12)
+            row.addView(icon(iconRes, iconTint), ivLp)
         }
         val text = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         text.addView(label(title, 15.5f, titleColor))
@@ -1946,6 +2194,7 @@ class MainActivity : Activity() {
     }
 
     private fun showLicenses() {
+        pushNav("licenses") { showLicenses() }
         generation++
         beginScreen("Licenses", showAvatar = false)
         fun block(title: String, body: String, first: Boolean) {
@@ -1997,6 +2246,7 @@ class MainActivity : Activity() {
      * exists from either source) are omitted, not faked.
      */
     private fun showSettings() {
+        navRoot("tab:settings") { showSettings() }
         generation++
         beginScreen("Settings", showAvatar = false)
 
@@ -2004,7 +2254,8 @@ class MainActivity : Activity() {
         content.addView(
             settingsRow(
                 "Music source",
-                sourceModeName(sourceMode()) + " · search, home and playback follow this"
+                sourceModeName(sourceMode()) + " · search, home and playback follow this",
+                iconRes = R.drawable.ic_radio
             ) {
                 showMenu(
                     "Music source",
@@ -2026,7 +2277,7 @@ class MainActivity : Activity() {
         } else {
             "$qualityName · steers YouTube stream selection"
         }
-        content.addView(settingsRow("Streaming quality", qualitySub) {
+        content.addView(settingsRow("Streaming quality", qualitySub, iconRes = R.drawable.ic_signal) {
             showMenu(
                 "Streaming quality", listOf(
                     "Data saver" to { setStreamQuality("data") },
@@ -2041,30 +2292,43 @@ class MainActivity : Activity() {
         content.addView(
             settingsRow(
                 "Crossfade",
-                if (cfSec == 0) "Off · tracks hard-cut, as before" else "$cfSec seconds between tracks"
+                if (cfSec == 0) "Off · tracks hard-cut, as before" else "$cfSec seconds between tracks",
+                iconRes = R.drawable.ic_crossfade
             ) { showCrossfadeSheet() }
+        )
+        content.addView(setting("Gapless playback", true))
+        content.addView(
+            label(
+                if (cfSec > 0) {
+                    "Crossfade is on and handles transitions — gapless applies when crossfade is 0"
+                } else {
+                    "The next song loads before this one ends, so tracks flow with no gap"
+                },
+                12.5f, white50
+            ).apply { setPadding(dp(34), 0, 0, dp(8)) }
         )
         content.addView(
             settingsRow(
                 "Lyrics sync offset",
-                "${fmtOffset(LyricOffsets.globalMs(this))} · default for tracks without their own offset"
+                "${fmtOffset(LyricOffsets.globalMs(this))} · default for tracks without their own offset",
+                iconRes = R.drawable.ic_lyrics
             ) { showGlobalOffsetSheet() }
         )
 
         content.addView(settingsGroupHeader("Audio"))
-        content.addView(settingsRow("Equalizer", "Opens the system audio effects panel") {
+        content.addView(settingsRow("Equalizer", "Opens the system audio effects panel", iconRes = R.drawable.ic_equalizer) {
             openEqualizer()
         })
 
         content.addView(settingsGroupHeader("Downloads & storage"))
         val dlCount = Downloads.entries(this).size
         val dlBytes = Downloads.storageBytes(this)
-        content.addView(settingsRow("Downloads", "$dlCount tracks · ${fmtBytes(dlBytes)} on this device") {
+        content.addView(settingsRow("Downloads", "$dlCount tracks · ${fmtBytes(dlBytes)} on this device", iconRes = R.drawable.ic_download) {
             setActiveTab("Downloads")
             showDownloads()
         })
         if (dlCount > 0) {
-            content.addView(settingsRow("Remove all downloads", "Frees ${fmtBytes(dlBytes)}", errorColor) {
+            content.addView(settingsRow("Remove all downloads", "Frees ${fmtBytes(dlBytes)}", errorColor, iconRes = R.drawable.ic_trash) {
                 showMenu(
                     "Remove all downloaded tracks?", listOf(
                         "Remove all" to {
@@ -2077,21 +2341,28 @@ class MainActivity : Activity() {
                 )
             })
         }
-        content.addView(settingsRow("Artwork cache", "${fmtBytes(ArtworkLoader.cacheBytes())} in memory") {
+        content.addView(settingsRow("Artwork cache", "${fmtBytes(ArtworkLoader.cacheBytes())} in memory", iconRes = R.drawable.ic_image) {
             ArtworkLoader.clearCache()
             Toast.makeText(this@MainActivity, "Artwork cache cleared", Toast.LENGTH_SHORT).show()
             showSettings()
         })
-        content.addView(settingsRow("Lyrics cache", "${fmtBytes(Lyrics.cacheBytes(this))} on this device") {
+        content.addView(settingsRow("Lyrics cache", "${fmtBytes(Lyrics.cacheBytes(this))} on this device", iconRes = R.drawable.ic_storage) {
             Lyrics.clearCache(this@MainActivity)
             Toast.makeText(this@MainActivity, "Lyrics cache cleared", Toast.LENGTH_SHORT).show()
             showSettings()
         })
 
         content.addView(settingsGroupHeader("Appearance & behavior"))
-        content.addView(settingsRow("Theme color", themeName()) { showThemeSheet() })
+        content.addView(setting("Glass effects", true) { applyGlassChange() })
+        content.addView(settingsRow("Theme color", themeName(), iconRes = R.drawable.ic_theme, iconTint = accent) { showThemeSheet() })
         content.addView(setting("Ambient color from artwork", true) { applyAmbient(false) })
         content.addView(setting("Visualizer", true))
+        content.addView(setting("Live visualizer", true) { updateVisualizerState() })
+        content.addView(
+            label(liveVizSubtitle(), 12.5f, white50).apply {
+                setPadding(dp(34), 0, 0, dp(8))
+            }
+        )
         content.addView(setting("Compact mini-player", false))
         content.addView(setting("Reduce motion", false))
 
@@ -2108,7 +2379,7 @@ class MainActivity : Activity() {
         content.addView(label("Sources · YouTube Music · Audius · On-device files", 15f, white50))
         content.addView(label("Lyrics · LRCLIB / lyrics.ovh when available", 15f, white50))
         content.addView(label("No DRM bypass, ever.", 15f, white50))
-        content.addView(settingsRow("Open-source licenses", null) { showLicenses() })
+        content.addView(settingsRow("Open-source licenses", null, iconRes = R.drawable.ic_doc) { showLicenses() })
     }
 
     private fun showEmpty(title: String, heading: String, message: String) {
@@ -2119,6 +2390,70 @@ class MainActivity : Activity() {
     }
 
     // ---------------------------------------------------------------- rows
+
+    /**
+     * Search "Top result" hero card (0.6.1, the YouTube Music /
+     * Spotify pattern): the songs bucket's first hit, large, at the
+     * very top of the results. Tapping plays it inside the search
+     * queue context (same queue the Songs rows use); the ⋯ keeps
+     * the full track menu. The song ALSO stays in the Songs list
+     * below, like the reference apps — the hero is a shortcut, not
+     * a move. Per source mode the bucket differs, and so does the
+     * hero: Audius mode's hero is the first Audius song; Both mode
+     * merges YouTube-first, so the hero is the YouTube hit when one
+     * exists; YouTube mode with YouTube down heroes the Audius
+     * fallback song, matching the list under it.
+     */
+    private fun topResultCard(track: Track, queueContext: List<Track>, q: String): LinearLayout {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = solidBg(14f, surface2)
+            setPadding(dp(12), dp(12), dp(6), dp(12))
+            isClickable = true
+            setOnClickListener {
+                setQueue(queueContext)
+                setPlayContext("Search", q)
+                play(track)
+            }
+            setOnLongClickListener {
+                showTrackMenu(track)
+                true
+            }
+        }
+        val img = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            roundedClip(this, 10)
+        }
+        ArtworkLoader.load(
+            track.artworkLarge ?: track.artworkSmall, img,
+            track.artworkSmall, dp(208)
+        )
+        card.addView(img, LinearLayout.LayoutParams(dp(76), dp(76)))
+        val text = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), 0, dp(6), 0)
+        }
+        text.addView(label(track.title, 18f, Color.WHITE, boldTf).apply {
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        val sub = if (track.duration > 0) {
+            "${track.artist} · ${fmt(track.duration * 1000)}"
+        } else {
+            track.artist
+        }
+        text.addView(label(sub, 14.5f, white50).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        card.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
+        val moreIcon = icon(R.drawable.ic_more, Color.argb(115, 255, 255, 255)).apply {
+            setOnClickListener { showTrackMenu(track) }
+        }
+        card.addView(moreIcon, LinearLayout.LayoutParams(dp(30), dp(30)))
+        return card
+    }
 
     private fun addRows(
         list: List<Track>,
@@ -2397,8 +2732,10 @@ class MainActivity : Activity() {
     }
 
     private fun showArtist(artistId: String, fallbackName: String? = null, fallbackArt: String? = null) {
+        pushNav("artist:$artistId") { showArtist(artistId, fallbackName, fallbackArt) }
         val gen = ++generation
         content.removeAllViews()
+        addScreenBackArrow()
         // Skeleton mirroring the artist page: banner, then rows.
         content.addView(skelBlock(232, 16))
         skelRows(content, 5)
@@ -2414,6 +2751,7 @@ class MainActivity : Activity() {
                 if (gen != generation) return@runOnUiThread
                 clearSkeletons()
                 content.removeAllViews()
+                addScreenBackArrow()
                 val p = page
                 if (p == null) {
                     content.addView(label(fallbackName ?: "Artist", 30f, Color.WHITE, boldTf))
@@ -2510,8 +2848,10 @@ class MainActivity : Activity() {
     }
 
     private fun showAlbum(ref: YtmAlbumRef) {
+        pushNav("album:${ref.id}") { showAlbum(ref) }
         val gen = ++generation
         content.removeAllViews()
+        addScreenBackArrow()
         // Skeleton mirroring the album page: header art, then rows.
         content.addView(skelBlock(150, 12))
         skelRows(content, 6)
@@ -2527,6 +2867,7 @@ class MainActivity : Activity() {
                 if (gen != generation) return@runOnUiThread
                 clearSkeletons()
                 content.removeAllViews()
+                addScreenBackArrow()
                 val p = page
                 if (p == null) {
                     content.addView(label(ref.title, 26f, Color.WHITE, boldTf))
@@ -2720,6 +3061,7 @@ class MainActivity : Activity() {
     /** Playlists inside one mood/genre category (real browse via
      *  FEmusic_moods_and_genres_category, not a search). */
     private fun showMoodPlaylists(cat: YtmMoodCategory) {
+        pushNav("mood:${cat.params}") { showMoodPlaylists(cat) }
         val gen = ++generation
         beginScreen(cat.name, showAvatar = false)
         val skelBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -2786,9 +3128,11 @@ class MainActivity : Activity() {
      *  Play + Shuffle, full playable track list — same shape as the
      *  album page. */
     private fun showYtmPlaylist(ref: YtmPlaylistRef) {
+        pushNav("ytplaylist:${ref.id}") { showYtmPlaylist(ref) }
         val gen = ++generation
         visibleScreen = "YtmPlaylist"
         content.removeAllViews()
+        addScreenBackArrow()
         // Skeleton mirroring the playlist page: header, then rows.
         content.addView(skelBlock(150, 12))
         skelRows(content, 6)
@@ -2804,6 +3148,7 @@ class MainActivity : Activity() {
                 if (gen != generation) return@runOnUiThread
                 clearSkeletons()
                 content.removeAllViews()
+                addScreenBackArrow()
                 val tracks = list
                 if (tracks == null) {
                     content.addView(label(ref.title, 26f, Color.WHITE, boldTf))
@@ -2901,10 +3246,20 @@ class MainActivity : Activity() {
         // The player scrolls (v6 refinement): the Spotify top layout
         // stays intact, and Lyrics preview + Related Songs live
         // below the fold.
-        val scroll = ScrollView(this).apply {
+        // 0.6.1: the scroll view is drag-aware — a downward drag
+        // from the header/artwork zone at scroll-top drags the
+        // whole panel toward dismissal (NpScrollView owns the
+        // gesture rules; these lambdas own the panel).
+        npScroll = NpScrollView(this).apply {
             isVerticalScrollBarEnabled = false
             isFillViewport = true
         }
+        val scroll = npScroll
+        npScroll.zoneTest = { y ->
+            ::npArtwork.isInitialized && y <= npArtwork.bottom.toFloat()
+        }
+        npScroll.onDrag = { dy -> nowPlaying.translationY = dy }
+        npScroll.onDragEnd = { dy, v -> onNpDragEnd(dy, v) }
         val inner = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24), dp(36), dp(24), dp(30))
@@ -2917,11 +3272,11 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        val chevron = icon(R.drawable.ic_chevron_down, Color.WHITE).apply {
-            contentDescription = "Close player"
-            setOnClickListener { hideNowPlaying() }
-        }
-        topBar.addView(chevron, LinearLayout.LayoutParams(dp(40), dp(40)))
+        // 0.6.1: the chevron moved OUT of the scroll content into a
+        // pinned button (it used to scroll away — Arz: "there is no
+        // back button"); this slot is a spacer so the centered
+        // context block keeps its exact geometry.
+        topBar.addView(View(this), LinearLayout.LayoutParams(dp(40), dp(40)))
         val ctxBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -3048,6 +3403,22 @@ class MainActivity : Activity() {
         times.addView(npRemaining)
         inner.addView(times)
 
+        // v6.1 glass: the transport + bottom rows live in ONE zone
+        // so the whole block carries a single glass fill over the
+        // (genuinely blurred) backdrop when glass is on; with
+        // glass off the zone is invisible and the v6 solid layout
+        // is pixel-identical.
+        val controlZone = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            if (glassOn()) {
+                background = npGlass(18f)
+                setPadding(dp(10), dp(6), dp(10), dp(8))
+            }
+        }
+        val zoneLp = LinearLayout.LayoutParams(-1, -2)
+        zoneLp.topMargin = dp(16)
+        controlZone.layoutParams = zoneLp
+
         // ---- controls: shuffle · prev · BIG white play · next · sleep ----
         val controls = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -3055,7 +3426,6 @@ class MainActivity : Activity() {
             setPadding(dp(6), 0, dp(6), 0)
         }
         val controlsLp = LinearLayout.LayoutParams(-1, -2)
-        controlsLp.topMargin = dp(14)
         controls.layoutParams = controlsLp
         // Spotify state treatment (spec §2.1/§3): active = accent
         // glyph + a dot beneath it; repeat-one works a "1" into the
@@ -3116,7 +3486,7 @@ class MainActivity : Activity() {
         controls.addView(playSlot, LinearLayout.LayoutParams(0, dp(64), 1.2f))
         controls.addView(nextBtn, LinearLayout.LayoutParams(0, dp(52), 1f))
         controls.addView(npSleepBtn, LinearLayout.LayoutParams(0, dp(44), 1f))
-        inner.addView(controls)
+        controlZone.addView(controls)
 
         npSleepLabel = label("", 12.5f, white55).apply {
             gravity = Gravity.CENTER
@@ -3124,7 +3494,7 @@ class MainActivity : Activity() {
         }
         val sleepLp = LinearLayout.LayoutParams(-1, -2)
         sleepLp.topMargin = dp(10)
-        inner.addView(npSleepLabel, sleepLp)
+        controlZone.addView(npSleepLabel, sleepLp)
 
         // ---- bottom row: lyrics · repeat · download · share · queue ----
         val bottomRow = LinearLayout(this).apply {
@@ -3178,12 +3548,15 @@ class MainActivity : Activity() {
         bottomRow.addView(downloadSlot, LinearLayout.LayoutParams(0, dp(34), 1f))
         bottomRow.addView(shareBtn, LinearLayout.LayoutParams(0, dp(34), 1f))
         bottomRow.addView(queueBtn, LinearLayout.LayoutParams(0, dp(34), 1f))
-        inner.addView(bottomRow)
+        controlZone.addView(bottomRow)
+        inner.addView(controlZone)
 
         // ---- Lyrics preview card (inspo): current + next line ----
         npLyricsCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = solidBg(14f, surface2)
+            // Glass over the blurred artwork backdrop when glass is
+            // on (0.6.1); the v6 solid card when it is off.
+            background = if (glassOn()) npGlass(14f) else solidBg(14f, surface2)
             setPadding(dp(16), dp(12), dp(16), dp(14))
             visibility = View.GONE
             isClickable = true
@@ -3208,7 +3581,42 @@ class MainActivity : Activity() {
         npLyricsCard.addView(npLyricsCardNext)
         inner.addView(npLyricsCard)
 
+        // Pinned chevron-down (0.6.1): a child of the PANEL, not of
+        // the scroll content, so it sits at the same spot as the
+        // old in-scroll chevron and never scrolls away. It
+        // translates with the panel during drag-dismiss, like a
+        // real sheet handle should.
+        npCloseBtn = icon(R.drawable.ic_chevron_down, Color.WHITE).apply {
+            contentDescription = "Close player"
+            background = GradientDrawable().apply {
+                setColor(Color.argb(46, 0, 0, 0))
+                shape = GradientDrawable.OVAL
+            }
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            setOnClickListener { hideNowPlaying() }
+        }
+        val closeLp = FrameLayout.LayoutParams(dp(40), dp(40), Gravity.TOP or Gravity.START)
+        closeLp.leftMargin = dp(24)
+        closeLp.topMargin = dp(36)
+        nowPlaying.addView(npCloseBtn, closeLp)
+
         root.addView(nowPlaying, FrameLayout.LayoutParams(-1, -1))
+    }
+
+    /** Drag-to-dismiss release decision (0.6.1): past ~25% of the
+     *  panel height, or a downward fling, completes the existing
+     *  slide-down hide; anything shorter springs back with the iOS
+     *  easing. Called by NpScrollView after a stolen gesture. */
+    private fun onNpDragEnd(dy: Float, velocityY: Float) {
+        if (nowPlaying.visibility != View.VISIBLE) return
+        val h = nowPlaying.height
+        val threshold = if (h > 0) h * 0.25f else dp(160).toFloat()
+        if (dy >= threshold || velocityY > 900f) {
+            hideNowPlaying()
+        } else {
+            nowPlaying.animate().translationY(0f).setDuration(250)
+                .setInterpolator(iosEase).start()
+        }
     }
 
     private fun styledSeek(thumbRes: Int): SeekBar = SeekBar(this).apply {
@@ -3254,6 +3662,10 @@ class MainActivity : Activity() {
             ::menuOverlay.isInitialized && menuOverlay.visibility == View.VISIBLE -> hideMenu()
             ::queueOverlay.isInitialized && queueOverlay.visibility == View.VISIBLE -> hideQueue()
             ::nowPlaying.isInitialized && nowPlaying.visibility == View.VISIBLE -> hideNowPlaying()
+            // Content screens pop exactly one level (0.6.1
+            // back-stack); at a tab root goBack() returns false
+            // and the system behavior takes over, as before.
+            goBack() -> Unit
             else -> super.onBackPressed()
         }
     }
@@ -3337,6 +3749,10 @@ class MainActivity : Activity() {
     // ---------------------------------------------------------------- playback wiring (engine unchanged)
 
     private fun play(track: Track) {
+        // A foreground play supersedes any gapless prep for the old
+        // track's boundary (manual skip, row tap, error advance):
+        // the prepared next is stale the moment this runs.
+        discardGaplessPrep()
         val idx = queue.indexOfFirst { it.id == track.id && it.source == track.source }
         if (idx >= 0) {
             queueIndex = idx
@@ -3408,6 +3824,11 @@ class MainActivity : Activity() {
     private fun releaseActivePlayer() {
         val p = player ?: return
         if (fadeSource === p) fadeSource = null
+        // The session dies with the player: release the Visualizer
+        // bound to it rather than leaking it across tracks.
+        stopLiveViz()
+        // A torn-down player has no boundary: drop any gapless prep.
+        discardGaplessPrep()
         p.release()
         player = null
     }
@@ -3659,6 +4080,15 @@ class MainActivity : Activity() {
         val holder = EnginePlayer(exo)
         player = holder
         activePlayerTrack = forTrack
+        // 0.6.1 (background playback): keep the network/CPU path
+        // awake while streaming, so a screen-off phone does not
+        // stall mid-song; the foreground service keeps the process.
+        exo.setWakeMode(C.WAKE_MODE_NETWORK)
+        // Every new player = a track starting: the media
+        // notification/session service runs from here, and the
+        // notification permission is asked at this first play.
+        PlaybackService.start(this)
+        requestNotifPermissionIfNeeded()
         exo.setAudioAttributes(
             Media3AudioAttributes.Builder()
                 .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
@@ -3818,6 +4248,9 @@ class MainActivity : Activity() {
         fadeStep = 0
         fadeTotalSteps = (fadeMs / 100).coerceAtLeast(1)
         handler.postDelayed(crossfadeTick, 100)
+        // The live visualizer follows `player`, which already
+        // points at the INCOMING (becoming-audible) player.
+        syncVisualizerSession()
     }
 
     /** Ends a running crossfade immediately: outgoing player
@@ -3827,12 +4260,296 @@ class MainActivity : Activity() {
         outPlayer?.release()
         outPlayer = null
         player?.setVolume(1f)
+        syncVisualizerSession()
+    }
+
+    // ------------------------------------------------- v6.1: gapless playback
+
+    private fun gaplessOn(): Boolean =
+        getPreferences(MODE_PRIVATE).getBoolean("setting_Gapless playback", true)
+
+    /**
+     * The definite next queue index per the play ORDER (shuffle
+     * order, not raw queue order) — the same computation
+     * handleCompletion advances by. Null when there is no definite
+     * next: repeat-one, end of queue without repeat-all, or the
+     * repeat-all wrap would land on the current track itself.
+     */
+    private fun expectedNextIndex(): Int? {
+        if (repeatMode == 2) return null
+        if (queue.isEmpty() || queueIndex !in queue.indices || playOrder.isEmpty()) return null
+        val pos = currentOrderPos()
+        if (pos < 0) return null
+        return if (pos + 1 < playOrder.size) {
+            playOrder[pos + 1]
+        } else if (repeatMode == 1) {
+            val first = playOrder[0]
+            if (first == queueIndex) null else first
+        } else {
+            null
+        }
+    }
+
+    /** Drops any prepared/armed next track. The prepared player is
+     *  released (unless it already activated — activation clears
+     *  [gaplessPrep] first, so this never kills the live player). */
+    private fun discardGaplessPrep() {
+        gaplessFire?.let { handler.removeCallbacks(it) }
+        gaplessFire = null
+        gaplessArmingFor = null
+        val prep = gaplessPrep
+        gaplessPrep = null
+        if (prep != null && !prep.activated) prep.holder.release()
+    }
+
+    /**
+     * Runs on the 500ms ticker. With ~30s left on a definite next
+     * track (crossfade off, gapless on, no sleep-after-track), the
+     * next stream is pre-resolved on the player executor (YouTube:
+     * the one-shot resolver — session cache + context walk +
+     * NewPipe, same machinery the foreground ladder walks stage by
+     * stage) and a second player is built and prepared. When the
+     * boundary comes within ~1.5s and the prep is READY, a one-shot
+     * timer is armed for the exact remaining time.
+     *
+     * HONEST LIMIT: the swap is scheduled from the player's own
+     * duration/position and fires on the main-thread handler, so
+     * the seam lands within a handler tick of the true boundary
+     * (typically single-digit ms, worst case a frame or two) — it
+     * is NOT sample-accurate. If the prep is not ready in time, or
+     * anything changed underneath, the normal end-of-track path
+     * runs instead: the transition is never worse than today's cut.
+     */
+    private fun maybeArmGapless() {
+        if (!gaplessOn() || crossfadeSec() > 0 || sleepAfterTrack) {
+            if (gaplessPrep != null || gaplessArmingFor != null) discardGaplessPrep()
+            return
+        }
+        val p = player ?: return
+        if (current == null || !p.isPlaying) return
+        val dur = p.durationMs
+        if (dur <= 0) return
+        val remaining = dur - p.positionMs
+        val nextIdx = expectedNextIndex()
+        if (nextIdx == null) {
+            if (gaplessPrep != null || gaplessArmingFor != null) discardGaplessPrep()
+            return
+        }
+        val next = queue.getOrNull(nextIdx) ?: return
+        val nextKey = Downloads.key(next)
+        val prep = gaplessPrep
+        if (prep != null) {
+            if (Downloads.key(prep.track) == nextKey) {
+                scheduleGaplessFire(remaining)
+                return
+            }
+            discardGaplessPrep()
+        }
+        if (gaplessArmingFor == nextKey) return // resolution in flight
+        if (remaining > 32_000) return // arm window opens at ~30s left
+        gaplessArmingFor = nextKey
+        val localFile = Downloads.localFile(this, next)
+        when {
+            next.source == SOURCE_LOCAL ->
+                // Local tracks ARE their content URI (same source
+                // startPlaybackUri plays); MediaItem parses it.
+                prepareGapless(next, next.id, null)
+            localFile != null ->
+                prepareGapless(next, localFile.absolutePath, null)
+            next.source == SOURCE_YOUTUBE -> {
+                val quality = effectiveQuality()
+                playerExecutor.execute {
+                    val resolved = try {
+                        StreamResolver.resolveYoutube(next.id, quality)
+                    } catch (e: Exception) {
+                        null
+                    }
+                    runOnUiThread {
+                        // Superseded while resolving (skip, queue
+                        // change, toggle off): drop the result.
+                        if (gaplessArmingFor != nextKey) return@runOnUiThread
+                        val url = resolved?.url
+                        if (resolved == null || url == null) {
+                            // No pre-resolution: the boundary uses
+                            // the normal foreground ladder — today's
+                            // behavior, never worse.
+                            gaplessArmingFor = null
+                            return@runOnUiThread
+                        }
+                        prepareGapless(next, url, resolved)
+                    }
+                }
+            }
+            else -> // Audius: the track URL streams directly.
+                prepareGapless(next, next.streamUrl, null)
+        }
+    }
+
+    /** Builds the second player for [next] and prepares it paused.
+     *  Its listener only marks readiness until activation; after
+     *  activation it behaves like a normal player listener. */
+    private fun prepareGapless(next: Track, uriString: String, resolved: StreamResolver.Resolved?) {
+        // Construction mirrors startPlaybackInternal EXACTLY (the
+        // matched-UA HTTP factory is the v5.1 playback fix; a prep
+        // built any other way would be rejected by googlevideo):
+        // same factory, same audio attributes, plus the wake mode
+        // a backgrounded player needs.
+        val httpFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent(resolved?.userAgent ?: "arzxsh (Android)")
+            .setConnectTimeoutMs(15_000)
+            .setReadTimeoutMs(30_000)
+            .setAllowCrossProtocolRedirects(true)
+        val exo = ExoPlayer.Builder(this)
+            .setMediaSourceFactory(
+                DefaultMediaSourceFactory(DefaultDataSource.Factory(this, httpFactory))
+            )
+            .build()
+        exo.setAudioAttributes(
+            Media3AudioAttributes.Builder()
+                .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                .setUsage(C.USAGE_MEDIA)
+                .build(),
+            false
+        )
+        exo.setWakeMode(C.WAKE_MODE_NETWORK)
+        val holder = EnginePlayer(exo)
+        val prep = GaplessPrep(next, holder, resolved)
+        gaplessPrep = prep
+        val listener = object : Player.Listener {
+            override fun onPlaybackStateChanged(state: Int) {
+                if (holder.retired) return
+                if (!prep.activated) {
+                    if (state == Player.STATE_READY) prep.ready = true
+                    return
+                }
+                if (holder !== player) return
+                if (state == Player.STATE_ENDED) handleCompletion()
+                else if (state == Player.STATE_READY) buffering = false
+                refreshPlaybackUi()
+            }
+
+            override fun onIsPlayingChanged(playing: Boolean) {
+                if (holder.retired) return
+                if (prep.activated && holder === player) refreshPlaybackUi()
+            }
+
+            override fun onPlayerError(error: PlaybackException) {
+                if (holder.retired) return
+                if (!prep.activated) {
+                    // A failed prep is silent: drop it and let the
+                    // boundary take the normal path.
+                    if (gaplessPrep === prep) discardGaplessPrep()
+                } else if (holder === player) {
+                    onPlayerFailed(holder, next, resolved, playToken, error)
+                }
+            }
+        }
+        holder.listener = listener
+        exo.addListener(listener)
+        try {
+            val item = if (uriString.startsWith("/")) {
+                MediaItem.fromUri(android.net.Uri.fromFile(java.io.File(uriString)))
+            } else {
+                MediaItem.fromUri(uriString)
+            }
+            exo.setMediaItem(item)
+            // playWhenReady stays false: prepared and buffered, but
+            // silent until the boundary activation calls play().
+            exo.prepare()
+        } catch (e: Exception) {
+            if (gaplessPrep === prep) discardGaplessPrep()
+        }
+    }
+
+    /** Arms the one-shot boundary timer once the prep is READY and
+     *  the end is ~1.5s out. */
+    private fun scheduleGaplessFire(remainingMs: Long) {
+        val prep = gaplessPrep ?: return
+        if (!prep.ready || prep.activated || gaplessFire != null) return
+        if (remainingMs > 1600) return
+        val fire = Runnable { fireGapless() }
+        gaplessFire = fire
+        handler.postDelayed(fire, remainingMs.coerceAtLeast(0))
+    }
+
+    /** Boundary moment: revalidate EVERYTHING (order, toggles,
+     *  sleep state, still playing) before swapping. Any mismatch
+     *  discards the prep and the normal completion path — which
+     *  fires from the old player's own STATE_ENDED — handles it. */
+    private fun fireGapless() {
+        gaplessFire = null
+        val prep = gaplessPrep ?: return
+        val p = player
+        if (!gaplessOn() || crossfadeSec() > 0 || sleepAfterTrack || sleepAfterQueue ||
+            p == null || !p.isPlaying || !prep.ready
+        ) {
+            discardGaplessPrep()
+            return
+        }
+        val nextIdx = expectedNextIndex()
+        val next = nextIdx?.let { queue.getOrNull(it) }
+        if (nextIdx == null || next == null || Downloads.key(next) != Downloads.key(prep.track)) {
+            discardGaplessPrep()
+            return
+        }
+        activateGapless(prep, nextIdx)
+    }
+
+    /** The swap itself: play()'s bookkeeping, but the new player
+     *  is already prepared, so starting it IS the boundary — the
+     *  old player is released only after the prep is installed,
+     *  and its retired/listener guards keep its late STATE_ENDED
+     *  from double-advancing the queue. */
+    private fun activateGapless(prep: GaplessPrep, nextIdx: Int) {
+        val next = prep.track
+        flushListened()
+        saveRecent(next)
+        com.arzx.music.PlayHistory.record(this, next)
+        playToken++
+        queueIndex = nextIdx
+        prep.activated = true
+        gaplessPrep = null
+        gaplessArmingFor = null
+        // A prep whose stream actually starts is known-good, same
+        // as a foreground ladder success (onPlayerReady's rule).
+        if (prep.resolved != null) {
+            StreamResolver.rememberGood(next.id, effectiveQuality(), prep.resolved)
+        }
+        val old = player
+        current = next
+        player = prep.holder
+        activePlayerTrack = next
+        trackFullyPlayed = false
+        listenedMs = 0L
+        lastListenTickAt = 0L
+        buffering = false
+        if (old != null && old !== prep.holder) {
+            if (fadeSource === old) fadeSource = null
+            old.release()
+        }
+        prep.holder.play()
+        // Same per-track surface resets a foreground play performs.
+        npLyrics = null
+        npLyricsKey = null
+        if (::lyricsOverlay.isInitialized && lyricsOverlay.visibility == View.VISIBLE) {
+            hideLyrics()
+            showLyrics()
+        }
+        npLyricIdx = -2
+        lastNpLyricText = null
+        fetchLyricsAsync(next)
+        requestAmbient(next)
+        refreshPlaybackUi()
     }
 
     // ------------------------------------------------------------ queue order, shuffle, repeat
 
     /** Replaces the queue and rebuilds the play order around it. */
     private fun setQueue(newQueue: List<Track>, startIndex: Int = -1) {
+        // New queue = new order: any gapless prep belongs to the
+        // old one and is discarded (the fire-time revalidation is
+        // the backstop, this is the prompt cleanup).
+        discardGaplessPrep()
         queue = newQueue
         manualIndices.clear()
         if (startIndex in newQueue.indices) {
@@ -3933,6 +4650,11 @@ class MainActivity : Activity() {
         // Queue truly ended: nothing is resolving anymore.
         buffering = false
         updateBufferingUi()
+        // Playback stopped for real: the media service ends with
+        // it (a fresh play restarts it from startPlaybackInternal).
+        lastPushedTrackKey = null
+        lastPushedPlaying = null
+        PlaybackService.stop(this)
         refreshPlaybackUi()
     }
 
@@ -4193,6 +4915,58 @@ class MainActivity : Activity() {
                 requestAmbient(t)
             }
         }
+        // Media notification + session mirror (0.6.1): pushed
+        // from this one funnel, change-guarded inside.
+        pushPlaybackState()
+    }
+
+    // ------------------------------------------------- v6.1: background playback
+
+    /** Last snapshot pushed to [PlaybackBridge] (change guard:
+     *  the service re-renders only on a real change). */
+    private var lastPushedTrackKey: String? = null
+    private var lastPushedPlaying: Boolean? = null
+    private var notifPermRequested = false
+
+    private fun pushPlaybackState() {
+        val t = current ?: return
+        val playing = isPlayingSafe()
+        val key = Downloads.key(t)
+        if (key == lastPushedTrackKey && playing == lastPushedPlaying) return
+        lastPushedTrackKey = key
+        lastPushedPlaying = playing
+        PlaybackBridge.push(
+            PlaybackBridge.State(
+                title = t.title,
+                artist = t.artist,
+                artworkUrl = t.artworkSmall ?: t.artworkLarge,
+                isPlaying = playing,
+                durationMs = player?.durationMs?.takeIf { it > 0 } ?: (t.duration * 1000L),
+                positionMs = player?.positionMs?.takeIf { it >= 0 } ?: 0L,
+                hasNext = expectedNextIndex() != null || manualIndices.isNotEmpty(),
+                hasPrev = queueIndex > 0 || currentOrderPos() > 0,
+                trackKey = key
+            )
+        )
+    }
+
+    /** POST_NOTIFICATIONS, asked once per process at first play
+     *  with the honest one-liner. Denial changes nothing about
+     *  playback: the service still runs, the system just hides
+     *  its notification. */
+    private fun requestNotifPermissionIfNeeded() {
+        if (android.os.Build.VERSION.SDK_INT < 33) return
+        if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) return
+        if (notifPermRequested) return
+        notifPermRequested = true
+        Toast.makeText(
+            this,
+            "Allow notifications to get playback controls on your lock screen",
+            Toast.LENGTH_LONG
+        ).show()
+        requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 7718)
     }
 
     /**
@@ -4201,12 +4975,183 @@ class MainActivity : Activity() {
      * playing. (v4 drove it from the setting alone, so the bars
      * "played" next to a pause-state play button.)
      */
+    // ------------------------------------------------- v6.1: live visualizer
+
+    private fun vizBarsEnabled(): Boolean =
+        getPreferences(MODE_PRIVATE).getBoolean("setting_Visualizer", true)
+
+    private fun liveVizOn(): Boolean =
+        getPreferences(MODE_PRIVATE).getBoolean("setting_Live visualizer", true)
+
+    /** The Settings subtitle for Live visualizer — it tells the
+     *  truth about the permission state, in the mandated words. */
+    private fun liveVizSubtitle(): String = when {
+        !liveVizOn() -> "Off — bars use a decorative pulse instead"
+        !vizPermissionGranted() -> "Permission needed — reads audio levels only, nothing is recorded"
+        else -> "Reads audio levels only — nothing is recorded"
+    }
+
+    private fun vizPermissionGranted(): Boolean =
+        checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    /**
+     * Keeps the audiofx Visualizer attached to the player that is
+     * (or is becoming) audible. Called from every playback-state
+     * change (via updateVisualizerState / refreshPlaybackUi) plus
+     * the crossfade edges: `player` flips to the incoming player
+     * the moment a fade starts, so following `player` IS following
+     * the audible side of the fade. Cheap when nothing changed —
+     * the session id compare short-circuits.
+     */
+    private fun syncVisualizerSession() {
+        val p = player
+        val want = p != null && isPlayingSafe() && vizBarsEnabled() && liveVizOn()
+        if (!want) {
+            stopLiveViz()
+            return
+        }
+        if (!vizPermissionGranted()) {
+            stopLiveViz()
+            // Ask once per process, with the rationale up front:
+            // the levels are computed on-device and discarded —
+            // nothing is recorded, stored or sent anywhere.
+            if (!vizPermRequested) {
+                vizPermRequested = true
+                Toast.makeText(
+                    this,
+                    "Live visualizer needs microphone permission — it reads audio levels only, nothing is recorded.",
+                    Toast.LENGTH_LONG
+                ).show()
+                if (android.os.Build.VERSION.SDK_INT >= 23) {
+                    requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO), 7717)
+                }
+            }
+            return
+        }
+        val sid = p.audioSessionId
+        if (sid <= 0) {
+            // Session not assigned yet (player not READY);
+            // onPlayerReady re-runs this via refreshPlaybackUi.
+            stopLiveViz()
+            return
+        }
+        if (sid == liveVizFailedSession) {
+            stopLiveViz()
+            return
+        }
+        if (liveViz != null && liveVizSession == sid && liveVizActive) return
+        startLiveViz(sid)
+    }
+
+    private fun startLiveViz(sessionId: Int) {
+        releaseLiveViz()
+        try {
+            val v = android.media.audiofx.Visualizer(sessionId)
+            val maxCapture = android.media.audiofx.Visualizer.getCaptureSizeRange()[1]
+            v.captureSize = maxCapture.coerceAtMost(1024)
+            v.enabled = true
+            liveViz = v
+            liveVizSession = sessionId
+            liveVizActive = true
+            // Real levels drive the bars now; the decorative pulse
+            // stands down (it would fight the FFT writes).
+            setVisualizerPulsing(false)
+            handler.removeCallbacks(vizTick)
+            handler.post(vizTick)
+        } catch (e: Exception) {
+            // Some OEM builds refuse Visualizer creation (or the
+            // session ended mid-flight): mark the session failed
+            // and let the caller's state pass start the decorative
+            // pulse — no retry, no recursion.
+            releaseLiveViz()
+            liveVizActive = false
+            liveVizFailedSession = sessionId
+        }
+    }
+
+    private fun releaseLiveViz() {
+        liveViz?.let {
+            try { it.enabled = false } catch (_: Exception) {}
+            try { it.release() } catch (_: Exception) {}
+        }
+        liveViz = null
+        liveVizSession = -1
+    }
+
+    /** Stops live capture entirely (paused / stopped / backgrounded
+     *  / feature off). The Visualizer is RELEASED, not just
+     *  disabled, so nothing holds the audio session while idle. */
+    private fun stopLiveViz() {
+        handler.removeCallbacks(vizTick)
+        val wasActive = liveVizActive
+        liveVizActive = false
+        releaseLiveViz()
+        if (wasActive) vizLevels.fill(0f)
+    }
+
+    /** One FFT poll (~30fps via vizTick; ~15fps under Reduce
+     *  Motion, which also damps amplitude). Four log-spaced bands
+     *  mapped onto the same 4 bars the decorative pulse used, so
+     *  no layout moves. Fast attack, slow decay smoothing. */
+    private fun pollVizFft() {
+        val v = liveViz ?: run { liveVizActive = false; return }
+        try {
+            if (v.getFft(vizFft) != android.media.audiofx.Visualizer.SUCCESS) return
+        } catch (e: Exception) {
+            // Poll blew up mid-stream: retire this session for good
+            // and fall back to the pulse via the state pass.
+            liveVizFailedSession = liveVizSession
+            stopLiveViz()
+            updateVisualizerState()
+            return
+        }
+        // FFT layout: [0]=DC, [1]=Nyquist, then re/im pairs per
+        // bin. Bands (upper bin edges) are log-spaced for music.
+        val edges = intArrayOf(3, 9, 24, 64)
+        var prev = 1
+        val rm = reduceMotion()
+        for (b in 0 until 4) {
+            var sum = 0f
+            var n = 0
+            for (k in prev..edges[b]) {
+                val re = vizFft[2 * k].toInt()
+                val im = vizFft[2 * k + 1].toInt()
+                sum += kotlin.math.sqrt((re * re + im * im).toFloat())
+                n++
+            }
+            prev = edges[b] + 1
+            var target = if (n > 0) (sum / n) / 110f else 0f
+            if (rm) target *= 0.55f
+            target = target.coerceIn(0f, 1f)
+            val cur = vizLevels[b]
+            vizLevels[b] = if (target > cur) {
+                cur + (target - cur) * 0.6f
+            } else {
+                cur + (target - cur) * 0.18f
+            }
+        }
+        applyVizLevels(miniVisualizerBars)
+        for (set in visualizerBarSets) applyVizLevels(set)
+    }
+
+    private fun applyVizLevels(bars: Array<View>?) {
+        if (bars == null) return
+        for (i in bars.indices) {
+            val lvl = vizLevels[i % vizLevels.size]
+            bars[i].scaleY = (0.25f + lvl * 1.5f).coerceIn(0.2f, 1.8f)
+        }
+    }
+
     private fun updateVisualizerState() {
         if (!::visualizerView.isInitialized) return
-        val on = getPreferences(MODE_PRIVATE).getBoolean("setting_Visualizer", true)
+        // 0.6.1: (re)attach live capture to the audible session
+        // first; the pulse below only runs when live is NOT feeding.
+        syncVisualizerSession()
+        val on = vizBarsEnabled()
         val show = on && isPlayingSafe()
         visualizerView.visibility = if (show) View.VISIBLE else View.GONE
-        setVisualizerPulsing(show)
+        setVisualizerPulsing(show && !liveVizActive)
     }
 
     /** One shared animator pulses every registered visualizer bar
@@ -4410,9 +5355,43 @@ class MainActivity : Activity() {
             lastNpLyricText = cur
             npLyricLine.text = cur
         }
+        // Same halo as the full lyrics view, smaller radius: these
+        // lines always show the CURRENT line, so the glow is simply
+        // re-asserted on each line change (the change guard above
+        // keeps it off the per-tick path).
+        setLyricGlow(npLyricLine, 10)
         if (::npLyricsCardCur.isInitialized) {
             npLyricsCardCur.text = cur
             npLyricsCardNext.text = lines.getOrNull(idx + 1)?.text?.ifEmpty { "♪" } ?: ""
+            setLyricGlow(npLyricsCardCur, 10)
+        }
+    }
+
+    // ------------------------------------------------- v6.1: lyric glow
+
+    /**
+     * Halo color for the CURRENT lyric line (0.6.1, from Arz's
+     * inspo board): the ambient artwork color when ambience is on,
+     * else the theme accent — lightened 55% toward white so the
+     * halo stays luminous without ever dropping the line's own
+     * contrast: the glow sits AROUND full-bright white text, it
+     * never replaces the text color.
+     */
+    private fun lyricGlowColor(): Int {
+        val base = (if (ambientOn()) ambientColor else null) ?: accent
+        fun lift(c: Int) = (c + (255 - c) * 0.55f).toInt().coerceIn(0, 255)
+        return Color.rgb(lift(Color.red(base)), lift(Color.green(base)), lift(Color.blue(base)))
+    }
+
+    /** Applies (radius > 0) or clears (radius = 0) the glow shadow
+     *  on a lyric line. Static effect — set only when the current
+     *  line CHANGES, never per frame, and Reduce Motion does not
+     *  gate it. */
+    private fun setLyricGlow(tv: TextView, radiusDp: Int) {
+        if (radiusDp <= 0) {
+            tv.setShadowLayer(0f, 0f, 0f, 0)
+        } else {
+            tv.setShadowLayer(dp(radiusDp).toFloat(), 0f, 0f, lyricGlowColor())
         }
     }
 
@@ -4493,7 +5472,9 @@ class MainActivity : Activity() {
         }
         menuPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = solidBg(22f, Color.rgb(40, 40, 40))
+            // Glass sheet (0.6.1) when glass is on; v6 solid sheet
+            // when off. The dim backdrop behind stays as it was.
+            background = if (glassOn()) chromeGlass(22f) else solidBg(22f, Color.rgb(40, 40, 40))
             setPadding(dp(8), dp(10), dp(8), dp(10))
             elevation = dp(16).toFloat()
             isClickable = true // absorb taps; only the dim backdrop dismisses
@@ -4795,6 +5776,7 @@ class MainActivity : Activity() {
     }
 
     private fun showLibrary() {
+        navRoot("tab:library") { showLibrary() }
         visibleScreen = "Library"
         generation++
         beginScreen("Library", showAvatar = false)
@@ -4865,6 +5847,40 @@ class MainActivity : Activity() {
         } catch (_: Exception) {
             Toast.makeText(this, "No file picker available on this device", Toast.LENGTH_LONG).show()
         }
+    }
+
+    // ------------------------------------------------- v6.1: lifecycle hooks
+
+    /** Capture never runs while the app is backgrounded: the
+     *  Visualizer is released here and re-created by the state
+     *  sync on resume if playback is still going. */
+    override fun onPause() {
+        super.onPause()
+        stopLiveViz()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::content.isInitialized) updateVisualizerState()
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 7718) {
+            // Notification permission answered: granted or not,
+            // playback continues exactly as before.
+            return
+        }
+        if (requestCode != 7717) return
+        // Granted: live levels start on the next state pass.
+        // Denied: the Settings row subtitle now reads "Permission
+        // needed" and the decorative pulse keeps covering.
+        updateVisualizerState()
+        if (visibleScreen == "Settings") showSettings()
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -5037,6 +6053,7 @@ class MainActivity : Activity() {
     }
 
     private fun showPlaylist(playlistId: String) {
+        pushNav("playlist:$playlistId") { showPlaylist(playlistId) }
         visibleScreen = "Playlist"
         generation++
         val p = Playlists.get(this, playlistId) ?: run {
@@ -5162,6 +6179,7 @@ class MainActivity : Activity() {
     }
 
     private fun showLiked() {
+        pushNav("liked") { showLiked() }
         visibleScreen = "Liked"
         generation++
         beginScreen("Liked Songs", showAvatar = false)
@@ -5176,6 +6194,7 @@ class MainActivity : Activity() {
     }
 
     private fun showHistory() {
+        pushNav("history") { showHistory() }
         visibleScreen = "History"
         generation++
         beginScreen("Listening History", showAvatar = false)
@@ -5191,6 +6210,7 @@ class MainActivity : Activity() {
     }
 
     private fun showStats() {
+        pushNav("stats") { showStats() }
         visibleScreen = "Stats"
         generation++
         beginScreen("Your Listening", showAvatar = false)
@@ -5404,6 +6424,7 @@ class MainActivity : Activity() {
     }
 
     private fun showDownloads() {
+        navRoot("tab:downloads") { showDownloads() }
         generation++
         beginScreen("Downloads", showAvatar = false)
         dlProgressViews.clear()
@@ -5761,6 +6782,12 @@ class MainActivity : Activity() {
                         setOnClickListener {
                             // Tap-to-seek lands where the highlight
                             // says the line is: offset applied.
+                            // The glow leaves the old line HERE:
+                            // resetting the active index would
+                            // otherwise orphan its shadow (the
+                            // highlight's prev-line cleanup keys off
+                            // the index being reset).
+                            lyricsLineViews.getOrNull(lyricsActiveLine)?.let { setLyricGlow(it, 0) }
                             player?.seekTo((line.timeMs - seekOffset).coerceAtLeast(0L))
                             lyricsActiveLine = -2
                             updateLyricsHighlight()
@@ -5811,11 +6838,17 @@ class MainActivity : Activity() {
                 if (idx > prev) Color.argb(64, 255, 255, 255) else Color.argb(120, 255, 255, 255)
             )
             it.typeface = semiboldTf
+            // The glow belongs to the current line ONLY: it leaves
+            // with the highlight.
+            setLyricGlow(it, 0)
         }
         lyricsActiveLine = idx
         val view = lyricsLineViews.getOrNull(idx) ?: return
         view.setTextColor(Color.WHITE)
         view.typeface = boldTf
+        // Luminous halo around the live line (inspo board): soft
+        // shadowLayer, no bitmap work, set once per line change.
+        setLyricGlow(view, 18)
         // Keep the current line centered-ish (inspo): a third of
         // the viewport down, not pinned to a fixed offset.
         val y = (view.top - lyricsScroll.height / 3).coerceAtLeast(0)
@@ -5827,7 +6860,11 @@ class MainActivity : Activity() {
     private fun buildQueueOverlay(root: FrameLayout) {
         queueOverlay = FrameLayout(this).apply {
             visibility = View.GONE
-            setBackgroundColor(Color.argb(250, 0, 0, 0))
+            // Glass backdrop (0.6.1): the near-opaque black softens
+            // so the screen behind ghosts through; solid when off.
+            setBackgroundColor(
+                if (glassOn()) Color.argb(216, 8, 8, 10) else Color.argb(250, 0, 0, 0)
+            )
         }
         val inner = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -6061,9 +7098,25 @@ class MainActivity : Activity() {
 
     // ---------------------------------------------------------------- helpers kept from the original UI
 
-    private fun setting(name: String, default: Boolean, onChange: ((Boolean) -> Unit)? = null): Switch {
+    /** Leading glyph per switch-setting (0.6.1 icon pass — Arz:
+     *  "add icons at settings"): drawn in the app's stroke
+     *  language, one per row, secondary tint. */
+    private fun settingIconRes(name: String): Int? = when (name) {
+        "Data saver" -> R.drawable.ic_download
+        "Autoplay" -> R.drawable.ic_next
+        "Gapless playback" -> R.drawable.ic_queue
+        "Ambient color from artwork" -> R.drawable.ic_ambient
+        "Visualizer" -> R.drawable.ic_visual
+        "Live visualizer" -> R.drawable.ic_wave
+        "Glass effects" -> R.drawable.ic_glass
+        "Compact mini-player" -> R.drawable.ic_compact
+        "Reduce motion" -> R.drawable.ic_motion
+        else -> null
+    }
+
+    private fun setting(name: String, default: Boolean, onChange: ((Boolean) -> Unit)? = null): View {
         val key = "setting_$name"
-        return Switch(this).apply {
+        val sw = Switch(this).apply {
             text = name
             textSize = 15f
             setTextColor(Color.WHITE)
@@ -6085,6 +7138,19 @@ class MainActivity : Activity() {
                 onChange?.invoke(checked)
             }
         }
+        // Icon slot (0.6.1): 22dp glyph, secondary tint, same slot
+        // geometry as the tappable rows.
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        settingIconRes(name)?.let { res ->
+            val ivLp = LinearLayout.LayoutParams(dp(22), dp(22))
+            ivLp.marginEnd = dp(12)
+            row.addView(icon(res, white55), ivLp)
+        }
+        row.addView(sw, LinearLayout.LayoutParams(0, -2, 1f))
+        return row
     }
 
     private fun visualizer(permanent: Boolean = false): LinearLayout {
@@ -6148,6 +7214,72 @@ class MainActivity : Activity() {
         }
     }
 
+    // ------------------------------------------------- v6.1: back navigation
+
+    /** Marks [restore] as the root of the current tab, dropping
+     *  any content-screen history. Called at the top of every tab
+     *  root screen; a no-op while a pop is re-rendering. */
+    private fun navRoot(key: String, restore: () -> Unit) {
+        if (navRestoring) return
+        navStack.clear()
+        navStack.add(NavEntry(key, restore))
+    }
+
+    /** Pushes a content screen onto the back-stack. Re-entering
+     *  the SAME screen (a refresh re-render, e.g. after a rename)
+     *  replaces the top entry instead of stacking a duplicate, so
+     *  Back never lands on the screen you're already looking at. */
+    private fun pushNav(key: String, restore: () -> Unit) {
+        if (navRestoring) return
+        val top = navStack.lastOrNull()
+        if (top != null && top.key == key) {
+            navStack[navStack.lastIndex] = NavEntry(key, restore)
+        } else {
+            navStack.add(NavEntry(key, restore))
+        }
+    }
+
+    /** Pops exactly one level: re-renders the screen beneath the
+     *  current one. Returns false at a tab root (nothing to pop),
+     *  where the system Back behavior takes over. */
+    private fun goBack(): Boolean {
+        if (navStack.size <= 1) return false
+        navStack.removeAt(navStack.lastIndex)
+        val target = navStack.last()
+        navRestoring = true
+        try {
+            target.restore()
+        } finally {
+            navRestoring = false
+        }
+        return true
+    }
+
+    /** The shared back-arrow affordance (36dp, soft circle). */
+    private fun backArrowView(): ImageView = icon(R.drawable.ic_back, Color.WHITE).apply {
+        contentDescription = "Back"
+        background = GradientDrawable().apply {
+            setColor(Color.argb(30, 255, 255, 255))
+            shape = GradientDrawable.OVAL
+        }
+        setPadding(dp(7), dp(7), dp(7), dp(7))
+        setOnClickListener { goBack() }
+    }
+
+    /** Back-arrow row for the custom-header screens (artist,
+     *  album, remote playlist), which don't use [beginScreen].
+     *  Adds nothing at a tab root (stack size 1). Called at screen
+     *  entry AND after the async re-render replaces the content. */
+    private fun addScreenBackArrow() {
+        if (navStack.size <= 1) return
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row.addView(backArrowView(), LinearLayout.LayoutParams(dp(36), dp(36)))
+        val lp = LinearLayout.LayoutParams(-1, -2)
+        lp.bottomMargin = dp(4)
+        row.layoutParams = lp
+        content.addView(row)
+    }
+
     private fun beginScreen(title: String, showAvatar: Boolean) {
         visibleScreen = title
         visualizerBarSets.clear()
@@ -6167,6 +7299,14 @@ class MainActivity : Activity() {
                 // The row now guarantees room for the full circle.
                 minimumHeight = dp(44)
             }
+        }
+        // Back arrow (0.6.1): present exactly when the back-stack
+        // has somewhere to go — content screens get it, the five
+        // tab roots (stack size 1) never do.
+        if (navStack.size > 1) {
+            val bLp = LinearLayout.LayoutParams(dp(36), dp(36))
+            bLp.marginEnd = dp(10)
+            head.addView(backArrowView(), bLp)
         }
         head.addView(label(title, 32f, Color.WHITE, boldTf).apply {
             letterSpacing = -0.01f
@@ -6221,6 +7361,12 @@ class MainActivity : Activity() {
         handler.removeCallbacks(crossfadeTick)
         outPlayer?.release()
         player?.release()
+        // The engine dies with the activity, so the playback
+        // service (its notification + session) ends too.
+        discardGaplessPrep()
+        stopLiveViz()
+        PlaybackBridge.controls = null
+        PlaybackService.stop(this)
         executor.shutdownNow()
         playerExecutor.shutdownNow()
         lyricsExecutor.shutdownNow()
