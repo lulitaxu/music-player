@@ -8,18 +8,13 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Build
-import android.os.Handler
 import android.os.IBinder
-import android.os.Looper
 import android.os.SystemClock
 import androidx.media3.common.util.UnstableApi
-import java.net.URL
-import java.util.concurrent.Executors
 
 /**
  * The shared player-state bridge (0.6.1, background playback).
@@ -92,16 +87,14 @@ object PlaybackBridge {
 class PlaybackService : Service() {
 
     private lateinit var session: MediaSession
-    private val mainHandler = Handler(Looper.getMainLooper())
 
     /** Set in onDestroy: late artwork fetches and bridge pushes
      *  racing the teardown must not render into a dead service. */
     @Volatile
     private var destroyed = false
 
-    /** Row-size artwork for the notification, fetched off the
-     *  bridge state's small rendition only when the track changes. */
-    private val artExecutor = Executors.newSingleThreadExecutor()
+    /** Row-size artwork for the notification, adopted from the
+     *  shared loader only when the track changes. */
     @Volatile
     private var artBitmap: Bitmap? = null
     @Volatile
@@ -173,7 +166,6 @@ class PlaybackService : Service() {
             session.release()
         } catch (_: Exception) {
         }
-        artExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -257,11 +249,12 @@ class PlaybackService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-    /** Fetches the row-size artwork for a NEW track only, on a
-     *  single background thread; the decoded bitmap is capped at
-     *  256px so the notification never carries Now-Playing-size
-     *  art (Helio G95 budget). Local/on-device tracks carry no URL
-     *  and simply render without art. */
+    /** Artwork for a NEW track only, read through the SHARED UI
+     *  loader (0.6.3, audit S3): this used to be a private 6th
+     *  fetch of the same image — worse, a FULL-resolution decode
+     *  scaled down afterwards. The loader's caches serve the
+     *  256px bucket the UI already decoded (or decode it once on
+     *  the hero thread, bytes shared with every other bucket). */
     private fun fetchArtIfNeeded(s: PlaybackBridge.State) {
         val url = s.artworkUrl
         if (url == null) {
@@ -274,34 +267,13 @@ class PlaybackService : Service() {
         if (artForKey == s.trackKey) return
         artForKey = s.trackKey
         artBitmap = null
-        artExecutor.execute {
-            val bmp = try {
-                val bytes = URL(url).openStream().use { it.readBytes() }
-                val raw = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return@execute
-                val scale = 256f / maxOf(raw.width, raw.height).coerceAtLeast(1)
-                if (scale < 1f) {
-                    Bitmap.createScaledBitmap(
-                        raw,
-                        (raw.width * scale).toInt().coerceAtLeast(1),
-                        (raw.height * scale).toInt().coerceAtLeast(1),
-                        true
-                    )
-                } else {
-                    raw
-                }
-            } catch (e: Exception) {
-                null
-            }
-            if (bmp != null) {
-                mainHandler.post {
-                    // Only adopt the art if it still belongs to the
-                    // current track (fast skips outrun fetches) and
-                    // the service is still alive.
-                    if (!destroyed && artForKey == s.trackKey) {
-                        artBitmap = bmp
-                        render()
-                    }
-                }
+        ArtworkLoader.bitmapFor(url, 256) { bmp ->
+            // Only adopt the art if it still belongs to the
+            // current track (fast skips outrun fetches) and
+            // the service is still alive.
+            if (bmp != null && !destroyed && artForKey == s.trackKey) {
+                artBitmap = bmp
+                render()
             }
         }
     }
