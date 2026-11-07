@@ -1,5 +1,7 @@
 package com.arzx.music
 
+import android.content.Context
+import android.content.SharedPreferences
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -105,6 +107,41 @@ object YtmApi {
     private var visitor: String? = null
     @Volatile
     private var visitorTried = false
+
+    // ------------------------------------------------------------ last-good client memory
+
+    /**
+     * The label of the player client context that most recently
+     * produced a playable stream. Resolution tries it FIRST (see
+     * [streamAttemptLabels]): v5 always walked the fixed client
+     * order, so a device where ANDROID_MUSIC fails paid every
+     * timeout on every track. Persisted via [initStore] so the
+     * memory survives process death, not just the session.
+     */
+    @Volatile
+    private var lastGoodLabel: String? = null
+
+    @Volatile
+    private var store: SharedPreferences? = null
+
+    /** Wires the last-good-client memory to disk. Call once from the
+     *  activity's onCreate; harmless to call again. */
+    fun initStore(ctx: Context) {
+        if (store != null) return
+        val prefs = ctx.applicationContext
+            .getSharedPreferences("arzxsh_ytm", Context.MODE_PRIVATE)
+        store = prefs
+        lastGoodLabel = prefs.getString("last_good_client", null)
+    }
+
+    private fun noteClientSuccess(label: String) {
+        if (label == lastGoodLabel) return
+        lastGoodLabel = label
+        try {
+            store?.edit()?.putString("last_good_client", label)?.apply()
+        } catch (_: Exception) {
+        }
+    }
 
     // ------------------------------------------------------------ transport
 
@@ -831,8 +868,18 @@ object YtmApi {
 
     /** Outcome of one Innertube stream resolution: a direct audio URL
      *  when one was exposed, plus a per-client report either way. The
-     *  report is user-visible diagnostics, not a log line. */
-    data class YtmStreamResult(val url: String?, val report: String)
+     *  report is user-visible diagnostics, not a log line.
+     *  [userAgent] is the UA of the client context that produced the
+     *  URL — googlevideo binds stream URLs to the requesting client,
+     *  so the player MUST send this exact UA or the URL is rejected
+     *  (the v5 MediaPlayer -38 failure). [clientLabel] names that
+     *  context for reports and the retry ladder. */
+    data class YtmStreamResult(
+        val url: String?,
+        val report: String,
+        val userAgent: String? = null,
+        val clientLabel: String? = null
+    )
 
     private class PlayerClient(
         val label: String,
@@ -903,8 +950,10 @@ object YtmApi {
         val conn = (URL("https://youtubei.googleapis.com/youtubei/v1/player?key=${client.key}&alt=json")
             .openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
-            connectTimeout = 15_000
-            readTimeout = 15_000
+            // 8s, not 15s: the client walk multiplies whatever this
+            // is, and a dead context must fail fast (v5.1 speed fix).
+            connectTimeout = 8_000
+            readTimeout = 8_000
             doOutput = true
             setRequestProperty("Content-Type", "application/json")
             setRequestProperty("User-Agent", client.ua)
@@ -929,7 +978,7 @@ object YtmApi {
      * directly playable, and the note says why (not playable, or every
      * audio format was signature-ciphered — reported, never forged).
      * DASH/HLS manifest URLs are never selected: the app hands the URL
-     * straight to MediaPlayer.
+     * straight to the player as a plain file.
      */
     private fun pickStream(resp: JSONObject, quality: String): Pair<String?, String> {
         val status = resp.optJSONObject("playabilityStatus")
@@ -979,35 +1028,81 @@ object YtmApi {
         return picked.url to "OK"
     }
 
+    /** Label of the catalog WEB_REMIX context in attempt orders. */
+    const val LABEL_WEB_REMIX = "WEB_REMIX"
+
+    /**
+     * The order stream-resolution attempts run in: the client that
+     * last produced a playable stream FIRST (persisted across
+     * sessions), then the canonical client order, with the catalog
+     * WEB_REMIX context last among the Innertube contexts. The
+     * playback retry ladder walks this list one attempt at a time;
+     * [resolveStream] walks it until the first success.
+     */
+    fun streamAttemptLabels(): List<String> {
+        val ordered = ArrayList<String>()
+        lastGoodLabel?.let { if (it !in ordered) ordered += it }
+        PLAYER_CLIENTS.forEach { if (it.label !in ordered) ordered += it.label }
+        if (LABEL_WEB_REMIX !in ordered) ordered += LABEL_WEB_REMIX
+        return ordered
+    }
+
+    /**
+     * ONE stream-resolution attempt against ONE client context.
+     * Returns the direct URL plus the producing context's UA on
+     * success (the player must replay that UA — see
+     * [YtmStreamResult.userAgent]); otherwise a one-line report.
+     */
+    fun resolveStreamAttempt(videoId: String, quality: String, label: String): YtmStreamResult {
+        if (label == LABEL_WEB_REMIX) {
+            return try {
+                val body = JSONObject()
+                    .put("videoId", videoId)
+                    .put("racyCheckOk", true)
+                    .put("contentCheckOk", true)
+                val (url, note) = pickStream(post("player", body), quality)
+                if (url != null) {
+                    noteClientSuccess(LABEL_WEB_REMIX)
+                    YtmStreamResult(url, "WEB_REMIX OK", UA, LABEL_WEB_REMIX)
+                } else {
+                    YtmStreamResult(null, "WEB_REMIX: $note")
+                }
+            } catch (t: Throwable) {
+                YtmStreamResult(null, "WEB_REMIX: ${shortErr(t)}")
+            }
+        }
+        val client = PLAYER_CLIENTS.firstOrNull { it.label == label }
+            ?: return YtmStreamResult(null, "$label: unknown client")
+        return try {
+            val (url, note) = pickStream(postPlayer(client, videoId), quality)
+            if (url != null) {
+                noteClientSuccess(label)
+                YtmStreamResult(url, "${client.label} OK", client.ua, client.label)
+            } else {
+                YtmStreamResult(null, "${client.label}: $note")
+            }
+        } catch (t: Throwable) {
+            YtmStreamResult(null, "${client.label}: ${shortErr(t)}")
+        }
+    }
+
     /**
      * Resolves a direct audio stream URL for [videoId] through the
-     * Innertube player endpoint, walking the client-context chain.
-     * [quality] is "data" (lowest bitrate), "normal" (best ≤160kbps)
-     * or "high" (best available). Stops at the first client that
-     * exposes a direct URL; the report names every attempt otherwise.
+     * Innertube player endpoint, walking the client-context chain in
+     * [streamAttemptLabels] order. [quality] is "data" (lowest
+     * bitrate), "normal" (best ≤160kbps) or "high" (best available).
+     * Stops at the first client that exposes a direct URL; the
+     * report names every attempt otherwise. Used where a single
+     * blocking resolution is the right shape (downloads); live
+     * playback drives [resolveStreamAttempt] itself so a player
+     * rejection can advance to the next context.
      */
     fun resolveStream(videoId: String, quality: String = "normal"): YtmStreamResult {
         val attempts = ArrayList<String>()
-        for (client in PLAYER_CLIENTS) {
-            try {
-                val (url, note) = pickStream(postPlayer(client, videoId), quality)
-                if (url != null) return YtmStreamResult(url, "${client.label} OK")
-                attempts += "${client.label}: $note"
-            } catch (t: Throwable) {
-                attempts += "${client.label}: ${shortErr(t)}"
-            }
-        }
-        // Last resort: the WEB_REMIX context the catalog calls use.
-        try {
-            val body = JSONObject()
-                .put("videoId", videoId)
-                .put("racyCheckOk", true)
-                .put("contentCheckOk", true)
-            val (url, note) = pickStream(post("player", body), quality)
-            if (url != null) return YtmStreamResult(url, "WEB_REMIX OK")
-            attempts += "WEB_REMIX: $note"
-        } catch (t: Throwable) {
-            attempts += "WEB_REMIX: ${shortErr(t)}"
+        for (label in streamAttemptLabels()) {
+            val r = resolveStreamAttempt(videoId, quality, label)
+            if (r.url != null) return r
+            attempts += r.report
         }
         return YtmStreamResult(null, attempts.joinToString(" · "))
     }

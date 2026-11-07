@@ -111,9 +111,14 @@ object Downloads {
         shouldContinue: () -> Boolean = { true },
         onProgress: (Int) -> Unit = {}
     ): Entry {
+        var streamUa: String? = null
         val url = when (track.source) {
             SOURCE_YOUTUBE -> {
                 val resolved = StreamResolver.resolveYoutube(track.id, quality)
+                // googlevideo binds the URL to the requesting client:
+                // the download fetch must send the producing context's
+                // UA, exactly like playback (v5 sent none at all).
+                streamUa = resolved.userAgent
                 resolved.url ?: throw RuntimeException("stream resolution failed: ${resolved.report}")
             }
             SOURCE_LOCAL -> throw RuntimeException("already on this device")
@@ -127,6 +132,7 @@ object Downloads {
             connectTimeout = 15_000
             readTimeout = 60_000
             instanceFollowRedirects = true
+            streamUa?.let { setRequestProperty("User-Agent", it) }
         }
         try {
             if (conn.responseCode !in 200..299) throw RuntimeException("HTTP ${conn.responseCode}")
