@@ -6,6 +6,7 @@ import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Outline
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
@@ -25,11 +26,14 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.common.AudioAttributes as Media3AudioAttributes
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.text.InputFilter
+import android.text.InputType
 import android.text.TextUtils
 import android.util.LruCache
 import android.util.TypedValue
@@ -38,6 +42,7 @@ import android.view.MotionEvent
 import android.view.VelocityTracker
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.ViewOutlineProvider
 import android.view.ViewGroup
 import android.animation.ValueAnimator
 import android.view.animation.AccelerateInterpolator
@@ -833,6 +838,14 @@ class MainActivity : Activity() {
 
     /** Activity-result code for the local-file document picker. */
     private val reqImport = 4205
+    private val reqProfilePhoto = 4206
+
+    // Local profile (0.6.4, WS-2): every header avatar box ever
+    // built by this instance (tab retention keeps more than one
+    // alive), so a photo/name change refreshes all of them.
+    private val avatarBoxes = ArrayList<FrameLayout>()
+    private var profilePreviewBox: FrameLayout? = null
+    private var profileDialog: android.app.AlertDialog? = null
 
     /** Which full-screen section is showing (for live row refresh). */
     private var visibleScreen = "home"
@@ -936,7 +949,6 @@ class MainActivity : Activity() {
     private val bgColor = Color.rgb(18, 18, 18) // #121212
     private val surface = Color.rgb(26, 26, 26) // #1A1A1A
     private val surface2 = Color.rgb(35, 35, 35) // #232323
-    private val purple = Color.rgb(125, 42, 232)
     private val white50 = Color.rgb(167, 167, 167)
     private val white55 = Color.rgb(179, 179, 179) // #B3B3B3
     private val white75 = Color.argb(191, 255, 255, 255)
@@ -6718,7 +6730,7 @@ class MainActivity : Activity() {
         if (restoreRoot("Library")) return
         visibleScreen = "Library"
         generation++
-        beginScreen("Library", showAvatar = false)
+        beginScreen("Library", showAvatar = true)
         displayedRootTab = "Library"
 
         content.addView(sectionTitle("Playlists"))
@@ -6851,7 +6863,12 @@ class MainActivity : Activity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != reqImport || resultCode != RESULT_OK || data == null) return
+        if (resultCode != RESULT_OK || data == null) return
+        if (requestCode == reqProfilePhoto) {
+            data.data?.let { onProfilePhotoPicked(it) }
+            return
+        }
+        if (requestCode != reqImport) return
         val uris = ArrayList<android.net.Uri>()
         val clip = data.clipData
         if (clip != null) {
@@ -8542,19 +8559,24 @@ class MainActivity : Activity() {
             letterSpacing = -0.01f
         }, LinearLayout.LayoutParams(0, -2, 1f))
         if (showAvatar) {
-            val avatar = label("A", 14f, Color.WHITE, boldTf).apply {
-                gravity = Gravity.CENTER
-                background = GradientDrawable(
-                    GradientDrawable.Orientation.TL_BR,
-                    intArrayOf(accent, purple)
-                ).apply { shape = GradientDrawable.OVAL }
+            // Local profile corner (0.6.4, WS-2): the profile
+            // photo when one is set, else the display-name
+            // initial on a SOLID theme-accent circle — the old
+            // accent→purple gradient is gone (it read as stock
+            // AI decoration). Tapping opens the profile sheet.
+            val avatarBox = FrameLayout(this).apply {
+                isClickable = true
+                contentDescription = "Profile"
+                setOnClickListener { showProfileSheet() }
             }
+            fillAvatar(avatarBox, 34)
+            avatarBoxes.add(avatarBox)
             // No top margin (vertical centering handles placement);
             // the end side keeps the content's standard 22dp inset via
             // the content padding, aligned with every other row.
             val aLp = LinearLayout.LayoutParams(dp(34), dp(34))
             aLp.marginStart = dp(10)
-            head.addView(avatar, aLp)
+            head.addView(avatarBox, aLp)
         }
         content.addView(head)
         // Cheap 150ms fade so tab switches don't hard-cut.
@@ -8563,6 +8585,175 @@ class MainActivity : Activity() {
         } else {
             content.alpha = 0f
             content.animate().alpha(1f).setDuration(150).start()
+        }
+    }
+
+    // ------------------------------------------------- local profile (0.6.4, WS-2)
+
+    /** (Re)renders an avatar into [box] at [sizeDp]: the
+     *  profile photo (center-cropped, circle-clipped) when one
+     *  is set, else the display-name initial on a solid
+     *  theme-accent circle. Used by the header corner (34dp)
+     *  and the profile sheet preview (96dp). */
+    private fun fillAvatar(box: FrameLayout, sizeDp: Int) {
+        box.removeAllViews()
+        val bmp = Profile.photoBitmap(this)
+        if (bmp != null) {
+            val iv = ImageView(this).apply {
+                setImageBitmap(bmp)
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                outlineProvider = object : ViewOutlineProvider() {
+                    override fun getOutline(view: View, outline: Outline) {
+                        outline.setOval(0, 0, view.width, view.height)
+                    }
+                }
+                clipToOutline = true
+            }
+            box.addView(iv, FrameLayout.LayoutParams(dp(sizeDp), dp(sizeDp)))
+        } else {
+            val tv = label(
+                Profile.initial(this), sizeDp * 0.42f, Color.WHITE, boldTf
+            ).apply {
+                gravity = Gravity.CENTER
+                background = GradientDrawable().apply {
+                    setColor(accent)
+                    shape = GradientDrawable.OVAL
+                }
+            }
+            box.addView(tv, FrameLayout.LayoutParams(dp(sizeDp), dp(sizeDp)))
+        }
+    }
+
+    /** Refreshes every live header avatar after a profile
+     *  change (tab retention can keep several roots alive). */
+    private fun refreshAvatars() {
+        for (box in avatarBoxes) fillAvatar(box, 34)
+    }
+
+    /**
+     * The profile sheet: current picture (tap it — or the photo
+     * row — to change it), an editable display name, and photo
+     * removal. Everything is local (see Profile): no account,
+     * no server, works signed-out forever. When v7's Google
+     * sign-in ships, the Google photo/name take precedence and
+     * this becomes the fallback — not built here.
+     */
+    private fun showProfileSheet() {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(18), dp(24), dp(4))
+        }
+        val preview = FrameLayout(this).apply {
+            isClickable = true
+            contentDescription = "Change profile photo"
+            setOnClickListener { launchProfilePhotoPicker() }
+        }
+        fillAvatar(preview, 96)
+        val pLp = LinearLayout.LayoutParams(dp(96), dp(96))
+        pLp.gravity = Gravity.CENTER_HORIZONTAL
+        box.addView(preview, pLp)
+        profilePreviewBox = preview
+        box.addView(label("On this device only — no account, nothing uploaded", 12.5f, white50).apply {
+            gravity = Gravity.CENTER
+            setPadding(0, dp(10), 0, 0)
+        })
+        val nameLabel = label("Display name", 13f, white50, semiboldTf)
+        val nlLp = LinearLayout.LayoutParams(-1, -2)
+        nlLp.topMargin = dp(18)
+        box.addView(nameLabel, nlLp)
+        val nameInput = EditText(this).apply {
+            setText(Profile.displayName(this@MainActivity))
+            hint = "Your name"
+            setTextColor(Color.WHITE)
+            setHintTextColor(white50)
+            typeface = regularTf
+            setTextSize(15.5f)
+            background = solidBg(10f, surface2)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS
+            filters = arrayOf(InputFilter.LengthFilter(40))
+            isSingleLine = true
+        }
+        val niLp = LinearLayout.LayoutParams(-1, -2)
+        niLp.topMargin = dp(8)
+        niLp.bottomMargin = dp(8)
+        box.addView(nameInput, niLp)
+        box.addView(
+            settingsRow(
+                if (Profile.hasPhoto(this)) "Change photo" else "Set photo",
+                "Pick from your photos",
+                iconRes = R.drawable.ic_image
+            ) { launchProfilePhotoPicker() }
+        )
+        if (Profile.hasPhoto(this)) {
+            box.addView(
+                settingsRow("Remove photo", null, errorColor, iconRes = R.drawable.ic_trash) {
+                    Profile.removePhoto(this@MainActivity)
+                    refreshAvatars()
+                    // Rebuild the sheet so the photo rows match
+                    // the new state (Remove disappears).
+                    profileDialog?.dismiss()
+                    showProfileSheet()
+                }
+            )
+        }
+        val dialog = android.app.AlertDialog.Builder(this)
+            .setTitle("Profile")
+            .setView(box)
+            .setPositiveButton("Done") { _, _ ->
+                Profile.setDisplayName(this, nameInput.text.toString())
+                refreshAvatars()
+            }
+            .setNegativeButton("Cancel", null)
+            .create()
+        profileDialog = dialog
+        dialog.setOnDismissListener {
+            if (profileDialog === dialog) {
+                profileDialog = null
+                profilePreviewBox = null
+            }
+        }
+        dialog.show()
+    }
+
+    /** System photo picker — NO storage permission: API 33+
+     *  gets the dedicated photo picker (ACTION_PICK_IMAGES),
+     *  older versions the document picker in image mode. The
+     *  returned URI's read grant is transient, so the result
+     *  handler copies the image into private storage at once. */
+    private fun launchProfilePhotoPicker() {
+        val intent = if (android.os.Build.VERSION.SDK_INT >= 33) {
+            Intent(MediaStore.ACTION_PICK_IMAGES).apply { type = "image/*" }
+        } else {
+            Intent(Intent.ACTION_GET_CONTENT).apply {
+                type = "image/*"
+                addCategory(Intent.CATEGORY_OPENABLE)
+            }
+        }
+        try {
+            startActivityForResult(intent, reqProfilePhoto)
+        } catch (_: Exception) {
+            Toast.makeText(this, "No photo picker available on this device", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun onProfilePhotoPicked(uri: Uri) {
+        executor.execute {
+            val ok = Profile.savePhotoFromUri(this@MainActivity, uri)
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (ok) {
+                    refreshAvatars()
+                    profilePreviewBox?.let { fillAvatar(it, 96) }
+                    Toast.makeText(
+                        this@MainActivity, "Profile photo set", Toast.LENGTH_SHORT
+                    ).show()
+                } else {
+                    Toast.makeText(
+                        this@MainActivity, "Couldn't use that photo", Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
         }
     }
 
