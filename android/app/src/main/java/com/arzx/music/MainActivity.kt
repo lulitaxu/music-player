@@ -7724,16 +7724,26 @@ class MainActivity : Activity() {
             )
         } else if (mosaicTracks.size == 1) {
             val img = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
-            ArtworkLoader.load(mosaicTracks[0].artworkLarge ?: mosaicTracks[0].artworkSmall, img)
+            // Explicit decode target (optimization pass): the
+            // no-target load falls back to a 512px guess before
+            // layout; the banner is screen-wide, so say so.
+            ArtworkLoader.load(
+                mosaicTracks[0].artworkLarge ?: mosaicTracks[0].artworkSmall,
+                img, null, resources.displayMetrics.widthPixels
+            )
             banner.addView(img, FrameLayout.LayoutParams(-1, -1))
         } else {
             val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            val cellPx = resources.displayMetrics.widthPixels / 2
             for (r in 0 until 2) {
                 val rowL = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
                 for (col in 0 until 2) {
                     val t = mosaicTracks[(r * 2 + col) % mosaicTracks.size]
                     val cell = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
-                    ArtworkLoader.load(t.artworkLarge ?: t.artworkSmall, cell)
+                    // Each cell shows at half screen width; decode
+                    // to that bucket (256) instead of the 512
+                    // fallback — 4 cells, ~4x less decode work.
+                    ArtworkLoader.load(t.artworkLarge ?: t.artworkSmall, cell, null, cellPx)
                     rowL.addView(cell, LinearLayout.LayoutParams(0, -1, 1f))
                 }
                 grid.addView(rowL, LinearLayout.LayoutParams(-1, 0, 1f))
