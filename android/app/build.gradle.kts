@@ -37,8 +37,8 @@ android {
         applicationId = "com.arzx.music"
         minSdk = 26
         targetSdk = 35
-        versionCode = 16
-        versionName = "0.6.8"
+        versionCode = 17
+        versionName = "0.6.9"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -83,6 +83,11 @@ dependencies {
     // where an expanded RecyclerView would bind every row
     // anyway — see the 0.6.3 notes in MainActivity.addRows.)
     implementation("androidx.recyclerview:recyclerview:1.3.2")
+    // Physics-based springs for Views (0.6.9 motion pack): the
+    // one motion system behind the player morph, artwork
+    // breathing and press feedback (see Motion.kt). Library
+    // only — it adds no permissions and no components.
+    implementation("androidx.dynamicanimation:dynamicanimation:1.0.0")
     // Media3 ExoPlayer: googlevideo stream URLs are bound to the
     // client that requested them, so playback must send the SAME
     // User-Agent as the Innertube context that produced the URL.
