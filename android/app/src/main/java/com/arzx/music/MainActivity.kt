@@ -946,13 +946,41 @@ class MainActivity : Activity() {
     private var accentColor: Int = Color.rgb(29, 185, 84) // Spotify green #1DB954
     private val accent: Int get() = accentColor
     private val errorColor = Color.rgb(243, 98, 110)
-    private val bgColor = Color.rgb(18, 18, 18) // #121212
-    private val surface = Color.rgb(26, 26, 26) // #1A1A1A
-    private val surface2 = Color.rgb(35, 35, 35) // #232323
+
+    /** Mixes the theme accent into [base] at [share] strength
+     *  (0 = the base color, 1 = the accent itself), keeping the
+     *  base's alpha. The math behind the 0.6.11 theme reach. */
+    private fun tintWithAccent(base: Int, share: Float): Int {
+        val a = accentColor
+        return Color.argb(
+            Color.alpha(base),
+            (Color.red(base) * (1f - share) + Color.red(a) * share).toInt(),
+            (Color.green(base) * (1f - share) + Color.green(a) * share).toInt(),
+            (Color.blue(base) * (1f - share) + Color.blue(a) * share).toInt()
+        )
+    }
+
+    // Theme reach (0.6.11, Arz: "there is theme color but it
+    // doesn't change except button"): before this, the accent
+    // only reached small controls — buttons, sliders, chips,
+    // dots — while the app's big surfaces (page background,
+    // cards, bars) stayed the same neutral grays for every
+    // theme, so switching themes changed almost nothing you
+    // could see. The base surfaces are now GETTERS that mix the
+    // accent into the neutral at low strength: green gives a
+    // deep green-black app, red a deep wine-black, blue a deep
+    // navy-black. Still dark, still readable, but the whole app
+    // wears the theme, not just its buttons. Every surface in
+    // the app already reads these at build time, and a theme
+    // change rebuilds shell + screen (applyAccent), so the new
+    // atmosphere applies live everywhere at once.
+    private val bgColor: Int get() = tintWithAccent(Color.rgb(18, 18, 18), 0.16f)
+    private val surface: Int get() = tintWithAccent(Color.rgb(26, 26, 26), 0.12f)
+    private val surface2: Int get() = tintWithAccent(Color.rgb(35, 35, 35), 0.14f)
     private val white50 = Color.rgb(167, 167, 167)
     private val white55 = Color.rgb(179, 179, 179) // #B3B3B3
     private val white75 = Color.argb(191, 255, 255, 255)
-    private val placeholder = Color.rgb(35, 35, 35)
+    private val placeholder: Int get() = surface2
 
     // ---- v6 fonts: Poppins (SIL Open Font License 1.1), the
     // closest free geometric sans to Spotify's proprietary Circular.
@@ -1053,7 +1081,7 @@ class MainActivity : Activity() {
         val dlListener: (String, String) -> Unit = { key, event -> onDownloadEvent(key, event) }
         myDlListener = dlListener
         Downloads.uiListener = dlListener
-        Downloads.resumeInterruptedAsync(this, effectiveQuality())
+        Downloads.resumeInterruptedAsync(this, effectiveDownloadQuality())
         backfillFavorites()
         loadAccentPref()
         window.statusBarColor = bgColor
@@ -1395,11 +1423,13 @@ class MainActivity : Activity() {
         activeTab = name
         tabViews.forEach { (tabName, views) ->
             val (_, iv, tv) = views
-            // Spotify treatment: no pill — active is pure white,
-            // inactive is #B3B3B3.
+            // No pill — and since 0.6.11 the ACTIVE tab wears
+            // the theme accent (was pure white for every theme):
+            // the chrome itself now shows which theme you picked.
+            // Inactive stays #B3B3B3.
             if (tabName == name) {
-                iv.setColorFilter(Color.WHITE)
-                tv.setTextColor(Color.WHITE)
+                iv.setColorFilter(accent)
+                tv.setTextColor(accent)
                 // Active-tab pop (0.6.10): the newly selected
                 // glyph springs from 0.78 to full size on the
                 // fast secondary press spring, so the tap gets a
@@ -2050,8 +2080,13 @@ class MainActivity : Activity() {
 
     private fun featuredCard(track: Track, kicker: String, context: List<Track>): FrameLayout {
         val card = FrameLayout(this).apply {
-            background = GradientDrawable().apply {
-                setColor(Color.rgb(20, 20, 23))
+            // 0.6.11 theme reach: the Home hero card fades from an
+            // accent-washed dark at the top into near-black — the
+            // biggest surface on Home now carries the theme too.
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(tintWithAccent(Color.rgb(20, 20, 23), 0.38f), Color.rgb(16, 16, 18))
+            ).apply {
                 cornerRadius = dp(16).toFloat()
             }
             clipToOutline = true
@@ -3057,6 +3092,32 @@ class MainActivity : Activity() {
         })
 
         content.addView(settingsGroupHeader("Downloads & storage"))
+        // Download quality (0.6.11): downloads get their OWN
+        // quality choice instead of silently inheriting the
+        // streaming one. It steers the same resolver pick the
+        // streaming quality steers — smallest file, balanced,
+        // or the best format the source offers — for downloads
+        // only; streaming is untouched.
+        val dlQualitySub = if (dataSaverOn()) {
+            "Data saver mode is on — the smallest files are used"
+        } else {
+            when (downloadQualityPref()) {
+                "data" -> "Data saver · smallest files, fastest downloads"
+                "high" -> "High · best quality the source offers"
+                "normal" -> "Normal · balanced size and quality"
+                else -> "Same as streaming · currently $qualityName"
+            }
+        }
+        content.addView(settingsRow("Download quality", dlQualitySub, iconRes = R.drawable.ic_download) {
+            showMenu(
+                "Download quality", listOf(
+                    "Same as streaming" to { setDownloadQuality("streaming"); showSettings() },
+                    "Data saver" to { setDownloadQuality("data"); showSettings() },
+                    "Normal" to { setDownloadQuality("normal"); showSettings() },
+                    "High" to { setDownloadQuality("high"); showSettings() }
+                )
+            )
+        })
         val dlCount = Downloads.entries(this).size
         val dlBytes = Downloads.storageBytes(this)
         content.addView(settingsRow("Downloads", "$dlCount tracks · ${fmtBytes(dlBytes)} on this device", iconRes = R.drawable.ic_download) {
@@ -4017,12 +4078,9 @@ class MainActivity : Activity() {
                         background = solidBg(999f, surface2)
                         setPadding(dp(10), dp(10), dp(10), dp(10))
                         setOnClickListener {
-                            if (allDown) {
-                                Toast.makeText(this@MainActivity, "Already downloaded", Toast.LENGTH_SHORT).show()
-                            } else {
-                                p.tracks.filter { Downloads.key(it) !in pageDlKeys }
-                                    .forEach { startDownload(it) }
-                            }
+                            // 0.6.11: one summary toast via the
+                            // shared helper (was a toast per track).
+                            downloadAllTracks(p.tracks, p.title)
                         }
                     }
                     actions.addView(dlBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
@@ -6713,6 +6771,26 @@ class MainActivity : Activity() {
     /** The quality the resolver actually uses: Data saver wins. */
     private fun effectiveQuality(): String = if (dataSaverOn()) "data" else streamQuality()
 
+    /** The stored Download quality choice (0.6.11): "streaming"
+     *  (follow the streaming quality, the pre-0.6.11 behavior),
+     *  or an explicit "data" / "normal" / "high" for downloads
+     *  only. Streaming keeps its own setting either way. */
+    private fun downloadQualityPref(): String =
+        getPreferences(MODE_PRIVATE).getString("download_quality", "streaming") ?: "streaming"
+
+    private fun setDownloadQuality(q: String) {
+        getPreferences(MODE_PRIVATE).edit().putString("download_quality", q).apply()
+    }
+
+    /** The quality downloads resolve at (0.6.11): the Download
+     *  quality choice, with Data saver mode still winning over
+     *  everything — it is the app's global low-data switch. */
+    private fun effectiveDownloadQuality(): String {
+        if (dataSaverOn()) return "data"
+        val pref = downloadQualityPref()
+        return if (pref == "streaming") streamQuality() else pref
+    }
+
     private fun autoplayOn(): Boolean =
         getPreferences(MODE_PRIVATE).getBoolean("setting_Autoplay", true)
 
@@ -7198,23 +7276,32 @@ class MainActivity : Activity() {
         displayedRootTab = "Library"
 
         content.addView(sectionTitle("Playlists"))
+        // Create-playlist, promoted (0.6.11): making a playlist
+        // used to be a plain row UNDER the list (and a "New
+        // Playlist…" line inside the add-to-playlist picker) —
+        // users asked where the make-a-playlist option even was.
+        // It is now a filled pill at the TOP of the section,
+        // impossible to miss, and the empty-state copy points at
+        // it as well as at the ⋯ menu route.
+        val createBtn = pillButton("+ New Playlist", filled = true) {
+            showNameDialog("New Playlist", "") { name ->
+                Playlists.create(this, name)
+                showLibrary()
+            }
+        }
+        val createLp = LinearLayout.LayoutParams(dp(168), dp(42))
+        createLp.topMargin = dp(4)
+        createLp.bottomMargin = dp(12)
+        content.addView(createBtn, createLp)
         val playlists = Playlists.all(this)
         if (playlists.isEmpty()) {
-            content.addView(label("No playlists yet. Use a track's ⋯ menu to start one.", 14.5f, white50))
+            content.addView(label("No playlists yet. Make one with the button above, or from any song's ⋯ menu.", 14.5f, white50))
         } else {
             playlists.forEachIndexed { i, p ->
                 if (i > 0) content.addView(hairline())
                 content.addView(playlistRow(p))
             }
         }
-        content.addView(
-            settingsRow("New Playlist", null) {
-                showNameDialog("New Playlist", "") { name ->
-                    Playlists.create(this, name)
-                    showLibrary()
-                }
-            }
-        )
 
         content.addView(sectionTitle("Your Music"))
         val likedCount = Favorites.liked(this).size
@@ -7472,6 +7559,9 @@ class MainActivity : Activity() {
                         play(p.tracks.first())
                     }
                 },
+                "Download All" to {
+                    downloadAllTracks(p.tracks, p.name)
+                },
                 "Rename" to {
                     showNameDialog("Rename Playlist", p.name) { name ->
                         Playlists.rename(this, p.id, name)
@@ -7507,6 +7597,13 @@ class MainActivity : Activity() {
         val head = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
+            // 0.6.11 theme reach: the playlist header sits on an
+            // accent-washed gradient that fades into the page —
+            // collection pages wear the theme too, not just Home.
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(tintWithAccent(Color.rgb(22, 22, 22), 0.45f), bgColor)
+            )
         }
         val art = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
@@ -7562,6 +7659,24 @@ class MainActivity : Activity() {
             val playLp = LinearLayout.LayoutParams(dp(132), dp(40))
             playLp.setMargins(dp(14), 0, dp(14), 0)
             actions.addView(playAll, playLp)
+            // Download-all (0.6.11): the playlist page gets the
+            // same circular download button the album page has —
+            // downloaded state shows the accent check version.
+            val plDlKeys = Downloads.downloadedKeys(this)
+            val plAllDown = p.tracks.all {
+                it.source == SOURCE_LOCAL || Downloads.key(it) in plDlKeys
+            }
+            val plDlBtn = icon(
+                if (plAllDown) R.drawable.ic_downloaded else R.drawable.ic_download,
+                if (plAllDown) accent else Color.WHITE
+            ).apply {
+                background = solidBg(999f, surface2)
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+                setOnClickListener { downloadAllTracks(p.tracks, p.name) }
+            }
+            val dlLp = LinearLayout.LayoutParams(dp(40), dp(40))
+            dlLp.marginEnd = dp(14)
+            actions.addView(plDlBtn, dlLp)
             val menuBtn = icon(R.drawable.ic_more, Color.WHITE).apply {
                 background = solidBg(999f, surface2)
                 setPadding(dp(10), dp(10), dp(10), dp(10))
@@ -7637,6 +7752,13 @@ class MainActivity : Activity() {
             content.addView(label("Tap the heart on Now Playing and the song lands here.", 15f, white50))
         } else {
             content.addView(sectionTitle("${liked.size} liked"))
+            // Download-all for the collection (0.6.11), same
+            // helper as the playlist and album pages.
+            content.addView(
+                settingsRow("Download All", "Save every liked song for offline", iconRes = R.drawable.ic_download) {
+                    downloadAllTracks(liked, "Liked Songs")
+                }
+            )
             val gen = generation
             addRowsChunked(
                 liked, content,
@@ -7770,6 +7892,35 @@ class MainActivity : Activity() {
         startDownload(t)
     }
 
+    /** Downloads every not-yet-downloaded track in a collection
+     *  (playlist page, Liked Songs, album page) with ONE summary
+     *  toast (0.6.11) — the album page used to fire startDownload
+     *  per track and stack a toast per song. Local files are
+     *  skipped (already on device), tracks already downloaded or
+     *  already in flight are skipped, and the Downloads store's
+     *  parallel pool (0.6.11) works through the queue 3 at a
+     *  time. Returns how many were actually queued. */
+    private fun downloadAllTracks(tracks: List<Track>, collectionName: String): Int {
+        val dlKeys = Downloads.downloadedKeys(this)
+        val todo = tracks.filter {
+            it.source != SOURCE_LOCAL &&
+                Downloads.key(it) !in dlKeys &&
+                !Downloads.isActive(it)
+        }
+        todo.forEach { Downloads.start(this, it, effectiveDownloadQuality()) }
+        if (todo.isEmpty()) {
+            Toast.makeText(this, "Everything in $collectionName is already downloaded", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(
+                this,
+                "Downloading ${todo.size} track${if (todo.size == 1) "" else "s"} from $collectionName",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+        if (visibleScreen == "Downloads") showDownloads()
+        return todo.size
+    }
+
     private fun startDownload(track: Track) {
         if (track.source == SOURCE_LOCAL) {
             Toast.makeText(this, "Local files are already on this device", Toast.LENGTH_SHORT).show()
@@ -7788,7 +7939,7 @@ class MainActivity : Activity() {
         // a download that died whenever the screen did. Leaving,
         // recreating or stacking activities cannot touch it now;
         // events come back through onDownloadEvent.
-        Downloads.start(this, track, effectiveQuality())
+        Downloads.start(this, track, effectiveDownloadQuality())
         refreshDownloadButton()
         if (visibleScreen == "Downloads") showDownloads()
         Toast.makeText(this, "Downloading ${track.title}\u2026", Toast.LENGTH_SHORT).show()

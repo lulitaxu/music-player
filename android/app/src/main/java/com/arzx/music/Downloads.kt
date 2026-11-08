@@ -3,6 +3,7 @@ package com.arzx.music
 import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.InterruptedIOException
 import java.net.HttpURLConnection
@@ -38,6 +39,12 @@ object Downloads {
     /** Thrown by [downloadSync] when the caller's stop flag fires. */
     class StoppedException : RuntimeException("stopped")
 
+    /** Internal (0.6.11): the server did not honor byte ranges
+     *  exactly as asked — the segmented transfer aborts with this
+     *  and the caller falls back to the plain single stream. Never
+     *  surfaces to the UI. */
+    private class RangeUnsupportedException : RuntimeException("range unsupported")
+
     // ------------------------------------------------------------ download manager (0.6.3, WS-D Bug D)
 
     /**
@@ -50,8 +57,21 @@ object Downloads {
      * interrupted", and the download died with the screen. This
      * executor is never shut down; activity death cannot touch a
      * transfer, and neither can a second instance's lifecycle.
+     *
+     * 0.6.11 speed: THREE transfers run in parallel (was: a
+     * single thread, so a queue of tracks downloaded strictly
+     * one by one and total time was the SUM of every track).
+     * Three is the honest ceiling here: more parallel streams
+     * mostly split the same phone bandwidth thinner and heat
+     * the SoC, they do not add throughput. Parallel workers are
+     * why the vault's state/index writes below are @Synchronized:
+     * two transfers finishing in the same moment must never
+     * read-modify-write the shared JSON over each other.
      */
-    private val dlExecutor = Executors.newSingleThreadExecutor()
+    private val dlExecutor = Executors.newFixedThreadPool(3)
+
+    /** How many transfers [dlExecutor] runs at once (0.6.11). */
+    private const val MAX_PARALLEL = 3
 
     /** Keys with a transfer running or queued on [dlExecutor]. */
     private val activeKeys = HashSet<String>()
@@ -114,7 +134,7 @@ object Downloads {
             stopModes.remove(key)
             setStatus(
                 appCtx, track,
-                if (activeKeys.size > 1) ST_QUEUED else ST_DOWNLOADING, 0
+                if (activeKeys.size > MAX_PARALLEL) ST_QUEUED else ST_DOWNLOADING, 0
             )
         }
         notifyUi(key, "progress")
@@ -259,6 +279,11 @@ object Downloads {
         dirCache ?: File(ctx.filesDir, "downloads").apply { mkdirs() }
             .also { dirCache = it }
 
+    // @Synchronized (0.6.11): with parallel transfers, a
+    // completion's read of the index must not interleave with
+    // another completion's write, or an entry gets lost. The
+    // sections are short JSON ops; contention is negligible.
+    @Synchronized
     fun entries(ctx: Context): List<Entry> {
         cache?.let { return it }
         val raw = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -339,14 +364,35 @@ object Downloads {
         onProgress: (Int) -> Unit = {}
     ): Entry {
         var streamUa: String? = null
-        val url = when (track.source) {
+        // 0.6.11 speed: reuse the playback ladder's known-good
+        // resolution when one exists (the track is playing, or
+        // was resolved moments ago) instead of walking every
+        // client context again — that walk was seconds of pure
+        // waiting before a single byte moved. A cached URL that
+        // turns out stale is evicted and resolved fresh ONCE,
+        // in the retry below.
+        var usedCache = false
+        fun resolveFresh(): String {
+            val resolved = StreamResolver.resolveYoutube(track.id, quality)
+            // googlevideo binds the URL to the requesting client:
+            // the download fetch must send the producing context's
+            // UA, exactly like playback (v5 sent none at all).
+            streamUa = resolved.userAgent
+            val u = resolved.url
+                ?: throw RuntimeException("stream resolution failed: ${resolved.report}")
+            StreamResolver.rememberGood(track.id, quality, resolved)
+            return u
+        }
+        var url = when (track.source) {
             SOURCE_YOUTUBE -> {
-                val resolved = StreamResolver.resolveYoutube(track.id, quality)
-                // googlevideo binds the URL to the requesting client:
-                // the download fetch must send the producing context's
-                // UA, exactly like playback (v5 sent none at all).
-                streamUa = resolved.userAgent
-                resolved.url ?: throw RuntimeException("stream resolution failed: ${resolved.report}")
+                val cached = StreamResolver.cachedGood(track.id, quality)
+                if (cached?.url != null) {
+                    streamUa = cached.userAgent
+                    usedCache = true
+                    cached.url
+                } else {
+                    resolveFresh()
+                }
             }
             SOURCE_LOCAL -> throw RuntimeException("already on this device")
             else -> "https://api.audius.co/v1/tracks/${track.id}/stream?app_name=arzxsh"
@@ -355,39 +401,181 @@ object Downloads {
             .takeIf { it in setOf("m4a", "mp3", "opus", "webm", "aac", "ogg") } ?: "m4a"
         val fileName = key(track).replace(Regex("[^A-Za-z0-9_-]"), "_") + "." + ext
         val tmp = File(dir(ctx), "$fileName.part")
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 15_000
-            readTimeout = 60_000
-            instanceFollowRedirects = true
-            streamUa?.let { setRequestProperty("User-Agent", it) }
-        }
-        try {
-            if (conn.responseCode !in 200..299) throw RuntimeException("HTTP ${conn.responseCode}")
-            val total = conn.contentLengthLong
-            conn.inputStream.use { input ->
-                tmp.outputStream().use { out ->
-                    val buf = ByteArray(64 * 1024)
-                    var read = 0L
-                    var lastPct = -1
-                    while (true) {
-                        if (!shouldContinue()) throw StoppedException()
-                        val n = input.read(buf)
-                        if (n < 0) break
-                        out.write(buf, 0, n)
-                        read += n
-                        if (total > 0) {
-                            val pct = (read * 100 / total).toInt().coerceIn(0, 99)
-                            if (pct != lastPct) {
-                                lastPct = pct
-                                onProgress(pct)
+
+        fun openConn(u: String, range: String?): HttpURLConnection =
+            (URL(u).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 15_000
+                readTimeout = 60_000
+                instanceFollowRedirects = true
+                streamUa?.let { setRequestProperty("User-Agent", it) }
+                range?.let { setRequestProperty("Range", it) }
+            }
+
+        // The pre-0.6.11 transfer, kept as the universal fallback:
+        // one stream, 256KB buffers both ways (was 64KB into an
+        // unbuffered file stream — a syscall per chunk on flash).
+        fun singleStream(u: String) {
+            val conn = openConn(u, null)
+            try {
+                if (conn.responseCode !in 200..299) throw RuntimeException("HTTP ${conn.responseCode}")
+                val total = conn.contentLengthLong
+                conn.inputStream.use { input ->
+                    BufferedOutputStream(tmp.outputStream(), 256 * 1024).use { out ->
+                        val buf = ByteArray(256 * 1024)
+                        var read = 0L
+                        var lastPct = -1
+                        while (true) {
+                            if (!shouldContinue()) throw StoppedException()
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            out.write(buf, 0, n)
+                            read += n
+                            if (total > 0) {
+                                val pct = (read * 100 / total).toInt().coerceIn(0, 99)
+                                if (pct != lastPct) {
+                                    lastPct = pct
+                                    onProgress(pct)
+                                }
                             }
                         }
                     }
                 }
+            } finally {
+                conn.disconnect()
             }
+        }
+
+        // Segmented transfer (0.6.11): the file fetched as 4 byte
+        // ranges in parallel. Per-connection throttling is the
+        // norm on the CDNs behind both sources — one connection
+        // gets a capped rate no matter how fast the phone's link
+        // is, four connections stack their caps. Any deviation
+        // (non-206 answer, short segment, wrong assembled size)
+        // aborts with RangeUnsupportedException and the caller
+        // falls back to singleStream, so a server that dislikes
+        // ranges costs one probe, never a failed download.
+        fun segmented(u: String, total: Long) {
+            val segments = 4
+            val segLen = (total + segments - 1) / segments
+            val segFiles = (0 until segments).map { File(dir(ctx), "$fileName.seg$it") }
+            val downloaded = java.util.concurrent.atomic.AtomicLong(0)
+            val failure = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+            val latch = java.util.concurrent.CountDownLatch(segments)
+            var lastAggPct = -1
+            val pool = Executors.newFixedThreadPool(segments)
+            try {
+                for (i in 0 until segments) {
+                    pool.execute {
+                        try {
+                            val start = i * segLen
+                            val end = minOf(start + segLen, total) - 1
+                            if (start <= end) {
+                                val conn = openConn(u, "bytes=$start-$end")
+                                try {
+                                    if (conn.responseCode != 206) throw RangeUnsupportedException()
+                                    conn.inputStream.use { input ->
+                                        BufferedOutputStream(segFiles[i].outputStream(), 256 * 1024).use { out ->
+                                            val buf = ByteArray(256 * 1024)
+                                            var segRead = 0L
+                                            while (true) {
+                                                if (!shouldContinue()) throw StoppedException()
+                                                if (failure.get() != null) throw RangeUnsupportedException()
+                                                val n = input.read(buf)
+                                                if (n < 0) break
+                                                out.write(buf, 0, n)
+                                                segRead += n
+                                                val agg = downloaded.addAndGet(n.toLong())
+                                                val pct = (agg * 100 / total).toInt().coerceIn(0, 99)
+                                                synchronized(segFiles) {
+                                                    if (pct != lastAggPct) {
+                                                        lastAggPct = pct
+                                                        onProgress(pct)
+                                                    }
+                                                }
+                                            }
+                                            if (segRead != end - start + 1) throw RangeUnsupportedException()
+                                        }
+                                    }
+                                } finally {
+                                    conn.disconnect()
+                                }
+                            }
+                        } catch (t: Throwable) {
+                            failure.compareAndSet(null, t)
+                        } finally {
+                            latch.countDown()
+                        }
+                    }
+                }
+                latch.await()
+                failure.get()?.let { throw it }
+                BufferedOutputStream(tmp.outputStream(), 256 * 1024).use { out ->
+                    val buf = ByteArray(256 * 1024)
+                    segFiles.forEach { f ->
+                        if (!f.exists()) return@forEach
+                        f.inputStream().use { input ->
+                            while (true) {
+                                val n = input.read(buf)
+                                if (n < 0) break
+                                out.write(buf, 0, n)
+                            }
+                        }
+                    }
+                }
+                if (tmp.length() != total) throw RangeUnsupportedException()
+            } finally {
+                pool.shutdownNow()
+                segFiles.forEach { it.delete() }
+            }
+        }
+
+        // One full attempt of [u] into [tmp]: probe the headers,
+        // go segmented when ranges are on offer and the file is
+        // big enough for it to matter (>= 2MB), else single
+        // stream. [tmp] is removed on any failure.
+        fun transfer(u: String) {
+            try {
+                val probe = openConn(u, null)
+                val code: Int
+                val total: Long
+                val ranges: String?
+                try {
+                    code = probe.responseCode
+                    total = probe.contentLengthLong
+                    ranges = probe.getHeaderField("Accept-Ranges")
+                } finally {
+                    probe.disconnect()
+                }
+                if (code !in 200..299) throw RuntimeException("HTTP $code")
+                if (total >= 2L * 1024 * 1024 && ranges?.contains("bytes", ignoreCase = true) == true) {
+                    try {
+                        segmented(u, total)
+                        return
+                    } catch (_: RangeUnsupportedException) {
+                        // Fall through to the plain stream.
+                    }
+                }
+                singleStream(u)
+            } catch (t: Throwable) {
+                tmp.delete()
+                throw t
+            }
+        }
+
+        try {
+            transfer(url)
+        } catch (e: StoppedException) {
+            throw e
         } catch (t: Throwable) {
-            tmp.delete()
-            throw t
+            if (!usedCache) throw t
+            // The cached URL was stale (googlevideo links expire):
+            // evict it, resolve fresh, retry the transfer ONCE.
+            // The extension/file name stay from the first URL —
+            // same track, same quality, same format pick.
+            StreamResolver.forgetGood(track.id, quality)
+            usedCache = false
+            url = resolveFresh()
+            transfer(url)
         }
         if (tmp.length() == 0L) {
             tmp.delete()
@@ -400,11 +588,17 @@ object Downloads {
             tmp.delete()
         }
         val entry = Entry(track, fileName)
-        writeAll(ctx, entries(ctx).filter { key(it.track) != key(track) } + entry)
-        clearStatus(ctx, key(track))
+        // Atomic completion (0.6.11): with parallel transfers,
+        // the read-modify-write of the index must not interleave
+        // with another transfer completing in the same moment.
+        synchronized(this) {
+            writeAll(ctx, entries(ctx).filter { key(it.track) != key(track) } + entry)
+            clearStatus(ctx, key(track))
+        }
         return entry
     }
 
+    @Synchronized
     fun remove(ctx: Context, track: Track) {
         val all = entries(ctx)
         val entry = all.firstOrNull { key(it.track) == key(track) } ?: return
@@ -455,6 +649,7 @@ object Downloads {
         }
     }
 
+    @Synchronized
     fun setStatus(ctx: Context, track: Track, state: String, progress: Int = 0, error: String? = null) {
         val map = statusMap(ctx)
         map[key(track)] = Status(state, progress, error)
@@ -477,6 +672,7 @@ object Downloads {
             .apply()
     }
 
+    @Synchronized
     fun clearStatus(ctx: Context, key: String) {
         val map = statusMap(ctx)
         if (map.remove(key) == null) return
@@ -520,6 +716,7 @@ object Downloads {
             }
     }
 
+    @Synchronized
     private fun writeAll(ctx: Context, list: List<Entry>) {
         cache = list
         indexVersion++
