@@ -3147,31 +3147,13 @@ class MainActivity : Activity() {
             setActiveTab("Downloads")
             showDownloads()
         })
-        if (dlCount > 0) {
-            content.addView(settingsRow("Remove all downloads", "Frees ${fmtBytes(dlBytes)}", errorColor, iconRes = R.drawable.ic_trash) {
-                showMenu(
-                    "Remove all downloaded tracks?", listOf(
-                        "Remove all" to {
-                            Downloads.removeAll(this@MainActivity)
-                            retainedRoots.remove("Downloads")
-                            Toast.makeText(this@MainActivity, "Downloads removed", Toast.LENGTH_SHORT).show()
-                            showSettings()
-                        },
-                        "Cancel" to {}
-                    )
-                )
-            })
-        }
-        content.addView(settingsRow("Artwork cache", "${fmtBytes(ArtworkLoader.cacheBytes())} in memory", iconRes = R.drawable.ic_image) {
-            ArtworkLoader.clearCache()
-            Toast.makeText(this@MainActivity, "Artwork cache cleared", Toast.LENGTH_SHORT).show()
-            showSettings()
-        })
-        content.addView(settingsRow("Lyrics cache", "${fmtBytes(Lyrics.cacheBytes(this))} on this device", iconRes = R.drawable.ic_storage) {
-            Lyrics.clearCache(this@MainActivity)
-            Toast.makeText(this@MainActivity, "Lyrics cache cleared", Toast.LENGTH_SHORT).show()
-            showSettings()
-        })
+        // 0.6.12: the destructive rows that used to live here
+        // (Remove all downloads, both cache clears — the cache
+        // rows deleted INSTANTLY on tap) moved to the Danger
+        // zone section at the bottom of Settings, each behind a
+        // warning dialog, per Arz's rule: deleting anything
+        // lives in its own section and asks first, so nothing
+        // is ever deleted by an accidental tap.
 
         content.addView(settingsGroupHeader("Appearance & behavior"))
         content.addView(setting("Glass effects", true) { applyGlassChange() })
@@ -3222,6 +3204,74 @@ class MainActivity : Activity() {
                 iconRes = R.drawable.ic_download
             ) { checkForUpdates(manual = true) }
         )
+
+        // ---- Danger zone (0.6.12, Arz's rule): everything that
+        // deletes lives together in its own section at the very
+        // bottom of Settings, and every row opens a warning
+        // dialog that states the consequence before anything is
+        // removed. Nothing in this section acts on first tap.
+        content.addView(settingsGroupHeader("Danger zone"))
+        if (dlCount > 0) {
+            content.addView(settingsRow("Remove all downloads", "Frees ${fmtBytes(dlBytes)} · asks first", errorColor, iconRes = R.drawable.ic_trash) {
+                confirmDanger(
+                    "Remove all downloads?",
+                    "$dlCount downloaded tracks (${fmtBytes(dlBytes)}) will be deleted from this device. " +
+                        "This cannot be undone — songs can be downloaded again, but not restored.",
+                    "Remove all"
+                ) {
+                    Downloads.removeAll(this@MainActivity)
+                    retainedRoots.remove("Downloads")
+                    Toast.makeText(this@MainActivity, "Downloads removed", Toast.LENGTH_SHORT).show()
+                    showSettings()
+                }
+            })
+        }
+        content.addView(settingsRow("Clear artwork cache", "${fmtBytes(ArtworkLoader.cacheBytes())} in memory · asks first", errorColor, iconRes = R.drawable.ic_image) {
+            confirmDanger(
+                "Clear artwork cache?",
+                "Cached cover images will be removed from memory. They load again on demand; " +
+                    "nothing else is affected.",
+                "Clear cache"
+            ) {
+                ArtworkLoader.clearCache()
+                Toast.makeText(this@MainActivity, "Artwork cache cleared", Toast.LENGTH_SHORT).show()
+                showSettings()
+            }
+        })
+        content.addView(settingsRow("Clear lyrics cache", "${fmtBytes(Lyrics.cacheBytes(this))} on this device · asks first", errorColor, iconRes = R.drawable.ic_storage) {
+            confirmDanger(
+                "Clear lyrics cache?",
+                "Saved lyrics will be deleted from this device, including lyrics fetched for " +
+                    "downloaded songs. They are fetched again when you are back online; offline, " +
+                    "lyrics will be unavailable until then.",
+                "Clear cache"
+            ) {
+                Lyrics.clearCache(this@MainActivity)
+                Toast.makeText(this@MainActivity, "Lyrics cache cleared", Toast.LENGTH_SHORT).show()
+                showSettings()
+            }
+        })
+    }
+
+    /** The one warning gate for destructive actions (0.6.12):
+     *  a dialog that names the action and its consequence, with
+     *  Cancel as the safe default and the destructive button
+     *  tinted in the error color. Every delete/clear in the app
+     *  routes through here. */
+    private fun confirmDanger(
+        title: String,
+        message: String,
+        confirmLabel: String,
+        onConfirm: () -> Unit
+    ) {
+        val dialog = android.app.AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage(message)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton(confirmLabel) { _, _ -> onConfirm() }
+            .create()
+        dialog.show()
+        dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE)?.setTextColor(errorColor)
     }
 
     // ------------------------------------------------------------ in-app updates (0.6.3, WS-E)
@@ -4643,16 +4693,23 @@ class MainActivity : Activity() {
             setOnClickListener { toggleShuffle() }
         }
         npShuffleDot = dotView()
-        val shuffleBox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-        }
-        shuffleBox.addView(npShuffleBtn, LinearLayout.LayoutParams(dp(30), dp(30)))
-        val shDotLp = LinearLayout.LayoutParams(dp(4), dp(4))
-        shDotLp.topMargin = dp(3)
+        // 0.6.12 ALIGNMENT PASS (Arz: "the buttons are not
+        // aligned"): the state dots used to STACK under the
+        // shuffle/repeat glyphs in a vertical column, pushing
+        // those glyphs UP out of the row's center line while
+        // prev/next/sleep sat dead center. Every transport slot
+        // is now the same height, every glyph is centered in an
+        // identically padded box, and the dots OVERLAY the
+        // bottom of the slot (pinned, centered) instead of
+        // displacing the glyph. One center line for the row.
+        val shuffleBox = FrameLayout(this)
+        shuffleBox.addView(npShuffleBtn, FrameLayout.LayoutParams(dp(30), dp(30), Gravity.CENTER))
+        val shDotLp = FrameLayout.LayoutParams(dp(4), dp(4), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+        shDotLp.bottomMargin = dp(2)
         shuffleBox.addView(npShuffleDot, shDotLp)
         val prevBtn = icon(R.drawable.ic_skip_prev, Color.WHITE).apply {
             contentDescription = "Previous track"
+            setPadding(dp(12), dp(12), dp(12), dp(12))
             setOnClickListener { playPrevious() }
         }
         // The big white circular play/pause (inspo): white disc,
@@ -4681,19 +4738,21 @@ class MainActivity : Activity() {
         playSlot.addView(npBuffering, FrameLayout.LayoutParams(dp(30), dp(30), Gravity.CENTER))
         val nextBtn = icon(R.drawable.ic_skip_next, Color.WHITE).apply {
             contentDescription = "Next track"
+            setPadding(dp(12), dp(12), dp(12), dp(12))
             setOnClickListener { playNext() }
         }
         // Sleep timer takes the fifth slot (inspo); its glyph tints
         // accent while a timer is armed.
         npSleepBtn = icon(R.drawable.ic_sleep, white75).apply {
             contentDescription = "Sleep timer"
+            setPadding(dp(13), dp(13), dp(13), dp(13))
             setOnClickListener { showSleepMenu() }
         }
-        controls.addView(shuffleBox, LinearLayout.LayoutParams(0, dp(48), 1f))
-        controls.addView(prevBtn, LinearLayout.LayoutParams(0, dp(52), 1f))
+        controls.addView(shuffleBox, LinearLayout.LayoutParams(0, dp(56), 1f))
+        controls.addView(prevBtn, LinearLayout.LayoutParams(0, dp(56), 1f))
         controls.addView(playSlot, LinearLayout.LayoutParams(0, dp(64), 1.2f))
-        controls.addView(nextBtn, LinearLayout.LayoutParams(0, dp(52), 1f))
-        controls.addView(npSleepBtn, LinearLayout.LayoutParams(0, dp(44), 1f))
+        controls.addView(nextBtn, LinearLayout.LayoutParams(0, dp(56), 1f))
+        controls.addView(npSleepBtn, LinearLayout.LayoutParams(0, dp(56), 1f))
         controlZone.addView(controls)
 
         npSleepLabel = label("", 12.5f, white55).apply {
@@ -4714,6 +4773,7 @@ class MainActivity : Activity() {
         bottomRow.layoutParams = bottomLp
         val lyricsBtn = icon(R.drawable.ic_lyrics, white75).apply {
             contentDescription = "Lyrics"
+            setPadding(dp(7), dp(7), dp(7), dp(7))
             setOnClickListener { showLyrics() }
         }
         npRepeatBtn = icon(R.drawable.ic_repeat, white55).apply {
@@ -4721,13 +4781,12 @@ class MainActivity : Activity() {
             setOnClickListener { toggleRepeat() }
         }
         npRepeatDot = dotView()
-        val repeatBox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-        }
-        repeatBox.addView(npRepeatBtn, LinearLayout.LayoutParams(dp(28), dp(28)))
-        val rpDotLp = LinearLayout.LayoutParams(dp(4), dp(4))
-        rpDotLp.topMargin = dp(3)
+        // Same overlay treatment as shuffle (0.6.12 alignment
+        // pass): glyph centered, dot pinned to the slot's bottom.
+        val repeatBox = FrameLayout(this)
+        repeatBox.addView(npRepeatBtn, FrameLayout.LayoutParams(dp(26), dp(26), Gravity.CENTER))
+        val rpDotLp = FrameLayout.LayoutParams(dp(4), dp(4), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+        rpDotLp.bottomMargin = dp(1)
         repeatBox.addView(npRepeatDot, rpDotLp)
         npDownloadBtn = icon(R.drawable.ic_download, white75).apply {
             contentDescription = "Download"
@@ -4741,21 +4800,23 @@ class MainActivity : Activity() {
         // Download slot: arrow (idle) -> indeterminate ring (working) ->
         // accent check (done), the three states in one footprint.
         val downloadSlot = FrameLayout(this)
-        downloadSlot.addView(npDownloadBtn, FrameLayout.LayoutParams(dp(32), dp(32), Gravity.CENTER))
+        downloadSlot.addView(npDownloadBtn, FrameLayout.LayoutParams(dp(28), dp(28), Gravity.CENTER))
         downloadSlot.addView(npDownloadProgress, FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER))
         val shareBtn = icon(R.drawable.ic_share, white75).apply {
             contentDescription = "Share"
+            setPadding(dp(7), dp(7), dp(7), dp(7))
             setOnClickListener { shareTrack(current) }
         }
         val queueBtn = icon(R.drawable.ic_queue, white75).apply {
             contentDescription = "Queue"
+            setPadding(dp(7), dp(7), dp(7), dp(7))
             setOnClickListener { showQueue() }
         }
-        bottomRow.addView(lyricsBtn, LinearLayout.LayoutParams(0, dp(34), 1f))
-        bottomRow.addView(repeatBox, LinearLayout.LayoutParams(0, dp(34), 1f))
-        bottomRow.addView(downloadSlot, LinearLayout.LayoutParams(0, dp(34), 1f))
-        bottomRow.addView(shareBtn, LinearLayout.LayoutParams(0, dp(34), 1f))
-        bottomRow.addView(queueBtn, LinearLayout.LayoutParams(0, dp(34), 1f))
+        bottomRow.addView(lyricsBtn, LinearLayout.LayoutParams(0, dp(40), 1f))
+        bottomRow.addView(repeatBox, LinearLayout.LayoutParams(0, dp(40), 1f))
+        bottomRow.addView(downloadSlot, LinearLayout.LayoutParams(0, dp(40), 1f))
+        bottomRow.addView(shareBtn, LinearLayout.LayoutParams(0, dp(40), 1f))
+        bottomRow.addView(queueBtn, LinearLayout.LayoutParams(0, dp(40), 1f))
         controlZone.addView(bottomRow)
         inner.addView(controlZone)
 
@@ -8003,9 +8064,26 @@ class MainActivity : Activity() {
             val entry = Downloads.entries(this).firstOrNull { Downloads.key(it.track) == key }
             val title = entry?.track?.title ?: pending?.first?.title
             when (event) {
-                "done" -> Toast.makeText(
-                    this, "Downloaded: ${title ?: "track"}", Toast.LENGTH_SHORT
-                ).show()
+                "done" -> {
+                    Toast.makeText(
+                        this, "Downloaded: ${title ?: "track"}", Toast.LENGTH_SHORT
+                    ).show()
+                    // Lyrics ride along with downloads (0.6.12,
+                    // Arz: "lyrics are also got download right?"):
+                    // the moment a track lands, fetch its lyrics
+                    // into the on-device cache on the lyrics
+                    // thread, so a downloaded song shows lyrics
+                    // OFFLINE too. fetch() is cache-first and
+                    // records misses, best-effort and silent.
+                    entry?.track?.let { t ->
+                        lyricsExecutor.execute {
+                            try {
+                                Lyrics.fetch(applicationContext, t)
+                            } catch (_: Exception) {
+                            }
+                        }
+                    }
+                }
                 "paused" -> Toast.makeText(
                     this, "Paused: ${title ?: "track"}", Toast.LENGTH_SHORT
                 ).show()
