@@ -6628,9 +6628,20 @@ class MainActivity : Activity() {
      *  Reduce Motion setting OR the system animator duration
      *  scale at 0 (accessibility / developer options) both mean
      *  springs resolve instantly — callers pass this as the
-     *  Springs instant flag. */
-    private fun springsOff(): Boolean =
-        reduceMotion() || ValueAnimator.getDurationScale() == 0f
+     *  Springs instant flag. The scale is read from Settings
+     *  (API 17+) because ValueAnimator.getDurationScale() is
+     *  API 33 and minSdk is 26 (CI lint NewApi). */
+    private fun springsOff(): Boolean {
+        if (reduceMotion()) return true
+        val scale = try {
+            Settings.Global.getFloat(
+                contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f
+            )
+        } catch (_: Throwable) {
+            1f
+        }
+        return scale == 0f
+    }
 
     /** Artwork URL for large surfaces; Data saver downgrades to the
      *  small rendition instead of prefetching full-size art. */
