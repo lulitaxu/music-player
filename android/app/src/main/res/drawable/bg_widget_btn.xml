@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Widget transport button disc (0.6.13): the same subtle
+     raised circle the in-app transport row reads as, so the
+     widget and the player feel like one product. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <solid android:color="#2C2C2C" />
+</shape>

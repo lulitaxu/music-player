@@ -780,6 +780,8 @@ class MainActivity : Activity() {
     private lateinit var lyricsScroll: ScrollView
     private lateinit var lyricsList: LinearLayout
     private lateinit var lyricsTitle: TextView
+    private lateinit var lyricsArtist: TextView
+    private lateinit var lyricsArt: ImageView
     private lateinit var lyricsStatus: TextView
     private var lyricsSyncedLines: List<LyriTimber> = emptyList()
     private var lyricsLineViews: List<TextView> = emptyList()
@@ -6698,17 +6700,10 @@ class MainActivity : Activity() {
         // The ambient is now a full-bleed rectangle wash: the
         // artwork color, strong at the top, melting into the page
         // background with no edge anywhere (the Spotify-style
-        // ambience this was always meant to be).
-        val glow = GradientDrawable(
-            GradientDrawable.Orientation.TOP_BOTTOM,
-            intArrayOf(
-                Color.argb(235, Color.red(c), Color.green(c), Color.blue(c)),
-                Color.argb(150, Color.red(c), Color.green(c), Color.blue(c)),
-                bgColor,
-                bgColor
-            )
-        )
-        npAmbient.background = glow
+        // ambience this was always meant to be). One shared
+        // builder (0.6.13): Now Playing and the lyrics page wear
+        // the SAME wash, never two dialects of it.
+        npAmbient.background = ambientWash(c)
         npAmbient.visibility = View.VISIBLE
         if (animate && !reduceMotion()) {
             npAmbient.alpha = 0f
@@ -6717,9 +6712,23 @@ class MainActivity : Activity() {
             npAmbient.alpha = 1f
         }
         if (::lyricsOverlay.isInitialized && lyricsOverlay.visibility == View.VISIBLE) {
-            lyricsOverlay.setBackgroundColor(c)
+            lyricsOverlay.background = ambientWash(c)
         }
     }
+
+    /** The ambient wash shared by Now Playing and the lyrics
+     *  page (0.6.13): artwork color strong at the top, melting
+     *  through a mid stop into the page background. A rectangle
+     *  gradient — it can never draw the 0.6.12 egg again. */
+    private fun ambientWash(c: Int): GradientDrawable = GradientDrawable(
+        GradientDrawable.Orientation.TOP_BOTTOM,
+        intArrayOf(
+            Color.argb(235, Color.red(c), Color.green(c), Color.blue(c)),
+            Color.argb(150, Color.red(c), Color.green(c), Color.blue(c)),
+            bgColor,
+            bgColor
+        )
+    )
 
     // ------------------------------------------------------------ v6: Now Playing lyrics
 
@@ -7685,55 +7694,102 @@ class MainActivity : Activity() {
             return
         }
         beginScreen(p.name, showAvatar = false)
-        val first = p.tracks.firstOrNull()
-        val head = LinearLayout(this).apply {
+        // 0.6.13 PLAYLIST REDESIGN (inspo: the iOS 27 beta page
+        // Arz supplied): a tall artwork banner whose image melts
+        // into the page through a shade gradient, the title set
+        // INTO the fade, and a centered row of circular actions
+        // (shuffle · BIG white play disc · download · more)
+        // replacing the old centered-square-art + pill layout.
+        // Playlists have no single cover, so the banner art is a
+        // 2x2 mosaic of the first four tracks (a lone track just
+        // fills the frame; an empty playlist gets a tinted
+        // placeholder with the note glyph).
+        val banner = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                setColor(tintWithAccent(Color.rgb(24, 24, 24), 0.30f))
+                cornerRadius = dp(18).toFloat()
+            }
+            clipToOutline = true
+        }
+        val bannerLp = LinearLayout.LayoutParams(-1, dp(264))
+        bannerLp.topMargin = dp(8)
+        banner.layoutParams = bannerLp
+        val mosaicTracks = p.tracks.take(4)
+        if (mosaicTracks.isEmpty()) {
+            banner.addView(
+                icon(R.drawable.ic_library, white50).apply {
+                    setPadding(dp(30), dp(30), dp(30), dp(30))
+                },
+                FrameLayout.LayoutParams(dp(84), dp(84), Gravity.CENTER)
+            )
+        } else if (mosaicTracks.size == 1) {
+            val img = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+            ArtworkLoader.load(mosaicTracks[0].artworkLarge ?: mosaicTracks[0].artworkSmall, img)
+            banner.addView(img, FrameLayout.LayoutParams(-1, -1))
+        } else {
+            val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            for (r in 0 until 2) {
+                val rowL = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                for (col in 0 until 2) {
+                    val t = mosaicTracks[(r * 2 + col) % mosaicTracks.size]
+                    val cell = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+                    ArtworkLoader.load(t.artworkLarge ?: t.artworkSmall, cell)
+                    rowL.addView(cell, LinearLayout.LayoutParams(0, -1, 1f))
+                }
+                grid.addView(rowL, LinearLayout.LayoutParams(-1, 0, 1f))
+            }
+            banner.addView(grid, FrameLayout.LayoutParams(-1, -1))
+        }
+        // The melt: transparent at the top, the page background
+        // by the bottom, so art and page are one surface.
+        banner.addView(
+            View(this).apply {
+                background = GradientDrawable(
+                    GradientDrawable.Orientation.TOP_BOTTOM,
+                    intArrayOf(
+                        Color.TRANSPARENT,
+                        Color.argb(90, Color.red(bgColor), Color.green(bgColor), Color.blue(bgColor)),
+                        bgColor
+                    )
+                )
+            },
+            FrameLayout.LayoutParams(-1, -1)
+        )
+        val totalSec = p.tracks.sumOf { it.duration }
+        val bannerLabels = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            // 0.6.11 theme reach: the playlist header sits on an
-            // accent-washed gradient that fades into the page —
-            // collection pages wear the theme too, not just Home.
-            background = GradientDrawable(
-                GradientDrawable.Orientation.TOP_BOTTOM,
-                intArrayOf(tintWithAccent(Color.rgb(22, 22, 22), 0.45f), bgColor)
-            )
+            setPadding(dp(18), 0, dp(18), dp(14))
         }
-        val art = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            roundedClip(this, 12)
-            elevation = dp(18).toFloat()
-        }
-        ArtworkLoader.load(first?.artworkLarge ?: first?.artworkSmall, art)
-        val artLp = LinearLayout.LayoutParams(dp(180), dp(180))
-        artLp.topMargin = dp(14)
-        head.addView(art, artLp)
-        val totalSec = p.tracks.sumOf { it.duration }
-        head.addView(
+        bannerLabels.addView(label(p.name, 25f, Color.WHITE, boldTf).apply {
+            gravity = Gravity.CENTER
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        bannerLabels.addView(
             label(
                 buildString {
                     append("${p.tracks.size} tracks")
                     if (totalSec > 0) append(" · ").append(fmt(totalSec * 1000))
                 },
-                13.5f, white50
-            ).apply {
-                gravity = Gravity.CENTER
-                val lp = LinearLayout.LayoutParams(-1, -2)
-                lp.topMargin = dp(12)
-                layoutParams = lp
-            }
+                13f, white75
+            ).apply { gravity = Gravity.CENTER }
         )
-        content.addView(head)
+        banner.addView(bannerLabels, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
+        content.addView(banner)
         if (p.tracks.isNotEmpty()) {
             val actions = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER
             }
             val aLp = LinearLayout.LayoutParams(-1, -2)
-            aLp.topMargin = dp(16)
-            aLp.bottomMargin = dp(6)
+            aLp.topMargin = dp(14)
+            aLp.bottomMargin = dp(8)
             actions.layoutParams = aLp
             val shuffleBtn = icon(R.drawable.ic_shuffle, Color.WHITE).apply {
                 background = solidBg(999f, surface2)
-                setPadding(dp(10), dp(10), dp(10), dp(10))
+                setPadding(dp(11), dp(11), dp(11), dp(11))
+                contentDescription = "Shuffle play"
                 setOnClickListener {
                     shuffleOn = true
                     setPlayContext("Playlist", p.name)
@@ -7742,18 +7798,33 @@ class MainActivity : Activity() {
                     play(p.tracks[playOrder.firstOrNull() ?: 0])
                 }
             }
-            actions.addView(shuffleBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
-            val playAll = pillButton("Play", filled = true) {
-                setPlayContext("Playlist", p.name)
-                setQueue(p.tracks)
-                play(p.tracks.first())
+            actions.addView(shuffleBtn, LinearLayout.LayoutParams(dp(44), dp(44)))
+            // The BIG white play disc (the inspo's centerpiece;
+            // same disc language as Now Playing's play button).
+            val playDisc = ImageView(this).apply {
+                setImageResource(R.drawable.ic_play)
+                setColorFilter(Color.BLACK)
+                scaleType = ImageView.ScaleType.CENTER_INSIDE
+                background = GradientDrawable().apply {
+                    setColor(Color.WHITE)
+                    shape = GradientDrawable.OVAL
+                }
+                setPadding(dp(20), dp(20), dp(20), dp(20))
+                isClickable = true
+                isFocusable = true
+                contentDescription = "Play"
+                setOnClickListener {
+                    setPlayContext("Playlist", p.name)
+                    setQueue(p.tracks)
+                    play(p.tracks.first())
+                }
             }
-            val playLp = LinearLayout.LayoutParams(dp(132), dp(40))
-            playLp.setMargins(dp(14), 0, dp(14), 0)
-            actions.addView(playAll, playLp)
-            // Download-all (0.6.11): the playlist page gets the
-            // same circular download button the album page has —
-            // downloaded state shows the accent check version.
+            MotionPress.attach(playDisc, primary = true) { springsOff() }
+            val playLp = LinearLayout.LayoutParams(dp(64), dp(64))
+            playLp.setMargins(dp(18), 0, dp(18), 0)
+            actions.addView(playDisc, playLp)
+            // Download-all (0.6.11): downloaded state shows the
+            // accent check version.
             val plDlKeys = Downloads.downloadedKeys(this)
             val plAllDown = p.tracks.all {
                 it.source == SOURCE_LOCAL || Downloads.key(it) in plDlKeys
@@ -7763,18 +7834,20 @@ class MainActivity : Activity() {
                 if (plAllDown) accent else Color.WHITE
             ).apply {
                 background = solidBg(999f, surface2)
-                setPadding(dp(10), dp(10), dp(10), dp(10))
+                setPadding(dp(11), dp(11), dp(11), dp(11))
+                contentDescription = "Download all"
                 setOnClickListener { downloadAllTracks(p.tracks, p.name) }
             }
-            val dlLp = LinearLayout.LayoutParams(dp(40), dp(40))
+            val dlLp = LinearLayout.LayoutParams(dp(44), dp(44))
             dlLp.marginEnd = dp(14)
             actions.addView(plDlBtn, dlLp)
             val menuBtn = icon(R.drawable.ic_more, Color.WHITE).apply {
                 background = solidBg(999f, surface2)
-                setPadding(dp(10), dp(10), dp(10), dp(10))
+                setPadding(dp(11), dp(11), dp(11), dp(11))
+                contentDescription = "Playlist options"
                 setOnClickListener { showPlaylistMenu(p) }
             }
-            actions.addView(menuBtn, LinearLayout.LayoutParams(dp(40), dp(40)))
+            actions.addView(menuBtn, LinearLayout.LayoutParams(dp(44), dp(44)))
             content.addView(actions)
             // Rows with playlist-specific menus: reorder happens
             // through explicit Move Up / Move Down items (the list
@@ -8257,11 +8330,29 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        lyricsTitle = label("", 21f, Color.WHITE, boldTf).apply {
+        // 0.6.13 lyrics header (Apple Music inspo): small cover
+        // thumb + title/artist stacked, persistent while lines
+        // scroll — the old header was one big title line only.
+        lyricsArt = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            roundedClip(this, 8)
+        }
+        head.addView(lyricsArt, LinearLayout.LayoutParams(dp(46), dp(46)))
+        val headTexts = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), 0, dp(8), 0)
+        }
+        lyricsTitle = label("", 17f, Color.WHITE, boldTf).apply {
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
         }
-        head.addView(lyricsTitle, LinearLayout.LayoutParams(0, -2, 1f))
+        headTexts.addView(lyricsTitle)
+        lyricsArtist = label("", 13.5f, white55).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        headTexts.addView(lyricsArtist)
+        head.addView(headTexts, LinearLayout.LayoutParams(0, -2, 1f))
         val done = label("Done", 16f, accent, mediumTf).apply {
             setPadding(dp(10), dp(6), dp(10), dp(6))
             isClickable = true
@@ -8408,12 +8499,15 @@ class MainActivity : Activity() {
         }
         ensureOverlays()
         lyricsTrack = t
-        // Ambient backdrop: the current artwork's color, solid;
+        // Ambient backdrop (0.6.13): the same full-bleed wash
+        // Now Playing wears (it used to be the flat solid color);
         // the neutral background when the toggle is off or no
         // color was extracted.
-        lyricsOverlay.setBackgroundColor(
-            if (ambientOn() && ambientColor != null) ambientColor!! else bgColor
-        )
+        if (ambientOn() && ambientColor != null) {
+            lyricsOverlay.background = ambientWash(ambientColor!!)
+        } else {
+            lyricsOverlay.setBackgroundColor(bgColor)
+        }
         lyricsOverlay.visibility = View.VISIBLE
         refreshOffsetLabel()
         // 0.6.9: spring entrance (fade + rise from 24dp) instead
@@ -8430,6 +8524,10 @@ class MainActivity : Activity() {
         handler.removeCallbacks(lyricsTicker)
         handler.post(lyricsTicker)
         lyricsTitle.text = t.title
+        if (::lyricsArtist.isInitialized) lyricsArtist.text = t.artist
+        if (::lyricsArt.isInitialized) {
+            ArtworkLoader.load(t.artworkSmall ?: t.artworkLarge, lyricsArt)
+        }
         val key = Downloads.key(t)
         if (key == lyricsKey && (lyricsLineViews.isNotEmpty() || lyricsLoading)) {
             // Already showing (or already fetching) this track.
@@ -8543,19 +8641,7 @@ class MainActivity : Activity() {
         val idx = lyricsSyncedLines.indexOfLast { it.timeMs - offset <= pos }
         if (idx == lyricsActiveLine) return
         val prev = lyricsActiveLine
-        if (prev == -2 && idx > 0) {
-            // First derivation (open mid-song): everything before
-            // the current line is already sung.
-            for (i in 0 until idx.coerceAtMost(lyricsLineViews.size)) {
-                lyricsLineViews[i].setTextColor(Color.argb(64, 255, 255, 255))
-            }
-        }
         lyricsLineViews.getOrNull(prev)?.let {
-            // Leaving a line by moving FORWARD = sung (dimmer);
-            // by seeking BACK = upcoming again (brighter dim).
-            it.setTextColor(
-                if (idx > prev) Color.argb(64, 255, 255, 255) else Color.argb(120, 255, 255, 255)
-            )
             it.typeface = semiboldTf
             // The glow belongs to the current line ONLY: it leaves
             // with the highlight.
@@ -8564,6 +8650,17 @@ class MainActivity : Activity() {
             Springs.scale(it, 1f, 0.75f, 700f, instant = springsOff())
         }
         lyricsActiveLine = idx
+        // 0.6.13 DISTANCE FADE (Apple Music inspo): non-active
+        // lines are no longer two flat dim levels — brightness
+        // now falls off with DISTANCE from the live line, near
+        // lines clearly readable, far lines dissolving into the
+        // wash (blur itself is not available per-TextView
+        // without bitmap work the G95 would feel; alpha carries
+        // the same read). Sung lines sit lower than upcoming
+        // ones at the same distance. Applied on line changes
+        // only, over a ±8 window (full list on first derivation
+        // and after seeks, when prev == -2).
+        applyLyricRamp(full = prev == -2)
         val view = lyricsLineViews.getOrNull(idx) ?: return
         view.setTextColor(Color.WHITE)
         view.typeface = boldTf
@@ -8580,6 +8677,44 @@ class MainActivity : Activity() {
         // the viewport down, not pinned to a fixed offset.
         val y = (view.top - lyricsScroll.height / 3).coerceAtLeast(0)
         scrollLyricsTo(y)
+    }
+
+    /** Brightness (white alpha) of a non-active lyrics line by
+     *  its distance from the live line (0.6.13 distance fade). */
+    private fun lyricDimAlpha(distance: Int, sung: Boolean): Int =
+        if (sung) {
+            when (distance) {
+                1 -> 104
+                2 -> 80
+                else -> 60
+            }
+        } else {
+            when (distance) {
+                1 -> 168
+                2 -> 128
+                3 -> 98
+                4 -> 80
+                else -> 64
+            }
+        }
+
+    /** Applies the distance fade around the active line. The
+     *  active line itself is styled by the caller (full white,
+     *  bold, glow) and skipped here. */
+    private fun applyLyricRamp(full: Boolean) {
+        val active = lyricsActiveLine
+        if (active < 0) return
+        val n = lyricsLineViews.size
+        if (n == 0) return
+        val from = if (full) 0 else maxOf(0, active - 8)
+        val to = if (full) n - 1 else minOf(n - 1, active + 8)
+        for (i in from..to) {
+            if (i == active) continue
+            val d = kotlin.math.abs(i - active)
+            lyricsLineViews[i].setTextColor(
+                Color.argb(lyricDimAlpha(d, i < active), 255, 255, 255)
+            )
+        }
     }
 
     /** Animated lyrics auto-scroll (0.6.9): a single cancellable

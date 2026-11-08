@@ -135,13 +135,33 @@ object ArzxshWidget {
         }
     }
 
+    /** Rounds the artwork's corners for the widget (0.6.13):
+     *  RemoteViews cannot clip an ImageView, so the bitmap is
+     *  pre-rounded on a canvas — the widget's art used to sit in
+     *  the rounded card with square corners poking out of it.
+     *  Runs only on state-change renders, never per frame. */
+    private fun roundedArt(context: Context, src: Bitmap): Bitmap {
+        val radius = 14f * context.resources.displayMetrics.density
+        val out = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(out)
+        val path = android.graphics.Path().apply {
+            addRoundRect(
+                android.graphics.RectF(0f, 0f, src.width.toFloat(), src.height.toFloat()),
+                radius, radius, android.graphics.Path.Direction.CW
+            )
+        }
+        canvas.clipPath(path)
+        canvas.drawBitmap(src, 0f, 0f, null)
+        return out
+    }
+
     private fun buildViews(context: Context, s: PlaybackBridge.State?): RemoteViews {
         val views = RemoteViews(context.packageName, R.layout.widget_arzxsh)
         views.setTextViewText(R.id.widget_title, s?.title ?: "arzxsh")
         views.setTextViewText(R.id.widget_artist, s?.artist ?: "Tap to open")
         val art = artBitmap
         if (s != null && art != null) {
-            views.setImageViewBitmap(R.id.widget_art, art)
+            views.setImageViewBitmap(R.id.widget_art, roundedArt(context, art))
         } else {
             views.setImageViewResource(R.id.widget_art, R.drawable.ic_logo)
         }
