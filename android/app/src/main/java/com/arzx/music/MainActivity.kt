@@ -10,7 +10,6 @@ import android.graphics.Outline
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
-import android.graphics.drawable.LayerDrawable
 import android.media.AudioManager
 import android.media.MediaMetadataRetriever
 import android.media.audiofx.AudioEffect
@@ -48,7 +47,6 @@ import android.animation.ValueAnimator
 import androidx.dynamicanimation.animation.DynamicAnimation
 import androidx.dynamicanimation.animation.SpringAnimation
 import android.view.animation.AccelerateInterpolator
-import android.view.animation.DecelerateInterpolator
 import android.view.animation.LinearInterpolator
 import android.view.animation.PathInterpolator
 import android.view.inputmethod.EditorInfo
@@ -1134,17 +1132,29 @@ class MainActivity : Activity() {
         }
         scroll.addView(content, LinearLayout.LayoutParams(-1, -2))
         root.addView(scroll, FrameLayout.LayoutParams(-1, -1))
+        // 0.6.9 glass: the chrome blur snapshot refreshes ~250ms
+        // after scrolling settles (never per frame — see
+        // GlassBlur.kt for the trade-off).
+        shellScroll = scroll
+        scroll.setOnScrollChangeListener { _, _, _, _, _ ->
+            handler.removeCallbacks(chromeBlurRefresh)
+            handler.postDelayed(chromeBlurRefresh, 250)
+        }
 
         bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            // v6: the chrome sits on solid black (Spotify). 0.6.1:
-            // with glass on, the bar goes translucent so scrolling
-            // content ghosts through its margins. 0.6.3 (WS-B):
-            // the glass bar is LIT from above (a vertical
-            // lightening gradient) so it reads as glass, not as
-            // another black slab.
+            // v6: the chrome sits on solid black (Spotify).
+            // 0.6.9: with glass on, the bar frosts over the real
+            // blurred snapshot of the content behind it
+            // (GlassBlur.kt), tinted with the artwork color; no
+            // sheen, no fake translucency gradient.
             if (glassOn()) {
-                background = glassBar(Color.argb(238, 32, 32, 36), Color.argb(230, 12, 12, 14))
+                background = GlassBlurDrawable(
+                    0f, dp(1).toFloat(),
+                    { chromeBlurBmp },
+                    { glassTinted(Color.argb(215, 26, 26, 30)) },
+                    { Color.argb(56, 255, 255, 255) }
+                )
             } else {
                 setBackgroundColor(Color.BLACK)
             }
@@ -1152,14 +1162,19 @@ class MainActivity : Activity() {
 
         // ---- mini player ----
         // v6: a SOLID dark bar like the Spotify inspo (art, title,
-        // artist, play/next). 0.6.1: glass effects (Settings,
-        // default on) swap the solid fill for the pre-v6 fake
-        // glass; off restores the solid bar exactly. Real actions
+        // artist, play/next). Glass effects (Settings, default on)
+        // swap the solid fill for the blurred-snapshot glass
+        // (0.6.9); off restores the solid bar exactly. Real actions
         // unchanged: tap opens Now Playing, swipe skips.
         mini = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = if (glassOn()) chromeGlass(8f) else solidBg(8f, surface2)
+            background = if (glassOn()) GlassBlurDrawable(
+                dp(8).toFloat(), dp(1).toFloat(),
+                { chromeBlurBmp },
+                { glassTinted(Color.argb(205, 34, 34, 40)) },
+                { Color.argb(64, 255, 255, 255) }
+            ) else solidBg(8f, surface2)
             setPadding(dp(8), dp(8), dp(12), dp(8))
             elevation = dp(10).toFloat()
             setOnClickListener { if (current != null) showNowPlaying() }
@@ -1251,11 +1266,16 @@ class MainActivity : Activity() {
         val nav = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            // 0.6.1: translucent glass-dark while glass is on.
-            // 0.6.3 (WS-B): lit-from-above gradient, same rule as
-            // the bottom bar — visible as glass over content.
+            // 0.6.9: the same blurred snapshot as the bottom bar
+            // (aligned by window coordinates, so the two read as
+            // one pane), under a slightly lighter tint.
             if (glassOn()) {
-                background = glassBar(Color.argb(240, 40, 40, 46), Color.argb(235, 18, 18, 20))
+                background = GlassBlurDrawable(
+                    0f, dp(1).toFloat(),
+                    { chromeBlurBmp },
+                    { glassTinted(Color.argb(190, 30, 30, 36)) },
+                    { Color.argb(48, 255, 255, 255) }
+                )
             } else {
                 setBackgroundColor(Color.BLACK)
             }
@@ -1310,6 +1330,10 @@ class MainActivity : Activity() {
         // to land after layout. A layout listener cannot miss.
         bottomBar.viewTreeObserver.addOnGlobalLayoutListener { fitContentPadding() }
         bottomBar.post { fitContentPadding() }
+        // 0.6.9 glass: register the blurred chrome surfaces and
+        // take the first snapshot once the shell is laid out.
+        chromeBlurViews = if (glassOn()) listOf(bottomBar, mini, nav) else emptyList()
+        bottomBar.post { refreshChromeBlur() }
     }
 
     private var lastFitPadding = -1
@@ -1386,79 +1410,93 @@ class MainActivity : Activity() {
     // ------------------------------------------------------------ v6.1: glass
 
     /** Glass effects toggle (Settings > Appearance, default ON).
-     *  When ON, the chrome surfaces (mini player, bottom bar, menu
-     *  sheets, queue backdrop) and Now Playing's card/control zone
-     *  use the pre-v6 fake-glass treatment: a translucent fill plus
-     *  a thin light stroke, with content subtly visible behind.
-     *  NO runtime blur is ever rendered on scrolling surfaces —
-     *  the only real blur in the app is Now Playing's precomputed
-     *  artwork backdrop. When OFF, the v6 solid Spotify surfaces
-     *  apply, exactly as 0.6.0 shipped. */
+     *  0.6.9 rework (field verdict on the old treatment: "looks
+     *  cheap"): when ON, the two small floating chrome surfaces
+     *  (mini player + the bottom/tab bar) frost over a REAL
+     *  blurred snapshot of the content behind them (GlassBlur.kt)
+     *  under an artwork-tinted fill — no painted sheen band, no
+     *  fake translucent gradient. Now Playing's zones keep their
+     *  lighter fill over the genuinely blurred artwork backdrop.
+     *  Sheets are solid in BOTH modes (Spotify style). When OFF,
+     *  every surface is exactly the v6 solid it was before 0.6.9:
+     *  same solidBg calls, same colors, same black bars. */
     private fun glassOn(): Boolean =
         getPreferences(MODE_PRIVATE).getBoolean("setting_Glass effects", true)
 
-    /** Layered glass (0.6.3, WS-B): the 0.6.1 treatment — a flat
-     *  translucent near-black fill + a faint stroke — read as
-     *  SOLID black over the app's #121212 screens, so the field
-     *  verdict was "glass layers not showing" with the toggle on.
-     *  Glass reads as glass through LIGHT, not darkness: a
-     *  vertical lightening gradient (lit from above), a bright
-     *  sheen band across the top edge, and a clearly visible
-     *  rim stroke. Still zero runtime blur (perf law); still two
-     *  static drawables per surface, drawn once. */
+    // ---- 0.6.9 glass state ----
+    /** The blurred snapshot the floating chrome frosts over;
+     *  recaptured at discrete moments only (refreshChromeBlur). */
+    private var chromeBlurBmp: Bitmap? = null
+    /** Views whose backgrounds draw [chromeBlurBmp] (bottom bar,
+     *  mini player, nav) — invalidated on recapture / tint change. */
+    private var chromeBlurViews: List<View> = emptyList()
+    /** The shell's scroll view: the snapshot's source. */
+    private var shellScroll: ScrollView? = null
+    private val chromeBlurRefresh = Runnable { refreshChromeBlur() }
+
+    /** Recaptures the chrome blur snapshot from the shell content
+     *  and repaints the chrome. Cheap by construction (one 96px
+     *  draw + blur); called on shell build, screen change, scroll
+     *  settle and track change — never per frame. */
+    private fun refreshChromeBlur() {
+        if (!glassOn()) return
+        val src = shellScroll ?: return
+        if (src.width <= 0 || src.height <= 0) return
+        val bmp = try {
+            GlassCapture.capture(src)
+        } catch (_: Throwable) {
+            null
+        } ?: return
+        val old = chromeBlurBmp
+        chromeBlurBmp = bmp
+        if (old != null && old !== bmp) old.recycle()
+        chromeBlurViews.forEach { it.invalidate() }
+    }
+
+    /** [base] glass fill with the current artwork's dominant
+     *  color mixed into its RGB at low strength (alpha kept):
+     *  the pane carries the song's color instead of dead grey.
+     *  Returns [base] unchanged when ambient is off or no color
+     *  has been extracted yet. */
+    private fun glassTinted(base: Int): Int {
+        val c = if (ambientOn()) ambientColor else null
+        if (c == null) return base
+        val f = 0.22f
+        return Color.argb(
+            Color.alpha(base),
+            (Color.red(c) * f + Color.red(base) * (1f - f)).toInt(),
+            (Color.green(c) * f + Color.green(base) * (1f - f)).toInt(),
+            (Color.blue(c) * f + Color.blue(base) * (1f - f)).toInt()
+        )
+    }
+
+    /** A single soft fill + hairline rim (0.6.9: the layered
+     *  sheen band of 0.6.1–0.6.8 is deleted — a painted shine on
+     *  every surface was the core of the "cheap" read). */
     private fun glassBg(
         radiusDp: Float,
         top: Int,
         bottom: Int,
-        stroke: Int,
-        sheenAlpha: Int
+        stroke: Int
     ): Drawable {
-        val r = dp(radiusDp.toInt()).toFloat()
-        val body = GradientDrawable(
+        return GradientDrawable(
             GradientDrawable.Orientation.TOP_BOTTOM,
             intArrayOf(top, bottom)
         ).apply {
-            cornerRadius = r
+            cornerRadius = dp(radiusDp.toInt()).toFloat()
             setStroke(dp(1), stroke)
         }
-        val sheen = GradientDrawable(
-            GradientDrawable.Orientation.TOP_BOTTOM,
-            intArrayOf(
-                Color.argb(sheenAlpha, 255, 255, 255),
-                Color.argb((sheenAlpha * 0.4f).toInt(), 255, 255, 255),
-                Color.argb(0, 255, 255, 255),
-                Color.argb(0, 255, 255, 255)
-            )
-        ).apply { cornerRadius = r }
-        return LayerDrawable(arrayOf(body, sheen))
     }
 
-    /** Glass for the floating chrome (mini player, sheets): the
-     *  fill stays translucent enough for content to ghost through,
-     *  but the top of the surface is now lit at ~74/255 grey
-     *  instead of 33 — unmistakably a lit pane, not a black box. */
-    private fun chromeGlass(radiusDp: Float): Drawable =
-        glassBg(
-            radiusDp,
-            Color.argb(238, 66, 66, 74), Color.argb(228, 36, 36, 42),
-            Color.argb(120, 255, 255, 255), sheenAlpha = 110
-        )
-
     /** Glass over Now Playing's genuinely blurred backdrop: the
-     *  art behind is already soft, so the fill can go lighter. */
+     *  art behind is already soft, so the fill can go lighter —
+     *  artwork-tinted now, with a subtler rim. */
     private fun npGlass(radiusDp: Float): Drawable =
         glassBg(
             radiusDp,
-            Color.argb(150, 58, 58, 66), Color.argb(120, 30, 30, 36),
-            Color.argb(130, 255, 255, 255), sheenAlpha = 80
-        )
-
-    /** Full-width bar glass (tab bar / bottom bar): the same
-     *  vertical lightening, no radius or rim (edge-to-edge). */
-    private fun glassBar(top: Int, bottom: Int): GradientDrawable =
-        GradientDrawable(
-            GradientDrawable.Orientation.TOP_BOTTOM,
-            intArrayOf(top, bottom)
+            glassTinted(Color.argb(150, 58, 58, 66)),
+            glassTinted(Color.argb(120, 30, 30, 36)),
+            Color.argb(64, 255, 255, 255)
         )
 
     /** Toggling glass rebuilds the shell + current screen (the
@@ -6402,6 +6440,9 @@ class MainActivity : Activity() {
      *  lyrics overlay (when open) takes the solid ambient color.
      *  Toggle OFF or no usable color = the neutral player. */
     private fun applyAmbient(animate: Boolean) {
+        // 0.6.9: the chrome glass tint follows the ambient color;
+        // repaint it whenever the ambient state is re-applied.
+        chromeBlurViews.forEach { it.invalidate() }
         if (!::npAmbient.isInitialized) return
         val c = if (ambientOn()) ambientColor else null
         if (c == null) {
@@ -6631,9 +6672,11 @@ class MainActivity : Activity() {
         }
         menuPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            // Glass sheet (0.6.1) when glass is on; v6 solid sheet
-            // when off. The dim backdrop behind stays as it was.
-            background = if (glassOn()) chromeGlass(22f) else solidBg(22f, Color.rgb(40, 40, 40))
+            // Solid sheet in BOTH glass modes (0.6.9, Spotify
+            // style): glass lives on the small floating chrome
+            // only now. With glass off this is the exact v6 solid
+            // sheet, as before; the dim backdrop stays as it was.
+            background = solidBg(22f, Color.rgb(40, 40, 40))
             setPadding(dp(8), dp(10), dp(8), dp(10))
             elevation = dp(16).toFloat()
             isClickable = true // absorb taps; only the dim backdrop dismisses
@@ -6652,7 +6695,7 @@ class MainActivity : Activity() {
         root.addView(menuOverlay, FrameLayout.LayoutParams(-1, -1))
     }
 
-    /** Glass bottom-sheet menu used for track actions, the Now Playing
+    /** Bottom-sheet menu used for track actions, the Now Playing
      *  more menu, and the sleep timer picker. */
     private fun showMenu(title: String?, items: List<Pair<String, () -> Unit>>) {
         ensureOverlays()
@@ -9010,6 +9053,9 @@ class MainActivity : Activity() {
             Springs.alpha(content, 1f, 0.9f, 800f, instant = false)
             Springs.translationY(content, 0f, 0.88f, 750f, instant = false)
         }
+        // 0.6.9: a new screen is new content behind the chrome —
+        // recapture its blur once this layout settles.
+        content.post(chromeBlurRefresh)
     }
 
     // ------------------------------------------------- local profile (0.6.4, WS-2)
@@ -9207,6 +9253,25 @@ class MainActivity : Activity() {
         suppressAutoPlay = true
         handler.removeCallbacks(ticker)
         handler.removeCallbacks(lyricsTicker)
+        // 0.6.9: no spring, scroll animator or blur work outlives
+        // the activity (the Springs registry is view-keyed, but
+        // the morph spring's holder is not a view — cancel all of
+        // them explicitly).
+        npMorphSpring?.cancel()
+        if (::content.isInitialized) Springs.cancel(content)
+        if (::npArtwork.isInitialized) Springs.cancel(npArtwork)
+        if (::npPlayButton.isInitialized) Springs.cancel(npPlayButton)
+        if (::menuOverlay.isInitialized) {
+            Springs.cancel(menuOverlay)
+            Springs.cancel(menuPanel)
+        }
+        if (::queueOverlay.isInitialized) Springs.cancel(queueOverlay)
+        if (::lyricsOverlay.isInitialized) Springs.cancel(lyricsOverlay)
+        lyricsLineViews.forEach { Springs.cancel(it) }
+        lyricsScrollAnim?.cancel()
+        handler.removeCallbacks(chromeBlurRefresh)
+        chromeBlurBmp?.recycle()
+        chromeBlurBmp = null
         visualizerAnimator?.cancel()
         flushListened()
         handler.removeCallbacks(crossfadeTick)
