@@ -38,7 +38,11 @@ import java.util.WeakHashMap
  */
 object Springs {
 
-    private val registry = WeakHashMap<View, HashMap<String, SpringAnimation>>()
+    // Keyed by the property OBJECT (every property used is a
+    // DynamicAnimation singleton): dynamicanimation 1.0.0 does
+    // not expose FloatPropertyCompat.name to Kotlin.
+    private val registry =
+        WeakHashMap<View, HashMap<FloatPropertyCompat<View>, SpringAnimation>>()
 
     private fun getOrCreate(
         view: View,
@@ -48,14 +52,14 @@ object Springs {
         stiffness: Float
     ): SpringAnimation {
         val byProperty = registry.getOrPut(view) { HashMap() }
-        byProperty[property.name]?.let { return it }
+        byProperty[property]?.let { return it }
         val anim = SpringAnimation(view, property).apply {
             spring = SpringForce(target).apply {
                 this.dampingRatio = dampingRatio
                 this.stiffness = stiffness
             }
         }
-        byProperty[property.name] = anim
+        byProperty[property] = anim
         return anim
     }
 
@@ -99,7 +103,7 @@ object Springs {
      *  wherever it currently sits. */
     fun cancelProperty(view: View, property: FloatPropertyCompat<View>) {
         val byProperty = registry[view] ?: return
-        byProperty.remove(property.name)?.cancel()
+        byProperty.remove(property)?.cancel()
         if (byProperty.isEmpty()) registry.remove(view)
     }
 
