@@ -355,6 +355,92 @@ object ArtworkLoader {
         }
     }
 
+    /** Two-color palette of [url]'s artwork (0.6.14): the
+     *  dominant vibrant hue plus a SECOND strong hue from the
+     *  same image (or a hue-rotated sibling when the art is
+     *  effectively monochrome). The lyrics page builds its
+     *  whole backdrop from these two colors — no blurred photo
+     *  anywhere. Callback on the main thread; null = no usable
+     *  color. One-shot per artwork, same cost class as
+     *  [loadAmbientColor]. */
+    fun loadAmbientPalette(url: String?, onPalette: (Pair<Int, Int>?) -> Unit) {
+        if (url.isNullOrEmpty()) {
+            onPalette(null)
+            return
+        }
+        heroPool.execute {
+            val bmp = decode(url, 256)
+            val palette = bmp?.let { paletteColors(it) }
+            Handler(Looper.getMainLooper()).post { onPalette(palette) }
+        }
+    }
+
+    /** Hue histogram shared by the ambient samplers: 36 buckets
+     *  of saturation×value weight over saturated, mid-bright
+     *  pixels (near-gray and near-black/white ignored). */
+    private fun hueBuckets(bmp: Bitmap): FloatArray {
+        val buckets = FloatArray(36)
+        val w = bmp.width
+        val h = bmp.height
+        if (w <= 0 || h <= 0) return buckets
+        val hsv = FloatArray(3)
+        var x = 0
+        while (x < w) {
+            var y = 0
+            while (y < h) {
+                Color.colorToHSV(bmp.getPixel(x, y), hsv)
+                val s = hsv[1]
+                val v = hsv[2]
+                if (s >= 0.25f && v >= 0.12f && v <= 0.95f) {
+                    val b = (hsv[0] / 10f).toInt().coerceIn(0, 35)
+                    buckets[b] += s * v
+                }
+                y += 4
+            }
+            x += 4
+        }
+        return buckets
+    }
+
+    /** (primary, secondary) deep-saturated colors for the
+     *  lyrics backdrop: primary is the winning hue (the same
+     *  pick [dominantVibrant] makes, a touch brighter for the
+     *  larger canvas), secondary the strongest hue at least
+     *  ~50° away — the second color actually IN the artwork —
+     *  or, for monochrome art, the primary's hue rotated 40°
+     *  and deepened, so the gradient still has two voices. */
+    private fun paletteColors(bmp: Bitmap): Pair<Int, Int>? {
+        val buckets = hueBuckets(bmp)
+        var best = -1
+        var bestW = 0f
+        for (i in buckets.indices) {
+            if (buckets[i] > bestW) {
+                bestW = buckets[i]
+                best = i
+            }
+        }
+        if (best < 0) return null
+        var second = -1
+        var secondW = 0f
+        for (i in buckets.indices) {
+            if (i == best) continue
+            val dist = minOf(
+                kotlin.math.abs(i - best), 36 - kotlin.math.abs(i - best)
+            )
+            if (dist >= 5 && buckets[i] > secondW) {
+                secondW = buckets[i]
+                second = i
+            }
+        }
+        val primary = Color.HSVToColor(floatArrayOf(best * 10f + 5f, 0.66f, 0.50f))
+        val secondary = if (second >= 0 && secondW > bestW * 0.12f) {
+            Color.HSVToColor(floatArrayOf(second * 10f + 5f, 0.60f, 0.34f))
+        } else {
+            Color.HSVToColor(floatArrayOf(best * 10f + 45f, 0.58f, 0.30f))
+        }
+        return primary to secondary
+    }
+
     /** Saturation/value-weighted hue histogram over the bitmap:
      *  near-gray and near-black/white pixels are ignored, the
      *  winning hue bucket is re-emitted at a fixed deep, saturated
@@ -702,6 +788,45 @@ private class NpScrollView(context: android.content.Context) : ScrollView(contex
     }
 }
 
+/**
+ * Resume-progress ring for Home's "Jump back in" cards
+ * (0.6.14): a thin track circle with a bright arc showing the
+ * fraction of the track the user previously reached (real
+ * data from [ListenProgress] — no record, no ring). Draw-only:
+ * two arcs on one small canvas, no layout work, density read
+ * per draw so it sizes identically on every screen.
+ */
+private class ProgressRingView(context: android.content.Context) : View(context) {
+    var fraction: Float = 0f
+        set(value) {
+            field = value.coerceIn(0f, 1f)
+            invalidate()
+        }
+
+    private val trackPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+        style = android.graphics.Paint.Style.STROKE
+        color = Color.argb(72, 255, 255, 255)
+    }
+    private val arcPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+        style = android.graphics.Paint.Style.STROKE
+        color = Color.WHITE
+        strokeCap = android.graphics.Paint.Cap.ROUND
+    }
+    private val rect = android.graphics.RectF()
+
+    override fun onDraw(canvas: android.graphics.Canvas) {
+        super.onDraw(canvas)
+        if (fraction <= 0f || width <= 0 || height <= 0) return
+        val stroke = 2.2f * resources.displayMetrics.density
+        trackPaint.strokeWidth = stroke
+        arcPaint.strokeWidth = stroke
+        val inset = stroke / 2f + 1f
+        rect.set(inset, inset, width - inset, height - inset)
+        canvas.drawArc(rect, 0f, 360f, false, trackPaint)
+        canvas.drawArc(rect, -90f, 360f * fraction, false, arcPaint)
+    }
+}
+
 @UnstableApi
 class MainActivity : Activity() {
     private val executor = Executors.newSingleThreadExecutor()
@@ -950,10 +1075,13 @@ class MainActivity : Activity() {
      *  one exists; a user touch on the lyrics scroll cancels it
      *  so the highlight never fights the reader's finger. */
     private var lyricsScrollAnim: ValueAnimator? = null
-    /** Spinner shown in the lyrics header while a fetch runs. */
-    private lateinit var lyricsSpinner: ProgressBar
-    /** Offset row value label in the lyrics overlay. */
-    private lateinit var lyricsOffsetLabel: TextView
+    /** Branded loader shown centered while a lyrics fetch runs
+     *  (0.6.14): the living logo, not a stock spinner. */
+    private lateinit var lyricsLoader: EqLogoView
+    /** Characters of the active line already swept bright
+     *  (0.6.14 karaoke sweep): the ticker only rewrites the
+     *  active line's spans when this count actually moves. */
+    private var lyricsSweepChars = -1
 
     // ---- v6: Now Playing lyrics (above-title line + preview card) ----
     private lateinit var npLyricLine: TextView
@@ -965,6 +1093,11 @@ class MainActivity : Activity() {
     private var npLyricsKey: String? = null
     private var npLyricIdx = -2
     private var lastNpLyricText: String? = null
+    /** Running crossfades for the NP lyric swaps (0.6.14): one
+     *  per surface, cancelled and replaced on the next swap so
+     *  two fades never fight over the same view. */
+    private var npLyricFadeLine: ValueAnimator? = null
+    private var npLyricFadeCard: ValueAnimator? = null
 
     // ---- v6: "Playing from {context}" for the Now Playing top bar ----
     private var npContextKind = ""
@@ -1020,6 +1153,12 @@ class MainActivity : Activity() {
     private lateinit var npAmbient: View
     /** Small in-memory cache: artwork URL -> ambient color. */
     private val ambientCache = HashMap<String, Int>()
+
+    /** Two-color artwork palette for the current track
+     *  (0.6.14): the lyrics page's backdrop is built from these
+     *  colors alone. Null until extraction lands. */
+    private var ambientPalette: Pair<Int, Int>? = null
+    private val ambientPaletteCache = HashMap<String, Pair<Int, Int>>()
 
     private fun ambientOn(): Boolean =
         getPreferences(MODE_PRIVATE).getBoolean("setting_Ambient color from artwork", true)
@@ -1317,6 +1456,21 @@ class MainActivity : Activity() {
      *  (0.6.13): a pull re-runs the current screen's loader. */
     private lateinit var swipeRefresh: androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 
+    /** Branded pull-to-refresh chip (0.6.14): a floating disc
+     *  carrying the living EqLogo mark. The stock
+     *  SwipeRefreshLayout circle is color-masked invisible and
+     *  THIS is what the user sees while a pull reload runs; it
+     *  springs down from the top edge and springs back out. */
+    private lateinit var refreshChip: FrameLayout
+    private val refreshChipHide = Runnable {
+        if (::refreshChip.isInitialized) {
+            Springs.translationY(refreshChip, -dp(84).toFloat(), 0.85f, 700f, instant = springsOff())
+            handler.postDelayed({
+                if (::refreshChip.isInitialized) refreshChip.visibility = View.GONE
+            }, 240)
+        }
+    }
+
     /** The live Search screen's re-run hook + last query
      *  (0.6.13): pull-to-refresh on Search re-runs the visible
      *  search instead of rebuilding the screen and losing it. */
@@ -1360,8 +1514,12 @@ class MainActivity : Activity() {
         // reload — a pull re-runs the current screen's loader.
         swipeRefresh = androidx.swiperefreshlayout.widget.SwipeRefreshLayout(this).apply {
             addView(scroll, ViewGroup.LayoutParams(-1, -1))
-            setColorSchemeColors(accent)
-            setProgressBackgroundColorSchemeColor(surface2)
+            // 0.6.14: the STOCK circle is masked out (transparent
+            // spinner on a transparent disc) — the gesture and
+            // the list's pull-down travel are SwipeRefreshLayout's,
+            // the visible loader is the branded chip below.
+            setColorSchemeColors(Color.TRANSPARENT)
+            setProgressBackgroundColorSchemeColor(Color.TRANSPARENT)
             setOnRefreshListener { onPullRefresh() }
         }
         root.addView(swipeRefresh, FrameLayout.LayoutParams(-1, -1))
@@ -1584,6 +1742,27 @@ class MainActivity : Activity() {
         bottomBar.addView(nav, navLp)
         root.addView(bottomBar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
 
+        // Branded refresh chip (0.6.14): parked above the top
+        // edge, springs into view while a pull-to-refresh runs.
+        refreshChip = FrameLayout(this).apply {
+            background = solidBg(26f, surface2)
+            elevation = dp(12).toFloat()
+            visibility = View.GONE
+            translationY = -dp(84).toFloat()
+        }
+        val refreshLogo = EqLogoView(this).apply {
+            motionAllowed = { !activityStopped && !reduceMotion() }
+            playingProvider = { isPlayingSafe() }
+            contentDescription = "Refreshing"
+        }
+        refreshChip.addView(
+            refreshLogo,
+            FrameLayout.LayoutParams(dp(30), dp(30), Gravity.CENTER)
+        )
+        val chipLp = FrameLayout.LayoutParams(dp(52), dp(52), Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+        chipLp.topMargin = dp(16)
+        root.addView(refreshChip, chipLp)
+
         // 0.6.3 (audit S7): the four overlay trees (Now Playing,
         // queue, lyrics, menu) are NOT built here anymore. They
         // cost real tree-building time at every startup and shell
@@ -1666,6 +1845,14 @@ class MainActivity : Activity() {
      * tree in place, and none exposes a completion callback.
      */
     private fun onPullRefresh() {
+        // Branded loader in, stock circle already masked: the
+        // chip springs down as the reload starts and springs
+        // back when the (fixed-delay) refresh window closes.
+        if (::refreshChip.isInitialized) {
+            handler.removeCallbacks(refreshChipHide)
+            refreshChip.visibility = View.VISIBLE
+            Springs.translationY(refreshChip, 0f, 0.8f, 620f, instant = springsOff())
+        }
         when (displayedRootTab) {
             "Home" -> buildHome(warmRefresh = true)
             "Search" -> {
@@ -1686,6 +1873,7 @@ class MainActivity : Activity() {
         }
         handler.postDelayed({
             if (::swipeRefresh.isInitialized) swipeRefresh.isRefreshing = false
+            refreshChipHide.run()
         }, 1100)
     }
 
@@ -2281,9 +2469,38 @@ class MainActivity : Activity() {
                 if (recentTracks.isNotEmpty()) {
                     content.addView(sectionTitle("Jump back in"))
                     content.addView(
-                        trackCardRow(recentTracks.toList(), 148, recentTracks.toList())
+                        trackCardRow(
+                            recentTracks.toList(), 148, recentTracks.toList(),
+                            showProgress = true
+                        )
                     )
                     any = true
+                }
+                // Made for tonight (0.6.14): in the night hours,
+                // a shelf of the tracks he actually plays AT
+                // NIGHT — PlayHistory events carry timestamps,
+                // so the shelf is filtered to night-hour plays,
+                // newest first. Fewer than 3 real night plays =
+                // no shelf; nothing is ever padded with filler.
+                val hourNow = java.util.Calendar.getInstance()
+                    .get(java.util.Calendar.HOUR_OF_DAY)
+                if (hourNow >= 22 || hourNow < 5) {
+                    val nightPicks = LinkedHashMap<String, Track>()
+                    for ((t, ts) in PlayHistory.events(this@MainActivity)) {
+                        val h = java.util.Calendar.getInstance().apply {
+                            timeInMillis = ts
+                        }.get(java.util.Calendar.HOUR_OF_DAY)
+                        if (h >= 22 || h < 5) {
+                            nightPicks.putIfAbsent(trackKey(t), t)
+                        }
+                        if (nightPicks.size >= 10) break
+                    }
+                    if (nightPicks.size >= 3) {
+                        val nightList = nightPicks.values.toList()
+                        content.addView(sectionTitle("Made for tonight"))
+                        content.addView(trackCardRow(nightList, 132, nightList))
+                        any = true
+                    }
                 }
                 if (charts != null && charts.songs.isNotEmpty()) {
                     content.addView(sectionTitle("Trending"))
@@ -2348,16 +2565,71 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Home header greeting by local time (Spotify-style home,
-     *  0.6.13): the header beginScreen draws carries this in place
-     *  of the old "Listen Now" title, avatar at the top-right as
-     *  before. */
-    private fun greetingTitle(): String =
-        when (java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)) {
-            in 5..11 -> "Good morning"
-            in 12..16 -> "Good afternoon"
-            else -> "Good evening"
+    /** Home header greeting (0.6.14, rebuilt at Arz's word):
+     *  time-aware buckets INCLUDING a night bucket after
+     *  midnight (0.6.13 wished him "Good evening" at 12:41 AM),
+     *  a POOL of lines per bucket instead of one fixed string,
+     *  one pick per day — date-seeded, so the greeting is stable
+     *  within a day and different tomorrow — and the name from
+     *  his profile slotted in when he has set one ("Still up,
+     *  Arz?" style), with name-free variants when he hasn't.
+     *  The header beginScreen draws carries this in place of
+     *  the old "Listen Now" title, avatar at the top-right. */
+    private fun greetingTitle(): String {
+        val cal = java.util.Calendar.getInstance()
+        val hour = cal.get(java.util.Calendar.HOUR_OF_DAY)
+        val name = Profile.displayName(this).trim()
+            .split(Regex("\\s+")).firstOrNull()?.takeIf { it.isNotEmpty() }
+        val named: List<String>
+        val plain: List<String>
+        when (hour) {
+            in 5..11 -> {
+                named = listOf(
+                    "Good morning, %s", "Morning, %s",
+                    "Rise and shine, %s", "Early tunes, %s"
+                )
+                plain = listOf(
+                    "Good morning", "Morning", "Rise and shine", "Early tunes"
+                )
+            }
+            in 12..16 -> {
+                named = listOf(
+                    "Good afternoon, %s", "Afternoon, %s",
+                    "Midday break, %s", "Songs for the afternoon, %s"
+                )
+                plain = listOf(
+                    "Good afternoon", "Afternoon",
+                    "Midday break", "Songs for the afternoon"
+                )
+            }
+            in 17..21 -> {
+                named = listOf(
+                    "Good evening, %s", "Evening, %s",
+                    "Golden hour, %s", "Winding down, %s"
+                )
+                plain = listOf(
+                    "Good evening", "Evening", "Golden hour", "Winding down"
+                )
+            }
+            else -> {
+                // 22:00-04:59: the night bucket.
+                named = listOf(
+                    "Still up, %s?", "Good night, %s",
+                    "Night owl hours, %s", "Burning the midnight oil, %s?",
+                    "The quiet hours, %s"
+                )
+                plain = listOf(
+                    "Still up?", "Good night", "Night owl hours",
+                    "Music for the quiet hours", "The quiet hours"
+                )
+            }
         }
+        val pool = if (name != null) named else plain
+        val seed = cal.get(java.util.Calendar.DAY_OF_YEAR) * 31 +
+            cal.get(java.util.Calendar.YEAR)
+        val pick = pool[Math.floorMod(seed, pool.size)]
+        return if (name != null) pick.format(name) else pick
+    }
 
     /** One quick-pick slot: exactly one of [track] / [playlist]. */
     private data class HomePick(val track: Track?, val playlist: Playlist?)
@@ -2484,7 +2756,8 @@ class MainActivity : Activity() {
      *  0.6.13): square art, title, artist — the card twin of
      *  albumCardRow. Tapping a card plays it in shelf context. */
     private fun trackCardRow(
-        items: List<Track>, cardDp: Int, queueContext: List<Track>
+        items: List<Track>, cardDp: Int, queueContext: List<Track>,
+        showProgress: Boolean = false
     ): HorizontalScrollView {
         val scroll = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
@@ -2510,7 +2783,29 @@ class MainActivity : Activity() {
                 roundedClip(this, 10)
             }
             ArtworkLoader.load(item.artworkLarge ?: item.artworkSmall, img)
-            box.addView(img, LinearLayout.LayoutParams(dp(cardDp), dp(cardDp)))
+            if (showProgress) {
+                // Jump back in (0.6.14): the art wears a resume
+                // ring when ListenProgress has a real position
+                // for this track; tracks never left mid-way get
+                // no ring, not a fake empty one.
+                val frame = FrameLayout(this)
+                frame.addView(img, FrameLayout.LayoutParams(-1, -1))
+                val frac = ListenProgress.fraction(this@MainActivity, item)
+                if (frac > 0.02f) {
+                    val ring = ProgressRingView(this@MainActivity).apply {
+                        fraction = frac
+                        contentDescription = "Previously played partway"
+                    }
+                    val rLp = FrameLayout.LayoutParams(
+                        dp(26), dp(26), Gravity.BOTTOM or Gravity.END
+                    )
+                    rLp.setMargins(0, 0, dp(6), dp(6))
+                    frame.addView(ring, rLp)
+                }
+                box.addView(frame, LinearLayout.LayoutParams(dp(cardDp), dp(cardDp)))
+            } else {
+                box.addView(img, LinearLayout.LayoutParams(dp(cardDp), dp(cardDp)))
+            }
             box.addView(label(item.title, 13.5f, Color.WHITE, mediumTf).apply {
                 maxLines = 2
                 ellipsize = TextUtils.TruncateAt.END
@@ -5941,6 +6236,11 @@ class MainActivity : Activity() {
         val nowMs = SystemClock.elapsedRealtime()
         if (p.isPlaying && nowMs - lastPosPushMs > 8000L) {
             lastPosPushMs = nowMs
+            // 0.6.14: the same ~8s throttle banks the reached
+            // position for Home's resume rings — local store,
+            // no bridge ownership questions, negligible cost
+            // (a map write + an off-thread persist).
+            current?.let { ListenProgress.record(this, it, p.positionMs, p.durationMs) }
             val t = current
             val prev = PlaybackBridge.state
             if (t != null && prev != null && prev.trackKey == Downloads.key(t) &&
@@ -6033,6 +6333,17 @@ class MainActivity : Activity() {
         // recorded against an EARLIER resolution (0.6.3, WS-C)
         // must not leak into this one and mute it.
         suppressAutoPlay = false
+        // 0.6.14: bank the OUTGOING track's reached position
+        // before it is replaced — the resume rings on Home read
+        // exactly this. Runs before the player is retired, so
+        // the position is the one the user actually left at.
+        val outTrack = current
+        val outPlayer = player
+        if (outTrack != null && outPlayer != null &&
+            (outTrack.id != track.id || outTrack.source != track.source)
+        ) {
+            ListenProgress.record(this, outTrack, outPlayer.positionMs, outPlayer.durationMs)
+        }
         // A foreground play supersedes any gapless prep for the old
         // track's boundary (manual skip, row tap, error advance):
         // the prepared next is stale the moment this runs.
@@ -7256,6 +7567,11 @@ class MainActivity : Activity() {
         }
         if (active.isPlaying) {
             active.pause()
+            // 0.6.14: a pause is a leave-point — bank the
+            // reached position for Home's resume rings.
+            current?.let {
+                ListenProgress.record(this, it, active.positionMs, active.durationMs)
+            }
             // A manual pause takes the timed sleep timer down
             // with it (0.6.8): mid-fade, the ramp is abandoned
             // and volume restored; merely armed, the deadline is
@@ -7638,20 +7954,30 @@ class MainActivity : Activity() {
         ambientKey = key
         if (!ambientOn()) {
             ambientColor = null
+            ambientPalette = null
             applyAmbient(animate = false)
             return
         }
         val cached = ambientCache[key]
-        if (cached != null) {
+        val cachedPalette = ambientPaletteCache[key]
+        if (cached != null && cachedPalette != null) {
             ambientColor = cached
+            ambientPalette = cachedPalette
             applyAmbient(animate = true)
             return
         }
+        ambientPalette = null
         ArtworkLoader.loadAmbientColor(heroArt(t) ?: t.artworkSmall) { color ->
             if (ambientKey != key) return@loadAmbientColor
             if (color != null) ambientCache[key] = color
             ambientColor = color
             applyAmbient(animate = true)
+        }
+        ArtworkLoader.loadAmbientPalette(heroArt(t) ?: t.artworkSmall) { palette ->
+            if (ambientKey != key) return@loadAmbientPalette
+            if (palette != null) ambientPaletteCache[key] = palette
+            ambientPalette = palette
+            applyAmbient(animate = false)
         }
     }
 
@@ -7692,7 +8018,51 @@ class MainActivity : Activity() {
             npAmbient.alpha = 1f
         }
         if (::lyricsOverlay.isInitialized && lyricsOverlay.visibility == View.VISIBLE) {
-            lyricsOverlay.background = ambientWash(c)
+            lyricsOverlay.background = lyricsBackdrop()
+        }
+    }
+
+    /** The lyrics page backdrop (0.6.14): a FULLY OPAQUE
+     *  gradient built from the current artwork's two palette
+     *  colors — primary at the top, secondary through the
+     *  middle, settling into a deep opaque mix at the bottom.
+     *  Opaque is the point: the old shared wash carried alpha
+     *  stops (235/150), so Now Playing's own title and lyric
+     *  line ghosted THROUGH it — the doubled text and the
+     *  faint duplicate line in Arz's screenshot — and the
+     *  blurred NP backdrop showing through read as "the
+     *  lyrics page is just a blur". No photo, no blur, no
+     *  transparency: color only. Falls back to a one-color
+     *  opaque gradient, then the plain background. */
+    private fun lyricsBackdrop(): Drawable {
+        val p = ambientPalette
+        val c = ambientColor
+        return when {
+            p != null -> GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(
+                    p.first,
+                    p.second,
+                    Color.rgb(
+                        (Color.red(p.second) * 0.45f + Color.red(bgColor) * 0.55f).toInt(),
+                        (Color.green(p.second) * 0.45f + Color.green(bgColor) * 0.55f).toInt(),
+                        (Color.blue(p.second) * 0.45f + Color.blue(bgColor) * 0.55f).toInt()
+                    )
+                )
+            )
+            c != null -> GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(
+                    c,
+                    Color.rgb(
+                        (Color.red(c) * 0.55f + Color.red(bgColor) * 0.45f).toInt(),
+                        (Color.green(c) * 0.55f + Color.green(bgColor) * 0.45f).toInt(),
+                        (Color.blue(c) * 0.55f + Color.blue(bgColor) * 0.45f).toInt()
+                    ),
+                    bgColor
+                )
+            )
+            else -> android.graphics.drawable.ColorDrawable(bgColor)
         }
     }
 
@@ -7765,6 +8135,65 @@ class MainActivity : Activity() {
         if (has) updateNpLyricLine()
     }
 
+    /** Crossfades a Now Playing lyric surface to [newText]
+     *  (0.6.14): the old line fades out over the first third,
+     *  the text swaps at the bottom of the fade, and the new
+     *  line fades in while rising a few dp — the hard text cut
+     *  these surfaces used to make is gone, on the under-cover
+     *  line and the preview card alike. [getAnim]/[setAnim]
+     *  access the surface's animator slot so a fast line change
+     *  cancels the previous fade instead of fighting it (the
+     *  cancelled fade's end callback still lands ITS swap, then
+     *  the new fade proceeds — the newest text always wins).
+     *  Motion off = direct set, fully landed. */
+    private fun swapLyricText(
+        tv: TextView,
+        newText: String,
+        getAnim: () -> ValueAnimator?,
+        setAnim: (ValueAnimator?) -> Unit
+    ) {
+        if (tv.text.toString() == newText) return
+        getAnim()?.cancel()
+        if (springsOff()) {
+            tv.text = newText
+            tv.alpha = 1f
+            tv.translationY = 0f
+            setAnim(null)
+            return
+        }
+        var swapped = false
+        fun doSwap() {
+            if (!swapped) {
+                swapped = true
+                tv.text = newText
+            }
+        }
+        val anim = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 300
+            interpolator = iosEase
+            addUpdateListener { a ->
+                val f = a.animatedValue as Float
+                if (f < 0.35f) {
+                    tv.alpha = 1f - f / 0.35f
+                } else {
+                    doSwap()
+                    val g = (f - 0.35f) / 0.65f
+                    tv.alpha = g
+                    tv.translationY = dp(5).toFloat() * (1f - g)
+                }
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(a: android.animation.Animator) {
+                    doSwap()
+                    tv.alpha = 1f
+                    tv.translationY = 0f
+                }
+            })
+        }
+        setAnim(anim)
+        anim.start()
+    }
+
     /** Moves the Now Playing lyric line + preview card to the line
      *  at the player's REAL position. Change-guarded: no view
      *  writes when the sounding line did not change. Called from
@@ -7780,7 +8209,8 @@ class MainActivity : Activity() {
         val cur = lines.getOrNull(idx)?.text?.ifEmpty { "♪" } ?: "♪"
         if (cur != lastNpLyricText) {
             lastNpLyricText = cur
-            npLyricLine.text = cur
+            // 0.6.14: crossfade + rise, never a hard text cut.
+            swapLyricText(npLyricLine, cur, { npLyricFadeLine }, { npLyricFadeLine = it })
         }
         // Same halo as the full lyrics view, smaller radius: these
         // lines always show the CURRENT line, so the glow is simply
@@ -7788,7 +8218,7 @@ class MainActivity : Activity() {
         // keeps it off the per-tick path).
         setLyricGlow(npLyricLine, 10)
         if (::npLyricsCardCur.isInitialized) {
-            npLyricsCardCur.text = cur
+            swapLyricText(npLyricsCardCur, cur, { npLyricFadeCard }, { npLyricFadeCard = it })
             npLyricsCardNext.text = lines.getOrNull(idx + 1)?.text?.ifEmpty { "♪" } ?: ""
             setLyricGlow(npLyricsCardCur, 10)
         }
@@ -8037,9 +8467,38 @@ class MainActivity : Activity() {
             else -> "Sleep Timer"
         }
         items += sleepText to { showSleepMenu() }
+        // Lyric sync offset (0.6.14): its home since the lyrics
+        // page declutter — behind this menu, invisible by
+        // default, still one tap from the player when a track's
+        // lines run early or late.
+        items += "Lyric Sync · ${fmtOffset(LyricOffsets.effectiveMs(this, t))}" to {
+            showLyricOffsetMenu(t)
+        }
         items += "Start Radio" to { startRadioFor(t) }
         val header = if (t.artist.isNotEmpty()) "${t.title}\n${t.artist}" else t.title
         showMenu(header, items)
+    }
+
+    /** The lyric sync offset submenu (0.6.14): ±0.1s fine
+     *  shifts, ±0.5s coarse, and a reset — the exact controls
+     *  that used to sit on the lyrics page itself. */
+    private fun showLyricOffsetMenu(t: Track) {
+        lyricsTrack = t
+        val title = "Lyric sync · ${fmtOffset(LyricOffsets.effectiveMs(this, t))}"
+        val items = mutableListOf<Pair<String, () -> Unit>>()
+        items += "Shift earlier · −0.5s" to { adjustLyricOffset(-500L) }
+        items += "Shift earlier · −0.1s" to { adjustLyricOffset(-100L) }
+        items += "Shift later · +0.1s" to { adjustLyricOffset(100L) }
+        items += "Shift later · +0.5s" to { adjustLyricOffset(500L) }
+        items += "Reset offset" to {
+            LyricOffsets.clearTrack(this, t)
+            lyricsActiveLine = -2
+            lyricsSweepChars = -1
+            updateLyricsHighlight()
+            npLyricIdx = -2
+            updateNpLyricLine()
+        }
+        showMenu(title, items)
     }
 
     private fun showSleepMenu() {
@@ -9402,63 +9861,20 @@ class MainActivity : Activity() {
         }
         head.addView(done)
         inner.addView(head)
-        lyricsStatus = label("", 13f, white50)
+        // Status line (0.6.14): state messages ONLY (unavailable,
+        // instrumental, not synchronized). The old permanent
+        // "Synced · <source> · tap a line to jump" label and the
+        // entire Sync offset row are GONE from this page — Arz:
+        // they ruined the aesthetic. Sync offset lives in the
+        // Now Playing ⋯ menu now, invisible by default.
+        lyricsStatus = label("", 13f, white50).apply { visibility = View.GONE }
         val stLp = LinearLayout.LayoutParams(-1, -2)
         stLp.topMargin = dp(4)
         inner.addView(lyricsStatus, stLp)
-        // Loading spinner + sync offset steppers (v6): the spinner
-        // replaces the old text-only "Loading lyrics…" state; the
-        // steppers shift THIS track's line timing by ±0.1s (the
-        // LyricOffsets sign convention applies it to the highlight
-        // and to tap-to-seek alike).
-        val ctrlRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        val cLp = LinearLayout.LayoutParams(-1, -2)
-        cLp.topMargin = dp(8)
-        ctrlRow.layoutParams = cLp
-        lyricsSpinner = ProgressBar(this).apply {
-            isIndeterminate = true
-            visibility = View.GONE
-            indeterminateTintList = ColorStateList.valueOf(accent)
-        }
-        ctrlRow.addView(lyricsSpinner, LinearLayout.LayoutParams(dp(22), dp(22)))
-        val offBox = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        offBox.addView(label("Sync", 12.5f, white55, semiboldTf).apply {
-            setPadding(dp(10), 0, dp(4), 0)
-        })
-        fun offBtn(txt: String, delta: Long): TextView =
-            label(txt, 20f, Color.WHITE, boldTf).apply {
-                gravity = Gravity.CENTER
-                isClickable = true
-                setPadding(dp(10), dp(4), dp(10), dp(4))
-                setOnClickListener { adjustLyricOffset(delta) }
-            }
-        offBox.addView(offBtn("−", -100L))
-        lyricsOffsetLabel = label("+0.0s", 14f, Color.WHITE, semiboldTf).apply {
-            gravity = Gravity.CENTER
-            minWidth = dp(54)
-        }
-        offBox.addView(lyricsOffsetLabel)
-        offBox.addView(offBtn("+", 100L))
-        offBox.addView(label("Reset", 13f, accent, mediumTf).apply {
-            isClickable = true
-            setPadding(dp(8), dp(4), dp(4), dp(4))
-            setOnClickListener {
-                lyricsTrack?.let { LyricOffsets.clearTrack(this@MainActivity, it) }
-                refreshOffsetLabel()
-                lyricsActiveLine = -2
-                updateLyricsHighlight()
-                npLyricIdx = -2
-                updateNpLyricLine()
-            }
-        })
-        ctrlRow.addView(offBox, LinearLayout.LayoutParams(0, -2, 1f))
-        inner.addView(ctrlRow)
+        val scrollWrap = FrameLayout(this)
+        val wLp = LinearLayout.LayoutParams(-1, 0, 1f)
+        wLp.topMargin = dp(10)
+        scrollWrap.layoutParams = wLp
         lyricsScroll = ScrollView(this).apply {
             // 0.6.9: grabbing the lyrics kills any running
             // auto-scroll animation instantly — the reader wins.
@@ -9475,31 +9891,35 @@ class MainActivity : Activity() {
             setPadding(0, dp(10), 0, dp(40))
         }
         lyricsScroll.addView(lyricsList)
-        val sLp = LinearLayout.LayoutParams(-1, 0, 1f)
-        sLp.topMargin = dp(10)
-        inner.addView(lyricsScroll, sLp)
+        scrollWrap.addView(lyricsScroll, FrameLayout.LayoutParams(-1, -1))
+        // Branded loading state (0.6.14): the living logo,
+        // centered over the (empty) list while a fetch runs —
+        // no stock spinner anywhere on this page.
+        lyricsLoader = EqLogoView(this).apply {
+            motionAllowed = { !activityStopped && !reduceMotion() }
+            playingProvider = { isPlayingSafe() }
+            contentDescription = "Loading lyrics"
+            visibility = View.GONE
+        }
+        val loadLp = FrameLayout.LayoutParams(dp(52), dp(52), Gravity.CENTER)
+        scrollWrap.addView(lyricsLoader, loadLp)
+        inner.addView(scrollWrap)
         lyricsOverlay.addView(inner, FrameLayout.LayoutParams(-1, -1))
         root.addView(lyricsOverlay, FrameLayout.LayoutParams(-1, -1))
     }
 
-    /** Refreshes the lyrics overlay's offset readout for the
-     *  overlay's current track (its own offset, else the global). */
-    private fun refreshOffsetLabel() {
-        if (!::lyricsOffsetLabel.isInitialized) return
-        val t = lyricsTrack ?: return
-        lyricsOffsetLabel.text = fmtOffset(LyricOffsets.effectiveMs(this, t))
-    }
-
-    /** One stepper tap in the lyrics view: shift the track's own
-     *  offset by [deltaMs] (seeded from the effective value so the
-     *  first tap starts from what is actually applied), persist
-     *  immediately, and re-derive both highlights. */
+    /** One offset shift from the Now Playing ⋯ menu (0.6.14;
+     *  the steppers used to live on the lyrics page): shift the
+     *  track's own offset by [deltaMs] (seeded from the
+     *  effective value so the first shift starts from what is
+     *  actually applied), persist immediately, and re-derive
+     *  both highlights. */
     private fun adjustLyricOffset(deltaMs: Long) {
         val t = lyricsTrack ?: return
         val now = (LyricOffsets.effectiveMs(this, t) + deltaMs).coerceIn(-5000L, 5000L)
         LyricOffsets.setTrackMs(this, t, now)
-        refreshOffsetLabel()
         lyricsActiveLine = -2
+        lyricsSweepChars = -1
         updateLyricsHighlight()
         npLyricIdx = -2
         updateNpLyricLine()
@@ -9541,17 +9961,16 @@ class MainActivity : Activity() {
         }
         ensureOverlays()
         lyricsTrack = t
-        // Ambient backdrop (0.6.13): the same full-bleed wash
-        // Now Playing wears (it used to be the flat solid color);
-        // the neutral background when the toggle is off or no
-        // color was extracted.
-        if (ambientOn() && ambientColor != null) {
-            lyricsOverlay.background = ambientWash(ambientColor!!)
+        // Artwork-color backdrop (0.6.14): the opaque two-color
+        // gradient built from this track's palette (see
+        // lyricsBackdrop); the neutral background when the
+        // ambient toggle is off.
+        if (ambientOn()) {
+            lyricsOverlay.background = lyricsBackdrop()
         } else {
             lyricsOverlay.setBackgroundColor(bgColor)
         }
         lyricsOverlay.visibility = View.VISIBLE
-        refreshOffsetLabel()
         // 0.6.9: spring entrance (fade + rise from 24dp) instead
         // of the alpha-only 180ms fade.
         if (springsOff()) {
@@ -9579,9 +9998,11 @@ class MainActivity : Activity() {
         lyricsSyncedLines = emptyList()
         lyricsLineViews = emptyList()
         lyricsActiveLine = -2
+        lyricsSweepChars = -1
         lyricsList.removeAllViews()
-        lyricsStatus.text = t.artist
-        if (::lyricsSpinner.isInitialized) lyricsSpinner.visibility = View.VISIBLE
+        lyricsStatus.text = ""
+        lyricsStatus.visibility = View.GONE
+        if (::lyricsLoader.isInitialized) lyricsLoader.visibility = View.VISIBLE
         lyricsLoading = true
         // Fine-cadence highlight driver, alive only while the
         // overlay is visible (see lyricsTicker).
@@ -9603,14 +10024,16 @@ class MainActivity : Activity() {
     }
 
     private fun renderLyrics(data: LyricsData?) {
-        if (::lyricsSpinner.isInitialized) lyricsSpinner.visibility = View.GONE
+        if (::lyricsLoader.isInitialized) lyricsLoader.visibility = View.GONE
         lyricsList.removeAllViews()
         lyricsSyncedLines = emptyList()
         lyricsLineViews = emptyList()
         lyricsActiveLine = -2
+        lyricsSweepChars = -1
         when {
             data == null -> {
                 lyricsStatus.text = "Lyrics unavailable for this track."
+                lyricsStatus.visibility = View.VISIBLE
                 lyricsList.addView(label("No lyrics provider had this song.", 15f, white50))
                 // 0.6.13: the per-provider fetch report is
                 // diagnostics — it goes to the log, never the
@@ -9620,21 +10043,32 @@ class MainActivity : Activity() {
                 }
             }
             data.instrumental -> {
-                lyricsStatus.text = "Instrumental · via ${data.source}"
+                lyricsStatus.text = "Instrumental"
+                lyricsStatus.visibility = View.VISIBLE
                 lyricsList.addView(label("This track is instrumental.", 15f, white50))
             }
             data.synced != null -> {
-                lyricsStatus.text = "Synced · ${data.source} · tap a line to jump"
+                // No status text at all for synced lyrics
+                // (0.6.14): the page is the lines, nothing else.
+                lyricsStatus.text = ""
+                lyricsStatus.visibility = View.GONE
                 val lines = data.synced
                 lyricsSyncedLines = lines
-                // Inspo screen 3: LARGE bold lines over the ambient
-                // hue; upcoming lines sit dim, the current line
-                // burns full-bright, sung lines dim further (the
-                // three states are applied in updateLyricsHighlight).
+                // LARGE expressive lines are the hero of this
+                // page (Arz's lyrics-edit reference, 0.6.14):
+                // upcoming lines sit dim, the current line burns
+                // full-bright with the sweep + glow, sung lines
+                // dim further (the states are applied in
+                // updateLyricsHighlight). The right padding is
+                // functional, not cosmetic: the active line's
+                // activation scale grows it rightward from its
+                // left pivot, and without this slack the grown
+                // text ran off the screen edge mid-word (Arz's
+                // 0.6.13 screenshot).
                 val views = ArrayList<TextView>(lines.size)
                 lines.forEach { line ->
-                    val tv = label(line.text.ifEmpty { "♪" }, 26f, Color.argb(120, 255, 255, 255), semiboldTf).apply {
-                        setPadding(0, dp(10), 0, dp(10))
+                    val tv = label(line.text.ifEmpty { "♪" }, 28f, Color.argb(120, 255, 255, 255), semiboldTf).apply {
+                        setPadding(0, dp(10), dp(18), dp(10))
                         isClickable = true
                         setOnClickListener {
                             // Tap-to-seek lands where the highlight
@@ -9656,6 +10090,7 @@ class MainActivity : Activity() {
                             lyricsLineViews.getOrNull(lyricsActiveLine)?.let { setLyricGlow(it, 0) }
                             player?.seekTo((line.timeMs - seekOffset).coerceAtLeast(0L))
                             lyricsActiveLine = -2
+                            lyricsSweepChars = -1
                             updateLyricsHighlight()
                         }
                     }
@@ -9666,7 +10101,8 @@ class MainActivity : Activity() {
                 updateLyricsHighlight()
             }
             else -> {
-                lyricsStatus.text = "Not synchronized · plain lyrics via ${data.source}"
+                lyricsStatus.text = "Not synchronized"
+                lyricsStatus.visibility = View.VISIBLE
                 data.plainLines.forEach { line ->
                     lyricsList.addView(label(line.ifEmpty { " " }, 16.5f, white75).apply {
                         setPadding(0, dp(3), 0, dp(3))
@@ -9688,55 +10124,107 @@ class MainActivity : Activity() {
         // uses, so the two can never disagree.
         val offset = lyricsTrack?.let { LyricOffsets.effectiveMs(this, it) } ?: 0L
         val idx = lyricsSyncedLines.indexOfLast { it.timeMs - offset <= pos }
-        if (idx == lyricsActiveLine) return
-        val prev = lyricsActiveLine
-        lyricsLineViews.getOrNull(prev)?.let {
-            it.typeface = semiboldTf
-            // The glow belongs to the current line ONLY: it leaves
-            // with the highlight.
-            setLyricGlow(it, 0)
-            // 0.6.9: the activation scale leaves with it too.
-            Springs.scale(it, 1f, 0.75f, 700f, instant = springsOff())
-        }
-        lyricsActiveLine = idx
-        if (idx < 0) {
-            // Seeked before the first line (0.6.13 audit fix):
-            // NO line is live, so every line returns to the
-            // initial upcoming base color — the ramp below would
-            // otherwise style distances from a phantom line and
-            // the previously active line kept its white read.
-            lyricsLineViews.forEach {
-                it.setTextColor(Color.argb(120, 255, 255, 255))
+        if (idx != lyricsActiveLine) {
+            val prev = lyricsActiveLine
+            lyricsLineViews.getOrNull(prev)?.let {
+                it.typeface = semiboldTf
+                // The glow belongs to the current line ONLY: it leaves
+                // with the highlight.
+                setLyricGlow(it, 0)
+                // 0.6.9: the activation scale leaves with it too.
+                Springs.scale(it, 1f, 0.75f, 700f, instant = springsOff())
+                // 0.6.14: the sweep spans leave with it (the plain
+                // string is re-set, dropping every span), and the
+                // sung line DRIFTS UP a few dp as it settles back
+                // into the ramp — passed lines recede, they don't
+                // just switch off.
+                it.text = it.text.toString()
+                Springs.translationY(it, -dp(4).toFloat(), 0.8f, 600f, instant = springsOff())
             }
-            return
+            lyricsActiveLine = idx
+            lyricsSweepChars = -1
+            if (idx < 0) {
+                // Seeked before the first line (0.6.13 audit fix):
+                // NO line is live, so every line returns to the
+                // initial upcoming base color — the ramp below would
+                // otherwise style distances from a phantom line and
+                // the previously active line kept its white read.
+                lyricsLineViews.forEach {
+                    it.setTextColor(Color.argb(120, 255, 255, 255))
+                }
+                return
+            }
+            // 0.6.13 DISTANCE FADE (Apple Music inspo): non-active
+            // lines are no longer two flat dim levels — brightness
+            // now falls off with DISTANCE from the live line, near
+            // lines clearly readable, far lines dissolving into
+            // the gradient (blur itself is not available per-
+            // TextView without bitmap work the G95 would feel;
+            // alpha carries the same read). Sung lines sit lower
+            // than upcoming ones at the same distance. Applied on
+            // line changes only, over a ±8 window (full list on
+            // first derivation and after seeks, when prev == -2).
+            applyLyricRamp(full = prev == -2)
+            val view = lyricsLineViews.getOrNull(idx) ?: return
+            // The active line's BASE is the not-yet-sung read
+            // (distance-1 brightness); the karaoke sweep below
+            // paints the sung part pure white on top of it.
+            view.setTextColor(Color.argb(168, 255, 255, 255))
+            view.typeface = boldTf
+            // Luminous halo around the live line (inspo board): soft
+            // shadowLayer, no bitmap work, set once per line change.
+            setLyricGlow(view, 18)
+            // 0.6.9: the live line grows a touch as it activates
+            // (Apple Music's synced-lyrics read), anchored at the
+            // left edge where the text starts; transform only, so
+            // the list layout never moves. 0.6.14: 1.03, not 1.04,
+            // and the line carries right padding now — the grown
+            // text stays on screen (see renderLyrics).
+            view.pivotX = 0f
+            Springs.scale(view, 1.03f, 0.75f, 700f, instant = springsOff())
+            // 0.6.14: the incoming line RISES IN — it starts a
+            // few dp low and springs home as it activates, the
+            // lyrics-edit entrance. Transform only, like the
+            // scale; with motion off it simply lands at 0.
+            if (springsOff()) {
+                view.translationY = 0f
+            } else {
+                view.translationY = dp(10).toFloat()
+                Springs.translationY(view, 0f, 0.8f, 620f, instant = false)
+            }
+            // Keep the current line centered-ish (inspo): a third of
+            // the viewport down, not pinned to a fixed offset.
+            val y = (view.top - lyricsScroll.height / 3).coerceAtLeast(0)
+            scrollLyricsTo(y)
         }
-        // 0.6.13 DISTANCE FADE (Apple Music inspo): non-active
-        // lines are no longer two flat dim levels — brightness
-        // now falls off with DISTANCE from the live line, near
-        // lines clearly readable, far lines dissolving into the
-        // wash (blur itself is not available per-TextView
-        // without bitmap work the G95 would feel; alpha carries
-        // the same read). Sung lines sit lower than upcoming
-        // ones at the same distance. Applied on line changes
-        // only, over a ±8 window (full list on first derivation
-        // and after seeks, when prev == -2).
-        applyLyricRamp(full = prev == -2)
-        val view = lyricsLineViews.getOrNull(idx) ?: return
-        view.setTextColor(Color.WHITE)
-        view.typeface = boldTf
-        // Luminous halo around the live line (inspo board): soft
-        // shadowLayer, no bitmap work, set once per line change.
-        setLyricGlow(view, 18)
-        // 0.6.9: the live line grows a touch as it activates
-        // (Apple Music's synced-lyrics read), anchored at the
-        // left edge where the text starts; transform only, so the
-        // list layout never moves.
-        view.pivotX = 0f
-        Springs.scale(view, 1.04f, 0.75f, 700f, instant = springsOff())
-        // Keep the current line centered-ish (inspo): a third of
-        // the viewport down, not pinned to a fixed offset.
-        val y = (view.top - lyricsScroll.height / 3).coerceAtLeast(0)
-        scrollLyricsTo(y)
+        // Karaoke sweep (0.6.14, Arz's lyrics-edit reference):
+        // the sung portion of the ACTIVE line fills bright,
+        // character by character, in step with the player's
+        // REAL position inside the line's window (this line's
+        // start to the next line's start — timing is never
+        // fabricated, both ends are LRC timestamps). Runs on
+        // every ticker pass, but only rewrites the spans when
+        // the filled character count actually moved.
+        if (idx < 0) return
+        val activeView = lyricsLineViews.getOrNull(idx) ?: return
+        val lineStart = lyricsSyncedLines[idx].timeMs - offset
+        val lineEnd = lyricsSyncedLines.getOrNull(idx + 1)?.let { it.timeMs - offset }
+            ?: (player?.durationMs?.takeIf { it > lineStart } ?: (lineStart + 5000L))
+        val spanMs = (lineEnd - lineStart).coerceAtLeast(1L)
+        val frac = ((pos - lineStart).toFloat() / spanMs.toFloat()).coerceIn(0f, 1f)
+        val plain = activeView.text.toString()
+        val swept = (frac * plain.length).toInt().coerceIn(0, plain.length)
+        if (swept == lyricsSweepChars || plain.isEmpty()) return
+        lyricsSweepChars = swept
+        val spanned = android.text.SpannableString(plain)
+        if (swept > 0) {
+            spanned.setSpan(
+                android.text.style.ForegroundColorSpan(Color.WHITE),
+                0, swept,
+                android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+        }
+        activeView.text = spanned
     }
 
     /** Brightness (white alpha) of a non-active lyrics line by

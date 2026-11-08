@@ -436,6 +436,91 @@ object LocalTracks {
  * makes lines trigger EARLIER (use it when lyrics lag behind the
  * singing); negative delays them.
  */
+/**
+ * Per-track listen progress (0.6.14): the furthest fraction of a
+ * track the user actually reached, recorded from the playback
+ * ticker (throttled) and at track changes — real local data
+ * only, never estimated. Home's "Jump back in" rings read it;
+ * a track with no record simply has no ring. Finished tracks
+ * (≥97%) are dropped: there is nothing to resume. Capped like
+ * the history store, persisted off the main thread.
+ */
+object ListenProgress {
+    private const val KEY = "listen_progress_v1"
+    private const val MAX_ENTRIES = 120
+
+    @Volatile
+    private var cached: LinkedHashMap<String, Float>? = null
+
+    private val persistExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+
+    private fun prefs(ctx: Context) =
+        ctx.getSharedPreferences(LIB_PREFS, Context.MODE_PRIVATE)
+
+    private fun load(ctx: Context): LinkedHashMap<String, Float> {
+        cached?.let { return it }
+        val map = LinkedHashMap<String, Float>()
+        try {
+            val raw = prefs(ctx).getString(KEY, null)
+            if (raw != null) {
+                val arr = JSONArray(raw)
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    map[o.getString("k")] = o.getDouble("f").toFloat()
+                }
+            }
+        } catch (_: Exception) {
+            map.clear()
+        }
+        cached = map
+        return map
+    }
+
+    /** Records the position reached in [track]. Sub-4-second
+     *  grazes and unknown durations are not progress. */
+    fun record(ctx: Context, track: Track, posMs: Long, durMs: Long) {
+        if (durMs <= 0L || posMs < 4000L) return
+        val frac = (posMs.toFloat() / durMs.toFloat()).coerceIn(0f, 1f)
+        val key = trackKey(track)
+        val map = load(ctx)
+        val done = frac >= 0.97f
+        val changed = if (done) {
+            map.remove(key) != null
+        } else {
+            val prev = map[key] ?: 0f
+            if (frac > prev) {
+                map[key] = frac
+                true
+            } else {
+                false
+            }
+        }
+        if (!changed) return
+        while (map.size > MAX_ENTRIES) {
+            val eldest = map.keys.firstOrNull() ?: break
+            map.remove(eldest)
+        }
+        val snapshot = LinkedHashMap(map)
+        val appCtx = ctx.applicationContext
+        persistExecutor.execute {
+            try {
+                val arr = JSONArray()
+                snapshot.forEach { (k, f) ->
+                    arr.put(JSONObject().put("k", k).put("f", f.toDouble()))
+                }
+                prefs(appCtx).edit().putString(KEY, arr.toString()).apply()
+            } catch (_: Exception) {
+                // Progress is decorative; a failed write must
+                // never disturb playback.
+            }
+        }
+    }
+
+    /** Fraction of [track] previously reached, 0 when unknown. */
+    fun fraction(ctx: Context, track: Track): Float =
+        load(ctx)[trackKey(track)] ?: 0f
+}
+
 object LyricOffsets {
     private const val KEY_PREFIX = "lyric_offset:"
     private const val KEY_GLOBAL = "lyric_offset_global"
