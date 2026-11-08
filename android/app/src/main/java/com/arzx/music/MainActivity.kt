@@ -31,6 +31,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -5705,9 +5706,18 @@ class MainActivity : Activity() {
         if (p.isPlaying && nowMs - lastPosPushMs > 8000L) {
             lastPosPushMs = nowMs
             val t = current
-            if (t != null && PlayerRegistry.isOwner(instanceId) && !bridgeMuted) {
+            val prev = PlaybackBridge.state
+            if (t != null && prev != null && prev.trackKey == Downloads.key(t) &&
+                PlayerRegistry.isOwner(instanceId) && !bridgeMuted
+            ) {
+                // Same snapshot, fresh position — every other
+                // field keeps the value the change-guarded push
+                // already established for this track.
                 PlaybackBridge.push(
-                    this, t, PlaybackBridge.STATE_PLAYING, p.positionMs, p.durationMs
+                    prev.copy(
+                        positionMs = p.positionMs.takeIf { it >= 0 } ?: prev.positionMs,
+                        durationMs = p.durationMs.takeIf { it > 0 } ?: prev.durationMs
+                    )
                 )
                 ArzxshWidget.syncFromState(this, PlaybackBridge.state)
             }
