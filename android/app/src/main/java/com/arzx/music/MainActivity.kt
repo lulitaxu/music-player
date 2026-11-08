@@ -1137,8 +1137,12 @@ class MainActivity : Activity() {
         // GlassBlur.kt for the trade-off).
         shellScroll = scroll
         scroll.setOnScrollChangeListener { _, _, _, _, _ ->
+            // 0.6.10: 500ms settle, not 250 — the recapture is
+            // decorative, a tap or the next scroll must never
+            // queue behind it, and a longer settle coalesces
+            // fling-stop-fling bursts into one capture.
             handler.removeCallbacks(chromeBlurRefresh)
-            handler.postDelayed(chromeBlurRefresh, 250)
+            handler.postDelayed(chromeBlurRefresh, 500)
         }
 
         bottomBar = LinearLayout(this).apply {
@@ -1294,13 +1298,45 @@ class MainActivity : Activity() {
                 gravity = Gravity.CENTER
                 contentDescription = name
                 setPadding(0, dp(7), 0, dp(5))
+                // Instant visible feedback the moment a finger
+                // lands (0.6.10): before this the cell gave no
+                // sign a tap had registered at all, so a swallowed
+                // or slow tap read as "the app ignored me".
+                rippleRect()
                 setOnClickListener {
+                    // Already sitting on this tab's root: a repeat
+                    // tap is a no-op instead of a full rebuild of
+                    // the screen the user is looking at (0.6.10).
+                    // Pushed screens have displayedRootTab == null
+                    // and Settings is never a retained root, so
+                    // both still route through action.run() here.
+                    if (name == activeTab && displayedRootTab == name) {
+                        return@setOnClickListener
+                    }
                     setActiveTab(name)
                     action.run()
                 }
             }
-            val iv = icon(iconRes, white55)
-            val tv = label(name, 10f, white55, mediumTf).apply { gravity = Gravity.CENTER }
+            // Press motion (0.6.10): the cell itself answers the
+            // finger — down springs it to 0.92, release springs
+            // it back — through the shared MotionPress helper,
+            // whose listener never consumes the event, so the
+            // click above still fires exactly once.
+            MotionPress.attach(box, primary = false) { springsOff() }
+            // Defense in depth at the reported surface (0.6.10):
+            // neither child may eat the cell's touches — the
+            // glyph and the label are display only, the BOX is
+            // the tab button. (icon() no longer marks glyphs
+            // clickable either; see its comment.)
+            val iv = icon(iconRes, white55).apply {
+                isClickable = false
+                isFocusable = false
+            }
+            val tv = label(name, 10f, white55, mediumTf).apply {
+                gravity = Gravity.CENTER
+                isClickable = false
+                isFocusable = false
+            }
             box.addView(iv, LinearLayout.LayoutParams(dp(23), dp(23)))
             box.addView(tv)
             nav.addView(box, LinearLayout.LayoutParams(0, dp(52), 1f))
@@ -1355,6 +1391,7 @@ class MainActivity : Activity() {
     }
 
     private fun setActiveTab(name: String) {
+        val changed = activeTab != name
         activeTab = name
         tabViews.forEach { (tabName, views) ->
             val (_, iv, tv) = views
@@ -1363,9 +1400,27 @@ class MainActivity : Activity() {
             if (tabName == name) {
                 iv.setColorFilter(Color.WHITE)
                 tv.setTextColor(Color.WHITE)
+                // Active-tab pop (0.6.10): the newly selected
+                // glyph springs from 0.78 to full size on the
+                // fast secondary press spring, so the tap gets a
+                // visible answer inside the tab bar itself, the
+                // same frame the color flips. Only on an actual
+                // change — re-asserting the current tab (shell
+                // rebuilds, the Settings shortcut) stays still.
+                // Motion off: scale pinned at 1, no spring runs.
+                if (changed && !springsOff()) {
+                    iv.scaleX = 0.78f
+                    iv.scaleY = 0.78f
+                    Springs.scale(iv, 1f, 0.70f, 900f, instant = false)
+                } else {
+                    iv.scaleX = 1f
+                    iv.scaleY = 1f
+                }
             } else {
                 iv.setColorFilter(white55)
                 tv.setTextColor(white55)
+                iv.scaleX = 1f
+                iv.scaleY = 1f
             }
         }
     }
@@ -1433,24 +1488,53 @@ class MainActivity : Activity() {
     /** The shell's scroll view: the snapshot's source. */
     private var shellScroll: ScrollView? = null
     private val chromeBlurRefresh = Runnable { refreshChromeBlur() }
+    /** Monotonic capture token (0.6.10): a background blur result
+     *  is applied only while it is still the newest capture;
+     *  superseded results are recycled, never swapped in. */
+    private var chromeBlurToken = 0
 
     /** Recaptures the chrome blur snapshot from the shell content
-     *  and repaints the chrome. Cheap by construction (one 96px
-     *  draw + blur); called on shell build, screen change, scroll
-     *  settle and track change — never per frame. */
+     *  and repaints the chrome. Called on shell build, screen
+     *  change, scroll settle and track change — never per frame.
+     *  0.6.10 split: the UI thread does ONLY the 96px draw; the
+     *  box-blur pixel loops run on the fetch pool and the finished
+     *  bitmap hops back for the swap. In 0.6.9 the whole capture
+     *  ran synchronously on the UI thread at exactly the moments
+     *  the user was tapping and scrolling, which was a standing
+     *  source of "the app feels unresponsive" jank on the G95. */
     private fun refreshChromeBlur() {
         if (!glassOn()) return
         val src = shellScroll ?: return
         if (src.width <= 0 || src.height <= 0) return
-        val bmp = try {
-            GlassCapture.capture(src)
+        val raw = try {
+            GlassCapture.captureRaw(src)
         } catch (_: Throwable) {
             null
         } ?: return
-        val old = chromeBlurBmp
-        chromeBlurBmp = bmp
-        if (old != null && old !== bmp) old.recycle()
-        chromeBlurViews.forEach { it.invalidate() }
+        val token = ++chromeBlurToken
+        try {
+            fetchPool.execute {
+                val bmp = try {
+                    GlassCapture.blur(raw)
+                } catch (_: Throwable) {
+                    raw.recycle()
+                    null
+                } ?: return@execute
+                runOnUiThread {
+                    if (token != chromeBlurToken) {
+                        bmp.recycle()
+                        return@runOnUiThread
+                    }
+                    val old = chromeBlurBmp
+                    chromeBlurBmp = bmp
+                    if (old != null && old !== bmp) old.recycle()
+                    chromeBlurViews.forEach { it.invalidate() }
+                }
+            }
+        } catch (_: Throwable) {
+            // Pool shut down (activity dying): drop the raw frame.
+            raw.recycle()
+        }
     }
 
     /** [base] glass fill with the current artwork's dominant
@@ -1744,8 +1828,19 @@ class MainActivity : Activity() {
         setImageResource(res)
         setColorFilter(tint)
         scaleType = ImageView.ScaleType.CENTER_INSIDE
-        isClickable = true
-        isFocusable = true
+        // 0.6.10 responsiveness fix: a decorative icon must NEVER
+        // consume touches. This helper used to mark every icon
+        // clickable + focusable, so an icon with no listener of
+        // its own (the tab-bar glyphs, settings-row leading icons,
+        // the downloaded badge in track rows) silently SWALLOWED
+        // taps aimed at its parent — the field report "tap a tab
+        // 3-4 times before it switches" was taps landing on the
+        // 23dp glyph in the middle of the tab cell dying here.
+        // Icons that ARE buttons get clickable back automatically:
+        // View.setOnClickListener sets clickable=true when a
+        // listener is attached, which every button call site does.
+        isClickable = false
+        isFocusable = false
         // No Material ripple on player controls / chrome (spec §13.4):
         // feedback there is glyph swap + scale, handled at the call site.
     }
@@ -8969,6 +9064,23 @@ class MainActivity : Activity() {
         val y = entry.scrollY
         if (sv != null) sv.post { sv.scrollTo(0, y) }
         displayedRootTab = tab
+        // Tab-switch motion (0.6.10): a RETAINED root used to swap
+        // in with no transition at all — the 0.6.9 tab fade/slide
+        // lived only in beginScreen, which warm switches never
+        // reach, so most real tab taps changed screens instantly
+        // and abruptly (part of why switches felt unresponsive:
+        // no motion answered the tap). Same spring pair as
+        // beginScreen, transform + alpha only, and motion-off
+        // pins the values instead of freezing mid-flight.
+        if (springsOff()) {
+            content.alpha = 1f
+            content.translationY = 0f
+        } else {
+            content.alpha = 0f
+            content.translationY = dp(6).toFloat()
+            Springs.alpha(content, 1f, 0.9f, 800f, instant = false)
+            Springs.translationY(content, 0f, 0.88f, 750f, instant = false)
+        }
         return true
     }
 
@@ -9066,7 +9178,11 @@ class MainActivity : Activity() {
         }
         // 0.6.9: a new screen is new content behind the chrome —
         // recapture its blur once this layout settles.
-        content.post(chromeBlurRefresh)
+        // 0.6.10: delayed + coalesced (was an immediate post):
+        // the capture must land AFTER the switch's first frames
+        // and any tap that follows them, never in their way.
+        handler.removeCallbacks(chromeBlurRefresh)
+        handler.postDelayed(chromeBlurRefresh, 500)
     }
 
     // ------------------------------------------------- local profile (0.6.4, WS-2)
@@ -9281,6 +9397,10 @@ class MainActivity : Activity() {
         lyricsLineViews.forEach { Springs.cancel(it) }
         lyricsScrollAnim?.cancel()
         handler.removeCallbacks(chromeBlurRefresh)
+        // 0.6.10: invalidate any blur still running on the pool —
+        // its result must be recycled by the token check, never
+        // applied to (or leaked into) a dead activity.
+        chromeBlurToken++
         chromeBlurBmp?.recycle()
         chromeBlurBmp = null
         visualizerAnimator?.cancel()

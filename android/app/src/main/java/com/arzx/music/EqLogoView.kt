@@ -49,6 +49,11 @@ class EqLogoView(context: Context) : View(context) {
 
     private var animator: ValueAnimator? = null
     private val rect = RectF()
+    /** Last invalidate stamp (0.6.10): the tick throttles its
+     *  redraws to ~30fps — the bars' motion period is measured
+     *  in seconds, so 60fps redraws bought nothing and kept the
+     *  frame scheduler busy on the Home tab full-time. */
+    private var lastInvalidateMs = 0L
 
     /** One bar segment: center x, nominal top/bottom in the
      *  240-unit viewport, its column (timing group), and
@@ -88,7 +93,13 @@ class EqLogoView(context: Context) : View(context) {
             addUpdateListener {
                 // Backgrounded / reduced-motion: the tick costs
                 // one lambda call and draws nothing.
-                if (motionAllowed()) invalidate()
+                if (motionAllowed()) {
+                    val now = SystemClock.uptimeMillis()
+                    if (now - lastInvalidateMs >= 33) {
+                        lastInvalidateMs = now
+                        invalidate()
+                    }
+                }
             }
             start()
         }

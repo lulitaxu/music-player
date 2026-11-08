@@ -134,18 +134,45 @@ object GlassCapture {
      *  Returns null when the source has not been laid out yet;
      *  the caller retries at the next discrete moment. */
     fun capture(source: View): Bitmap? {
+        val raw = captureRaw(source) ?: return null
+        return blur(raw)
+    }
+
+    /** UI-thread half of [capture] (0.6.10): ONLY the draw.
+     *  Drawing a view hierarchy must happen on its own thread,
+     *  but it is the short half of the work — the pixel loops in
+     *  [blur] are the long half, and those used to run on the UI
+     *  thread in the same call, right in the middle of tab
+     *  switches and scroll settles, eating the frames (and the
+     *  taps) that landed during them. Split so the caller can
+     *  blur on a background pool and swap the result in later. */
+    fun captureRaw(source: View): Bitmap? {
         if (source.width <= 0 || source.height <= 0) return null
         val w = 96
         val scale = w.toFloat() / source.width
         val h = max(1, (source.height * scale).toInt())
-        var bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         canvas.scale(scale, scale)
         source.draw(canvas)
+        return bmp
+    }
+
+    /** Background-safe half of [capture] (0.6.10): the three
+     *  box-blur passes over [raw]. Takes ownership of [raw]
+     *  (recycled as an intermediate) and returns the blurred
+     *  bitmap. Pure pixel work on an owned bitmap — no views,
+     *  no shared state — so any thread may run it. */
+    fun blur(raw: Bitmap): Bitmap {
         // The hard downscale does most of the softening (same
         // recipe as the Now Playing backdrop); three horizontal
         // box passes finish it.
-        repeat(3) { bmp = boxBlur(bmp, 5) }
+        var bmp = raw
+        repeat(3) {
+            val next = boxBlur(bmp, 5)
+            if (next !== bmp) bmp.recycle()
+            bmp = next
+        }
         return bmp
     }
 
