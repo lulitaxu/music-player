@@ -1184,6 +1184,11 @@ class MainActivity : Activity() {
             setOnClickListener { playNext() }
         }
         mini.addView(miniNextButton, LinearLayout.LayoutParams(dp(38), dp(38)))
+        // 0.6.9: mini transport joins the shared press system
+        // (play = primary spring). The container's own swipe
+        // listener is untouched — press attaches to the buttons.
+        MotionPress.attach(miniPlayButton, primary = true) { springsOff() }
+        MotionPress.attach(miniNextButton, primary = false) { springsOff() }
         visualizerView = visualizer(permanent = true).apply {
             // State comes from updateVisualizerState() (setting AND
             // actual playback); starting hidden avoids showing "playing"
@@ -1351,6 +1356,10 @@ class MainActivity : Activity() {
             }
             isClickable = true
             setOnClickListener { onClick() }
+            // 0.6.9: page primary buttons join the shared press
+            // system at the helper, so every pill in the app
+            // answers a tap the same way (filled = primary spring).
+            MotionPress.attach(this, primary = filled) { springsOff() }
         }
     }
 
@@ -4532,6 +4541,16 @@ class MainActivity : Activity() {
         controlZone.addView(bottomRow)
         inner.addView(controlZone)
 
+        // 0.6.9: the shared press treatment on the whole transport
+        // block — play/pause on the primary (stiffer) spring, every
+        // other control on the secondary one. No call site grows
+        // its own press animation after this.
+        MotionPress.attach(npPlayButton, primary = true) { springsOff() }
+        listOf(
+            prevBtn, nextBtn, npShuffleBtn, npSleepBtn, npRepeatBtn,
+            npHeart, npAdd, npDownloadBtn, lyricsBtn, shareBtn, queueBtn, npMore
+        ).forEach { MotionPress.attach(it, primary = false) { springsOff() } }
+
         // ---- Lyrics preview card (inspo): current + next line ----
         npLyricsCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -4569,6 +4588,7 @@ class MainActivity : Activity() {
         // real sheet handle should.
         npCloseBtn = icon(R.drawable.ic_chevron_down, Color.WHITE).apply {
             contentDescription = "Close player"
+            MotionPress.attach(this, primary = false) { springsOff() }
             background = GradientDrawable().apply {
                 setColor(Color.argb(46, 0, 0, 0))
                 shape = GradientDrawable.OVAL
@@ -6020,13 +6040,16 @@ class MainActivity : Activity() {
             }
             active.play()
         }
-        // Small scale pop on the glyph swap (spec §13.4), transform-only.
-        if (!reduceMotion() && ::npPlayButton.isInitialized && nowPlaying.visibility == View.VISIBLE) {
-            npPlayButton.animate().scaleX(0.88f).scaleY(0.88f).setDuration(70)
-                .withEndAction {
-                    npPlayButton.animate().scaleX(1f).scaleY(1f).setDuration(140).start()
-                }
-                .start()
+        // Scale pop on the glyph swap (spec §13.4), transform-only.
+        // 0.6.9: the fixed 70/140ms two-step tween is the primary
+        // press spring — snap to the pressed scale, spring back.
+        // It also covers toggles that arrive with no local touch
+        // (headset, widget, notification); the button's own
+        // MotionPress uses the same spring, so the two compose.
+        if (::npPlayButton.isInitialized && nowPlaying.visibility == View.VISIBLE) {
+            npPlayButton.scaleX = 0.88f
+            npPlayButton.scaleY = 0.88f
+            Springs.scale(npPlayButton, 1f, 0.55f, 1500f, instant = springsOff())
         }
         refreshPlaybackUi()
     }
