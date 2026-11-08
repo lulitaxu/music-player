@@ -45,6 +45,8 @@ import android.view.ViewConfiguration
 import android.view.ViewOutlineProvider
 import android.view.ViewGroup
 import android.animation.ValueAnimator
+import androidx.dynamicanimation.animation.DynamicAnimation
+import androidx.dynamicanimation.animation.SpringAnimation
 import android.view.animation.AccelerateInterpolator
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.LinearInterpolator
@@ -614,6 +616,13 @@ class MainActivity : Activity() {
     private lateinit var npElapsed: TextView
     private lateinit var npRemaining: TextView
     private lateinit var npPlayButton: ImageView
+
+    // 0.6.9 morph state: ONE progress value (0 = collapsed at the
+    // mini player, 1 = full Now Playing) drives the panel position,
+    // the mini fade and the Now Playing content fade (applyNpMorph).
+    private val npMorph = Springs.Value(0f)
+    private var npMorphSpring: SpringAnimation? = null
+    private var npMorphTarget = 0f
 
     private lateinit var audioManager: AudioManager
     private val handler = Handler(Looper.getMainLooper())
@@ -4181,7 +4190,7 @@ class MainActivity : Activity() {
         npScroll.zoneTest = { y ->
             ::npArtwork.isInitialized && y <= npArtwork.bottom.toFloat()
         }
-        npScroll.onDrag = { dy -> nowPlaying.translationY = dy }
+        npScroll.onDrag = { dy -> onNpDrag(dy) }
         npScroll.onDragEnd = { dy, v -> onNpDragEnd(dy, v) }
         // The ambient wash steps aside while the panel scrolls
         // (0.6.3, audit S9): a full-screen radial layer under a
@@ -4335,10 +4344,31 @@ class MainActivity : Activity() {
 
                 override fun onStartTrackingTouch(sb: SeekBar?) {
                     seeking = true
+                    // 0.6.9: the scrubber grows while dragging — a
+                    // larger thumb drawable (18dp vs the resting
+                    // 14dp, ~1.3x) plus a subtle spring swell of
+                    // the bar itself; both spring/snap back on
+                    // release. (A SeekBar thumb is a drawable, not
+                    // a view, so the growth is a thumb swap eased
+                    // by the bar's own scale spring.)
+                    sb?.thumb = getDrawable(R.drawable.seek_thumb_big)
+                    if (sb != null) {
+                        Springs.animate(
+                            sb, DynamicAnimation.SCALE_Y, 1.12f,
+                            0.70f, 900f, instant = springsOff()
+                        )
+                    }
                 }
 
                 override fun onStopTrackingTouch(sb: SeekBar?) {
                     seeking = false
+                    sb?.thumb = getDrawable(R.drawable.seek_thumb)
+                    if (sb != null) {
+                        Springs.animate(
+                            sb, DynamicAnimation.SCALE_Y, 1f,
+                            0.70f, 900f, instant = springsOff()
+                        )
+                    }
                     player?.seekTo((sb?.progress ?: 0).toLong())
                     updateNpLyricLine()
                 }
@@ -4554,10 +4584,22 @@ class MainActivity : Activity() {
         root.addView(nowPlaying, FrameLayout.LayoutParams(-1, -1))
     }
 
+    /** Drag-to-dismiss in progress (0.6.9): the drag writes the
+     *  morph progress directly — the panel, the mini fade and the
+     *  content fade all follow the finger from the one value. Any
+     *  settle spring is cancelled first; the release re-springs. */
+    private fun onNpDrag(dy: Float) {
+        npMorphSpring?.cancel()
+        val h = nowPlaying.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+        npMorph.value = (1f - dy / h).coerceIn(0f, 1f)
+        applyNpMorph(npMorph.value)
+    }
+
     /** Drag-to-dismiss release decision (0.6.1): past ~25% of the
-     *  panel height, or a downward fling, completes the existing
-     *  slide-down hide; anything shorter springs back with the iOS
-     *  easing. Called by NpScrollView after a stolen gesture. */
+     *  panel height, or a downward fling, completes the hide;
+     *  anything shorter settles back open. Called by NpScrollView
+     *  after a stolen gesture. 0.6.9: both outcomes are the morph
+     *  spring now, not fixed-duration slides. */
     private fun onNpDragEnd(dy: Float, velocityY: Float) {
         if (nowPlaying.visibility != View.VISIBLE) return
         val h = nowPlaying.height
@@ -4565,9 +4607,71 @@ class MainActivity : Activity() {
         if (dy >= threshold || velocityY > 900f) {
             hideNowPlaying()
         } else {
-            nowPlaying.animate().translationY(0f).setDuration(250)
-                .setInterpolator(iosEase).start()
+            settleNpMorph(1f)
         }
+    }
+
+    /** Renders one morph progress value (0.6.9). The panel rises
+     *  from the mini player's end of the screen; the mini bar
+     *  fades out across the FIRST half of the travel and the Now
+     *  Playing content (scroll + close chevron) fades in across
+     *  the SECOND half — one surface becoming the other, driven
+     *  by the single value so spring, drag and instant paths can
+     *  never disagree about where anything is. */
+    private fun applyNpMorph(p: Float) {
+        if (!::nowPlaying.isInitialized) return
+        val h = nowPlaying.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+        nowPlaying.translationY = (1f - p) * h
+        if (::mini.isInitialized) {
+            mini.alpha = 1f - (p / 0.5f).coerceIn(0f, 1f)
+        }
+        val contentAlpha = ((p - 0.5f) / 0.5f).coerceIn(0f, 1f)
+        if (::npScroll.isInitialized) npScroll.alpha = contentAlpha
+        if (::npCloseBtn.isInitialized) npCloseBtn.alpha = contentAlpha
+    }
+
+    /** Settles the morph to [target] (1 = open, 0 = closed) on
+     *  the container spring (dampingRatio 0.95 / stiffness 350 —
+     *  heavy, near-critically damped, the approved reference
+     *  feel). Motion off resolves instantly. A settle to 0 hides
+     *  the panel only when the spring actually comes to rest at
+     *  the closed end (a mid-close re-open retargets the same
+     *  spring, so the end listener re-checks the live target). */
+    private fun settleNpMorph(target: Float) {
+        npMorphTarget = target
+        if (springsOff()) {
+            npMorphSpring?.cancel()
+            npMorph.value = target
+            applyNpMorph(target)
+            if (target == 0f) finishNpClose()
+            return
+        }
+        val spring = npMorphSpring ?: Springs.valueSpring(npMorph, target, 0.95f, 350f)
+            .also { s ->
+                s.addUpdateListener { _, value, _ -> applyNpMorph(value) }
+                s.addEndListener { _, canceled, _, _ ->
+                    if (!canceled && npMorphTarget == 0f) finishNpClose()
+                }
+                npMorphSpring = s
+            }
+        spring.spring?.let {
+            it.finalPosition = target
+            it.dampingRatio = 0.95f
+            it.stiffness = 350f
+        }
+        if (!spring.isRunning) spring.start()
+    }
+
+    /** The closed end state: panel hidden and every alpha the
+     *  morph touched restored, so the shell underneath is exactly
+     *  as it was before the player opened. */
+    private fun finishNpClose() {
+        if (!::nowPlaying.isInitialized) return
+        nowPlaying.visibility = View.GONE
+        nowPlaying.translationY = 0f
+        if (::mini.isInitialized) mini.alpha = 1f
+        if (::npScroll.isInitialized) npScroll.alpha = 1f
+        if (::npCloseBtn.isInitialized) npCloseBtn.alpha = 1f
     }
 
     private fun styledSeek(thumbRes: Int): SeekBar = SeekBar(this).apply {
@@ -4579,34 +4683,26 @@ class MainActivity : Activity() {
 
     private fun showNowPlaying() {
         ensureOverlays()
+        val wasHidden = nowPlaying.visibility != View.VISIBLE
         nowPlaying.visibility = View.VISIBLE
         refreshPlaybackUi()
-        if (reduceMotion()) {
-            nowPlaying.translationY = 0f
-            return
+        if (wasHidden) {
+            // A fresh open starts the morph at the mini end; a
+            // re-show while a close is still settling continues
+            // from the live progress instead of snapping.
+            if (npMorphSpring?.isRunning != true) npMorph.value = 0f
+            applyNpMorph(npMorph.value)
         }
-        // Slide up from the mini player instead of a hard cut; the
-        // transform is composited, so it stays smooth on mid-range GPUs.
-        val h = nowPlaying.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
-        nowPlaying.translationY = h.toFloat()
-        nowPlaying.animate().translationY(0f).setDuration(300)
-            .setInterpolator(iosEase).start()
+        // 0.6.9: the morph spring replaces the 300ms slide-up;
+        // settleNpMorph resolves instantly when motion is off.
+        settleNpMorph(1f)
     }
 
     private fun hideNowPlaying() {
-        if (reduceMotion()) {
-            nowPlaying.visibility = View.GONE
-            nowPlaying.translationY = 0f
-            return
-        }
-        val h = nowPlaying.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
-        nowPlaying.animate().translationY(h.toFloat()).setDuration(230)
-            .setInterpolator(iosEase)
-            .withEndAction {
-                nowPlaying.visibility = View.GONE
-                nowPlaying.translationY = 0f
-            }
-            .start()
+        if (!::nowPlaying.isInitialized) return
+        // 0.6.9: the morph spring replaces the 230ms slide-down;
+        // finishNpClose hides the panel at the spring's rest.
+        settleNpMorph(0f)
     }
 
     override fun onBackPressed() {
@@ -5999,14 +6095,15 @@ class MainActivity : Activity() {
         refreshDownloadButton()
         // Apple signature detail (spec §13.3): the artwork breathes —
         // slightly smaller while paused, full size while playing.
-        // Skipped entirely under Reduce motion.
+        // 0.6.9: the fixed 260ms tween is a spring now (heavier
+        // than the button springs — the artwork is the biggest
+        // moving surface). Motion off sets the scale instantly, so
+        // the state read (full = playing, shrunk = paused) survives
+        // Reduce Motion instead of freezing wherever it was.
         if (::npArtwork.isInitialized && playing != artWasPlaying) {
             artWasPlaying = playing
-            if (!reduceMotion()) {
-                val s = if (playing) 1f else 0.92f
-                npArtwork.animate().scaleX(s).scaleY(s).setDuration(260)
-                    .setInterpolator(iosEase).start()
-            }
+            val s = if (playing) 1f else 0.92f
+            Springs.scale(npArtwork, s, 0.78f, 380f, instant = springsOff())
         }
         if (t == null) return
         miniTitle.text = t.title
@@ -6215,11 +6312,17 @@ class MainActivity : Activity() {
      *  steps. Skipped under Reduce Motion. */
     private fun fadeInNpArtwork() {
         if (reduceMotion() || !::npArtwork.isInitialized) return
+        // The breathing spring must never fight the entrance
+        // tween for the same properties (0.6.9): cancel it first,
+        // and land the entrance on the breathing target for the
+        // live play state, not a hard-coded 1f.
+        Springs.cancel(npArtwork)
         npArtwork.animate().cancel()
         npArtwork.alpha = 0f
         npArtwork.scaleX = 0.965f
         npArtwork.scaleY = 0.965f
-        npArtwork.animate().alpha(1f).scaleX(1f).scaleY(1f)
+        val s = if (isPlayingSafe()) 1f else 0.92f
+        npArtwork.animate().alpha(1f).scaleX(s).scaleY(s)
             .setDuration(340).setInterpolator(iosEase).start()
     }
 
@@ -6452,6 +6555,14 @@ class MainActivity : Activity() {
 
     private fun reduceMotion(): Boolean =
         getPreferences(MODE_PRIVATE).getBoolean("setting_Reduce motion", false)
+
+    /** Motion master check for the 0.6.9 spring system: the app's
+     *  Reduce Motion setting OR the system animator duration
+     *  scale at 0 (accessibility / developer options) both mean
+     *  springs resolve instantly — callers pass this as the
+     *  Springs instant flag. */
+    private fun springsOff(): Boolean =
+        reduceMotion() || ValueAnimator.getDurationScale() == 0f
 
     /** Artwork URL for large surfaces; Data saver downgrades to the
      *  small rendition instead of prefetching full-size art. */

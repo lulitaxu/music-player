@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Dragging variant of seek_thumb (0.6.9): 18dp vs the resting
+     14dp (~1.3x), swapped in while the Now Playing scrubber is
+     being dragged and swapped back on release. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+    <size android:width="18dp" android:height="18dp" />
+    <solid android:color="#FFFFFF" />
+</shape>
