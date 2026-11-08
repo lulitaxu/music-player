@@ -65,5 +65,24 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+        <!-- Home-screen widget (0.6.8). Exported because the
+             platform requires it: the launcher must be able to
+             deliver APPWIDGET_UPDATE. That is the ONLY action in
+             the filter, AppWidgetProvider's onReceive drops
+             everything else, and the provider's whole power is
+             re-rendering the widget — transport runs through
+             immutable PendingIntents to this app's own
+             non-exported service, never through this receiver. -->
+        <receiver
+            android:name=".ArzxshWidgetProvider"
+            android:exported="true"
+            android:label="arzxsh widget">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/arzxsh_widget_info" />
+        </receiver>
     </application>
 </manifest>

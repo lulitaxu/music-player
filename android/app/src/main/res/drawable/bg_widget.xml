@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Home-screen widget surface (0.6.8): the app's #1A1A1A
+     surface colour with the player's generous corner radius. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <corners android:radius="20dp" />
+    <solid android:color="#1A1A1A" />
+</shape>

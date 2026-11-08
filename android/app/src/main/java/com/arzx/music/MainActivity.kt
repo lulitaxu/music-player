@@ -5976,6 +5976,9 @@ class MainActivity : Activity() {
         lastPushedPlaying = null
         bridgeMuted = true
         PlaybackBridge.clearState()
+        // The widget clears with the bridge (0.6.8): a stopped
+        // player leaves a placeholder, never a stale track.
+        ArzxshWidget.syncFromState(this, null)
         PlaybackService.stop(this)
         refreshPlaybackUi()
     }
@@ -6102,6 +6105,10 @@ class MainActivity : Activity() {
                 trackKey = key
             )
         )
+        // Home-screen widget (0.6.8): mirrors this same snapshot
+        // through the same funnel, change guard and ownership
+        // rule — it can never show a track the bridge doesn't.
+        ArzxshWidget.syncFromState(this, PlaybackBridge.state)
     }
 
     /** POST_NOTIFICATIONS, asked once per process at first play
