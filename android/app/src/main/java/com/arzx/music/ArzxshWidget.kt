@@ -32,6 +32,7 @@ import androidx.media3.common.util.UnstableApi
  * service ends itself (its documented backstop) — the widget can
  * never mint a zombie player. The body opens MainActivity.
  */
+@UnstableApi
 class ArzxshWidgetProvider : AppWidgetProvider() {
 
     override fun onUpdate(
@@ -47,7 +48,7 @@ class ArzxshWidgetProvider : AppWidgetProvider() {
     }
 }
 
-@OptIn(UnstableApi::class)
+@UnstableApi
 object ArzxshWidget {
 
     /** Last snapshot handed over by the activity's funnel. */
