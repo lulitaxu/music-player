@@ -2186,23 +2186,44 @@ class MainActivity : Activity() {
         navRoot("tab:home") { showHome() }
         val gen = ++generation
         val warmToken = if (warmRefresh) ++homeWarmToken else homeWarmToken
-        // Cold builds show the v6 skeleton twin of the real home
-        // layout (hero card + section rows at the same geometry),
-        // never a bare "Loading…" line. Warm refreshes build NO
-        // skeleton: the retained tree stays on screen untouched
-        // until the swap.
+        // Cold builds show the skeleton twin of the real home
+        // layout (quick-pick grid + card shelves at the same
+        // geometry), never a bare "Loading…" line. Warm refreshes
+        // build NO skeleton: the retained tree stays on screen
+        // untouched until the swap.
         val skeleton: LinearLayout? = if (warmRefresh) {
             null
         } else {
-            beginScreen("Listen Now", showAvatar = true)
+            beginScreen(greetingTitle(), showAvatar = true)
             displayedRootTab = "Home"
             homeMainDone = false
             homeMixPending = false
             val sk = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-            val heroSkel = skelBlock(196, 16)
-            (heroSkel.layoutParams as LinearLayout.LayoutParams).topMargin = dp(16)
-            sk.addView(heroSkel)
-            skelSection(sk, 4)
+            // Quick-pick grid twin: two rows of two 56dp chips.
+            repeat(2) { r ->
+                val rowL = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                }
+                val rowLp = LinearLayout.LayoutParams(-1, dp(56))
+                rowLp.topMargin = if (r == 0) dp(18) else dp(8)
+                rowL.layoutParams = rowLp
+                repeat(2) { c ->
+                    val cell = skelBlock(56, 8)
+                    val cellLp = LinearLayout.LayoutParams(0, dp(56), 1f)
+                    if (c == 1) cellLp.marginStart = dp(8)
+                    cell.layoutParams = cellLp
+                    rowL.addView(cell)
+                }
+                sk.addView(rowL)
+            }
+            // Shelf twins: title bar + one card-height block.
+            repeat(2) {
+                val t = skelBlock(20, 8, 150)
+                (t.layoutParams as LinearLayout.LayoutParams).topMargin = dp(24)
+                (t.layoutParams as LinearLayout.LayoutParams).bottomMargin = dp(10)
+                sk.addView(t)
+                sk.addView(skelBlock(150, 12))
+            }
             content.addView(sk)
             sk
         }
@@ -2229,7 +2250,7 @@ class MainActivity : Activity() {
                         return@runOnUiThread
                     }
                     retainedRoots["Home"]?.builtAtMs = System.currentTimeMillis()
-                    beginScreen("Listen Now", showAvatar = true)
+                    beginScreen(greetingTitle(), showAvatar = true)
                     displayedRootTab = "Home"
                     homeMixPending = false
                 } else {
@@ -2247,36 +2268,34 @@ class MainActivity : Activity() {
                     tracks.clear()
                     tracks.addAll(audius)
                 }
-                // Featured prefers YouTube Music (the primary source);
-                // Audius headlines only when charts are unavailable.
-                val featured = if (mode == "audius") {
-            audius?.firstOrNull() ?: charts?.songs?.firstOrNull()
-        } else {
-            charts?.songs?.firstOrNull() ?: audius?.firstOrNull()
-        }
-                if (featured != null) {
-                    val context = if (featured.source == SOURCE_YOUTUBE) {
-                        charts?.songs ?: listOf(featured)
-                    } else {
-                        audius ?: listOf(featured)
-                    }
-                    val kicker = if (featured.source == SOURCE_YOUTUBE) {
-                        "TRENDING"
-                    } else {
-                        "FEATURED MIX"
-                    }
-                    content.addView(featuredCard(featured, kicker, context))
+                // Spotify-style home (0.6.13): NO hero card. The
+                // page opens with the quick-pick grid (his own
+                // stuff, local and instant), then card shelves.
+                // Greeting + avatar live in the header beginScreen
+                // already drew.
+                val picks = homeQuickPicks()
+                if (picks.isNotEmpty()) {
+                    content.addView(quickPickGrid(picks))
                     any = true
                 }
                 if (recentTracks.isNotEmpty()) {
-                    content.addView(sectionTitle("Recently Played"))
-                    addRows(recentTracks, withHairlines = true, queueContext = recentTracks.toList())
+                    content.addView(sectionTitle("Jump back in"))
+                    content.addView(
+                        trackCardRow(recentTracks.toList(), 148, recentTracks.toList())
+                    )
                     any = true
                 }
                 if (charts != null && charts.songs.isNotEmpty()) {
                     content.addView(sectionTitle("Trending"))
                     val top = charts.songs.take(12)
-                    addRows(top, withHairlines = true, queueContext = top)
+                    content.addView(trackCardRow(top, 132, top))
+                    any = true
+                } else if (mode == "audius" && audius != null && audius.isNotEmpty()) {
+                    // Audius mode fires no charts call at all: the
+                    // trending list it did fetch IS the shelf.
+                    content.addView(sectionTitle("Trending"))
+                    val top = audius.take(12)
+                    content.addView(trackCardRow(top, 132, top))
                     any = true
                 } else if (chartsErr != null) {
                     // A dead section says so plainly, never a
@@ -2296,68 +2315,27 @@ class MainActivity : Activity() {
                     content.addView(artistCircleRow(charts.artists.take(10)))
                     any = true
                 }
-                // Made for You: an on-device mix — YouTube Music radio
-                // seeded by his most-played YouTube track, labeled as
-                // generated here. No seed (nothing played yet, or
-                // Audius mode) → the section simply doesn't exist.
-                if (mode != "audius") {
-                    val seed = PlayHistory.topTracks(this@MainActivity, 20)
-                        .firstOrNull { it.first.source == SOURCE_YOUTUBE }?.first
-                    if (seed != null) {
-                        content.addView(sectionTitle("Made for You"))
-                        val mixBox = LinearLayout(this@MainActivity).apply {
-                            orientation = LinearLayout.VERTICAL
-                        }
-                        skelRows(mixBox, 3)
-                        content.addView(mixBox)
-                        any = true
-                        homeMixPending = true
-                        executor.execute {
-                            var mix: List<Track>? = null
-                            var mixErr: String? = null
-                            try {
-                                mix = YtmApi.radio(seed.id)
-                            } catch (t: Throwable) {
-                                mixErr = shortErr(t)
-                            }
-                            runOnUiThread {
-                                if (gen != generation) return@runOnUiThread
-                                homeMixPending = false
-                                mixBox.removeAllViews()
-                                val m = mix
-                                if (m == null || m.isEmpty()) {
-                                    android.util.Log.e(
-                                        "Home", "mix failed: ${mixErr ?: "empty radio"}"
-                                    )
-                                    mixBox.addView(
-                                        statusLine("Mix unavailable right now.")
-                                    )
-                                } else {
-                                    mixBox.addView(
-                                        statusLine(
-                                            "Generated on this device · radio from “${seed.title}” by ${seed.artist}"
-                                        )
-                                    )
-                                    addRows(
-                                        m.take(15), mixBox,
-                                        withHairlines = true, queueContext = m
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
                 // In YouTube Music mode the Audius section is the
                 // fallback: it appears only when the charts failed
-                // or came back empty. Audius/Both modes always show it.
-                val showAudiusSection = mode != "youtube" ||
-                    charts == null || charts.songs.isEmpty()
-                if (showAudiusSection && audius != null && audius.size > 1) {
+                // or came back empty. Audius/Both modes always show
+                // it. Audius mode skips it: its Trending shelf above
+                // already IS this list (there is no hero eating the
+                // first entry anymore).
+                val showAudiusSection = mode != "audius" && (mode != "youtube" ||
+                    charts == null || charts.songs.isEmpty())
+                if (showAudiusSection && audius != null && audius.isNotEmpty()) {
                     content.addView(sectionTitle("More trending"))
-                    val rest = audius.drop(1).take(12)
-                    addRows(rest, withHairlines = true, queueContext = rest)
+                    val rest = audius.take(12)
+                    content.addView(trackCardRow(rest, 132, rest))
                     any = true
                 }
+                val myPlaylists = Playlists.all(this@MainActivity)
+                if (myPlaylists.isNotEmpty()) {
+                    content.addView(sectionTitle("Your playlists"))
+                    content.addView(playlistCardRow(myPlaylists))
+                    any = true
+                }
+                if (addMadeForYouSection(gen, mode)) any = true
                 if (!any) {
                     if (isOffline()) {
                         content.addView(offlineStateView { buildHome(warmRefresh = false) })
@@ -2370,57 +2348,315 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun featuredCard(track: Track, kicker: String, context: List<Track>): FrameLayout {
-        val card = FrameLayout(this).apply {
-            // 0.6.11 theme reach: the Home hero card fades from an
-            // accent-washed dark at the top into near-black — the
-            // biggest surface on Home now carries the theme too.
-            background = GradientDrawable(
-                GradientDrawable.Orientation.TOP_BOTTOM,
-                intArrayOf(tintWithAccent(Color.rgb(20, 20, 23), 0.38f), Color.rgb(16, 16, 18))
-            ).apply {
-                cornerRadius = dp(16).toFloat()
-            }
-            clipToOutline = true
-            setOnClickListener {
-                setQueue(context)
-                play(track)
+    /** Home header greeting by local time (Spotify-style home,
+     *  0.6.13): the header beginScreen draws carries this in place
+     *  of the old "Listen Now" title, avatar at the top-right as
+     *  before. */
+    private fun greetingTitle(): String =
+        when (java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)) {
+            in 5..11 -> "Good morning"
+            in 12..16 -> "Good afternoon"
+            else -> "Good evening"
+        }
+
+    /** One quick-pick slot: exactly one of [track] / [playlist]. */
+    private data class HomePick(val track: Track?, val playlist: Playlist?)
+
+    /** Quick picks (Spotify-style home, 0.6.13): up to 8 slots
+     *  filled in order — most recent distinct plays from
+     *  PlayHistory, then Liked Songs, then his playlists, then
+     *  downloaded tracks. All local stores (parsed-once caches),
+     *  so this runs on the UI thread for free. Empty slots simply
+     *  don't exist; a fresh install gets no grid at all. */
+    private fun homeQuickPicks(): List<HomePick> {
+        val picks = ArrayList<HomePick>()
+        val seen = HashSet<String>()
+        for ((t, _) in PlayHistory.events(this)) {
+            if (picks.size >= 8) break
+            if (seen.add(trackKey(t))) picks += HomePick(t, null)
+        }
+        if (picks.size < 8) {
+            for (t in Favorites.liked(this)) {
+                if (picks.size >= 8) break
+                if (seen.add(trackKey(t))) picks += HomePick(t, null)
             }
         }
-        val lp = LinearLayout.LayoutParams(-1, dp(196))
-        lp.topMargin = dp(16)
-        card.layoutParams = lp
-        val img = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
-        // 0.6.13: the hero is a full-width surface — decode for
-        // the screen width, not the loader's 512px fallback.
-        ArtworkLoader.load(
-            largeArt(track), img, track.artworkSmall,
-            resources.displayMetrics.widthPixels
-        )
-        card.addView(img, FrameLayout.LayoutParams(-1, -1))
-        val shade = View(this).apply {
-            background = GradientDrawable(
-                GradientDrawable.Orientation.TOP_BOTTOM,
-                intArrayOf(Color.TRANSPARENT, Color.argb(184, 0, 0, 0))
+        if (picks.size < 8) {
+            for (p in Playlists.all(this)) {
+                if (picks.size >= 8) break
+                picks += HomePick(null, p)
+            }
+        }
+        if (picks.size < 8) {
+            for (e in Downloads.entries(this)) {
+                if (picks.size >= 8) break
+                if (seen.add(trackKey(e.track))) picks += HomePick(e.track, null)
+            }
+        }
+        return picks
+    }
+
+    /** The 2-column quick-pick grid: rows of two 56dp chips. */
+    private fun quickPickGrid(picks: List<HomePick>): LinearLayout {
+        val queueContext = picks.mapNotNull { it.track }
+        val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val gridLp = LinearLayout.LayoutParams(-1, -2)
+        gridLp.topMargin = dp(18)
+        grid.layoutParams = gridLp
+        picks.chunked(2).forEachIndexed { rowIdx, rowPicks ->
+            val rowL = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            val rowLp = LinearLayout.LayoutParams(-1, dp(56))
+            if (rowIdx > 0) rowLp.topMargin = dp(8)
+            rowL.layoutParams = rowLp
+            rowPicks.forEachIndexed { colIdx, pick ->
+                val chipLp = LinearLayout.LayoutParams(0, dp(56), 1f)
+                if (colIdx == 1) chipLp.marginStart = dp(8)
+                rowL.addView(quickPickChip(pick, queueContext), chipLp)
+            }
+            if (rowPicks.size == 1) {
+                // Odd tail: an invisible twin keeps the last chip
+                // at half width instead of stretching full-bleed.
+                val spLp = LinearLayout.LayoutParams(0, dp(56), 1f)
+                spLp.marginStart = dp(8)
+                rowL.addView(View(this), spLp)
+            }
+            grid.addView(rowL)
+        }
+        return grid
+    }
+
+    /** One quick-pick chip: artwork flush left, title right, on a
+     *  surface tile. A track chip plays in grid context; a
+     *  playlist chip opens the playlist. */
+    private fun quickPickChip(pick: HomePick, queueContext: List<Track>): LinearLayout {
+        val track = pick.track
+        val playlist = pick.playlist
+        val chip = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = solidBg(8f, surface)
+            clipToOutline = true
+            isClickable = true
+        }
+        val artSlot = FrameLayout(this)
+        val artTrack = track ?: playlist?.tracks?.firstOrNull()
+        if (artTrack != null) {
+            val img = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+            }
+            ArtworkLoader.load(artTrack.artworkLarge ?: artTrack.artworkSmall, img)
+            artSlot.addView(img, FrameLayout.LayoutParams(-1, -1))
+        } else {
+            // Empty playlist: the tinted tile + library glyph,
+            // same placeholder language as the playlist banner.
+            artSlot.background = GradientDrawable().apply { setColor(surface2) }
+            artSlot.addView(
+                icon(R.drawable.ic_library, white50).apply {
+                    setPadding(dp(7), dp(7), dp(7), dp(7))
+                },
+                FrameLayout.LayoutParams(dp(30), dp(30), Gravity.CENTER)
             )
         }
-        card.addView(shade, FrameLayout.LayoutParams(-1, -1))
-        val labels = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), 0, dp(16), dp(13))
+        chip.addView(artSlot, LinearLayout.LayoutParams(dp(56), dp(56)))
+        chip.addView(
+            label(
+                track?.title ?: playlist?.name ?: "", 13.5f, Color.WHITE, mediumTf
+            ).apply {
+                maxLines = 2
+                ellipsize = TextUtils.TruncateAt.END
+                setPadding(dp(10), 0, dp(8), 0)
+            },
+            LinearLayout.LayoutParams(0, -2, 1f)
+        )
+        if (track != null) {
+            chip.setOnClickListener {
+                setQueue(queueContext)
+                play(track)
+            }
+        } else if (playlist != null) {
+            chip.setOnClickListener { showPlaylist(playlist.id) }
         }
-        labels.addView(label(kicker, 11f, white75, boldTf).apply { letterSpacing = 0.11f })
-        labels.addView(TextView(this).apply {
-            text = "${track.title}\n${track.artist}"
-            setTextSize(20f)
-            setTextColor(Color.WHITE)
-            typeface = boldTf
-            maxLines = 2
-            ellipsize = TextUtils.TruncateAt.END
-            setLineSpacing(0f, 1.15f)
-        })
-        card.addView(labels, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
-        return card
+        MotionPress.attach(chip, primary = false) { springsOff() }
+        return chip
+    }
+
+    /** Horizontal card shelf for tracks (Spotify-style home,
+     *  0.6.13): square art, title, artist — the card twin of
+     *  albumCardRow. Tapping a card plays it in shelf context. */
+    private fun trackCardRow(
+        items: List<Track>, cardDp: Int, queueContext: List<Track>
+    ): HorizontalScrollView {
+        val scroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            clipToPadding = false
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(4), 0, dp(2))
+        }
+        items.forEach { item ->
+            val box = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setOnClickListener {
+                    setQueue(queueContext)
+                    play(item)
+                }
+            }
+            val boxLp = LinearLayout.LayoutParams(dp(cardDp), -2)
+            boxLp.marginEnd = dp(14)
+            box.layoutParams = boxLp
+            val img = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                roundedClip(this, 10)
+            }
+            ArtworkLoader.load(item.artworkLarge ?: item.artworkSmall, img)
+            box.addView(img, LinearLayout.LayoutParams(dp(cardDp), dp(cardDp)))
+            box.addView(label(item.title, 13.5f, Color.WHITE, mediumTf).apply {
+                maxLines = 2
+                ellipsize = TextUtils.TruncateAt.END
+                val lp = LinearLayout.LayoutParams(-1, -2)
+                lp.topMargin = dp(7)
+                layoutParams = lp
+            })
+            box.addView(label(item.artist, 12.5f, white50).apply {
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            })
+            MotionPress.attach(box, primary = false) { springsOff() }
+            row.addView(box)
+        }
+        scroll.addView(row)
+        return scroll
+    }
+
+    /** "Your playlists" shelf (0.6.13): cards whose art is a 2x2
+     *  mosaic of the playlist's first four tracks — the playlist
+     *  page banner's art language at shelf size. A lone track
+     *  fills the frame; an empty playlist gets the glyph tile. */
+    private fun playlistCardRow(playlists: List<Playlist>): HorizontalScrollView {
+        val scroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            clipToPadding = false
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(4), 0, dp(2))
+        }
+        playlists.forEach { p ->
+            val box = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setOnClickListener { showPlaylist(p.id) }
+            }
+            val boxLp = LinearLayout.LayoutParams(dp(132), -2)
+            boxLp.marginEnd = dp(14)
+            box.layoutParams = boxLp
+            val frame = FrameLayout(this)
+            roundedClip(frame, 10)
+            val mosaicTracks = p.tracks.take(4)
+            if (mosaicTracks.isEmpty()) {
+                frame.addView(
+                    icon(R.drawable.ic_library, white50).apply {
+                        setPadding(dp(16), dp(16), dp(16), dp(16))
+                    },
+                    FrameLayout.LayoutParams(dp(52), dp(52), Gravity.CENTER)
+                )
+            } else if (mosaicTracks.size == 1) {
+                val img = ImageView(this).apply {
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                }
+                ArtworkLoader.load(
+                    mosaicTracks[0].artworkLarge ?: mosaicTracks[0].artworkSmall, img
+                )
+                frame.addView(img, FrameLayout.LayoutParams(-1, -1))
+            } else {
+                val grid = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                }
+                for (r in 0 until 2) {
+                    val rowL = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                    }
+                    for (col in 0 until 2) {
+                        val t = mosaicTracks[(r * 2 + col) % mosaicTracks.size]
+                        val cell = ImageView(this).apply {
+                            scaleType = ImageView.ScaleType.CENTER_CROP
+                        }
+                        ArtworkLoader.load(t.artworkLarge ?: t.artworkSmall, cell)
+                        rowL.addView(cell, LinearLayout.LayoutParams(0, -1, 1f))
+                    }
+                    grid.addView(rowL, LinearLayout.LayoutParams(-1, 0, 1f))
+                }
+                frame.addView(grid, FrameLayout.LayoutParams(-1, -1))
+            }
+            box.addView(frame, LinearLayout.LayoutParams(dp(132), dp(132)))
+            box.addView(label(p.name, 13.5f, Color.WHITE, mediumTf).apply {
+                maxLines = 2
+                ellipsize = TextUtils.TruncateAt.END
+                val lp = LinearLayout.LayoutParams(-1, -2)
+                lp.topMargin = dp(7)
+                layoutParams = lp
+            })
+            box.addView(label("${p.tracks.size} tracks", 12.5f, white50))
+            MotionPress.attach(box, primary = false) { springsOff() }
+            row.addView(box)
+        }
+        scroll.addView(row)
+        return scroll
+    }
+
+    /** Made for You: an on-device mix — radio seeded by his
+     *  most-played track from the primary source, labeled as
+     *  generated here. No seed (nothing played yet, or the
+     *  single-source mode that skips the charts backend) → the
+     *  section simply doesn't exist. Returns true when the
+     *  section was added. Unchanged from the pre-redesign home;
+     *  it just renders last now. */
+    private fun addMadeForYouSection(gen: Int, mode: String): Boolean {
+        if (mode == "audius") return false
+        val seed = PlayHistory.topTracks(this, 20)
+            .firstOrNull { it.first.source == SOURCE_YOUTUBE }?.first
+            ?: return false
+        content.addView(sectionTitle("Made for You"))
+        val mixBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        skelRows(mixBox, 3)
+        content.addView(mixBox)
+        homeMixPending = true
+        executor.execute {
+            var mix: List<Track>? = null
+            var mixErr: String? = null
+            try {
+                mix = YtmApi.radio(seed.id)
+            } catch (t: Throwable) {
+                mixErr = shortErr(t)
+            }
+            runOnUiThread {
+                if (gen != generation) return@runOnUiThread
+                homeMixPending = false
+                mixBox.removeAllViews()
+                val m = mix
+                if (m == null || m.isEmpty()) {
+                    android.util.Log.e(
+                        "Home", "mix failed: ${mixErr ?: "empty radio"}"
+                    )
+                    mixBox.addView(
+                        statusLine("Mix unavailable right now.")
+                    )
+                } else {
+                    mixBox.addView(
+                        statusLine(
+                            "Generated on this device · radio from “${seed.title}” by ${seed.artist}"
+                        )
+                    )
+                    addRows(
+                        m.take(15), mixBox,
+                        withHairlines = true, queueContext = m
+                    )
+                }
+            }
+        }
+        return true
     }
 
     // ---------------------------------------------------------------- search
