@@ -64,6 +64,9 @@ import java.util.concurrent.Executors
 const val SOURCE_AUDIUS = "audius"
 const val SOURCE_YOUTUBE = "youtube"
 const val SOURCE_LOCAL = "local"
+/** Sleep-timer fade ramp (0.6.8): the final 30 seconds of a
+ *  timed sleep timer ramp the volume to zero — no hard cut. */
+const val SLEEP_FADE_MS = 30_000L
 
 data class Track(
     val id: String,
@@ -649,6 +652,14 @@ class MainActivity : Activity() {
     private var repeatMode = 0 // 0 = off, 1 = all, 2 = one
     private var playOrder: List<Int> = emptyList()
     private var sleepDeadline = 0L
+    /** 0.6.8 sleep fade: true while the timed sleep timer is
+     *  inside its final volume ramp (see beginSleepFade).
+     *  Transition code (crossfade, gapless) reads it and stays
+     *  out of the way — sleep wins over every transition. */
+    private var sleepFadeRunning = false
+    /** Length of the current timer's fade ramp: the last 30s,
+     *  or the whole timer when a custom duration is shorter. */
+    private var sleepFadeWindowMs = 0L
 
     private lateinit var npShuffleBtn: ImageView
     private lateinit var npRepeatBtn: ImageView
@@ -906,12 +917,6 @@ class MainActivity : Activity() {
     private lateinit var queueOverlay: FrameLayout
     private lateinit var queueRecycler: RecyclerView
 
-    private val sleepFire = Runnable {
-        sleepDeadline = 0L
-        fadeOutAndPause()
-        updateSleepLabel()
-        Toast.makeText(this@MainActivity, "Sleep timer ended", Toast.LENGTH_SHORT).show()
-    }
     private val tabViews = mutableMapOf<String, Triple<LinearLayout, ImageView, TextView>>()
     private val categoryArtViews = mutableListOf<ImageView>()
 
@@ -4834,7 +4839,7 @@ class MainActivity : Activity() {
         val fade = fadeSource
         val sameTrack = forTrack != null && activePlayerTrack != null &&
             forTrack.id == activePlayerTrack?.id && forTrack.source == activePlayerTrack?.source
-        val canFade = fadeMs > 0 && fade != null && !sameTrack && fade.isPlaying
+        val canFade = fadeMs > 0 && fade != null && !sameTrack && fade.isPlaying && !sleepFadeRunning
         val httpFactory = DefaultHttpDataSource.Factory()
             .setUserAgent(userAgent ?: "arzxsh (Android)")
             .setConnectTimeoutMs(15_000)
@@ -4852,6 +4857,10 @@ class MainActivity : Activity() {
         // releases it even if every other path forgets it.
         PlayerRegistry.register(instanceId) { holder.release() }
         activePlayerTrack = forTrack
+        // 0.6.8: a track starting inside the sleep fade window
+        // starts ON the ramp, not at unity — the fade survives
+        // the player swap (the tick keeps re-deriving it too).
+        if (sleepFadeRunning) holder.setVolume(sleepFadeVolumeNow())
         // 0.6.1 (background playback): keep the network/CPU path
         // awake while streaming, so a screen-off phone does not
         // stall mid-song; the foreground service keeps the process.
@@ -4970,7 +4979,10 @@ class MainActivity : Activity() {
         }
         if (!faded) {
             if (partner != null && partner !== holder) partner.release()
-            holder.setVolume(1f)
+            // Unity — unless the sleep fade owns the volume
+            // right now (0.6.8), in which case the new player
+            // lands on the ramp instead of punching through it.
+            holder.setVolume(if (sleepFadeRunning) sleepFadeVolumeNow() else 1f)
         }
         refreshPlaybackUi()
     }
@@ -5154,7 +5166,7 @@ class MainActivity : Activity() {
      * runs instead: the transition is never worse than today's cut.
      */
     private fun maybeArmGapless() {
-        if (!gaplessOn() || crossfadeSec() > 0 || sleepAfterTrack) {
+        if (!gaplessOn() || crossfadeSec() > 0 || sleepAfterTrack || sleepFadeRunning) {
             if (gaplessPrep != null || gaplessArmingFor != null) discardGaplessPrep()
             return
         }
@@ -5331,6 +5343,7 @@ class MainActivity : Activity() {
         val prep = gaplessPrep ?: return
         val p = player
         if (!gaplessOn() || crossfadeSec() > 0 || sleepAfterTrack || sleepAfterQueue ||
+            sleepFadeRunning ||
             p == null || !p.isPlaying || !prep.ready
         ) {
             discardGaplessPrep()
@@ -5691,6 +5704,12 @@ class MainActivity : Activity() {
         }
         if (active.isPlaying) {
             active.pause()
+            // A manual pause takes the timed sleep timer down
+            // with it (0.6.8): mid-fade, the ramp is abandoned
+            // and volume restored; merely armed, the deadline is
+            // disarmed — a timer must never fire later against a
+            // player the user deliberately paused and resumed.
+            cancelTimedSleep()
             // A pause DISARMS the gapless boundary timer (0.6.3,
             // WS-C): fireGapless's own isPlaying revalidation is
             // the second lock; this is the first, so a paused
@@ -5734,6 +5753,10 @@ class MainActivity : Activity() {
      */
     private fun stopPlayback() {
         if (outPlayer != null) finishCrossfadeNow()
+        // The conclusive stop ends the timed sleep timer too
+        // (0.6.8): no deadline, no fade, volume whole — nothing
+        // timed may outlive the stop.
+        cancelTimedSleep()
         // Disarm the boundary: prep released, fire timer removed.
         discardGaplessPrep()
         gaplessFire?.let { handler.removeCallbacks(it) }
@@ -6367,7 +6390,7 @@ class MainActivity : Activity() {
             else -> "Sleep Timer"
         }
         val items = mutableListOf<Pair<String, () -> Unit>>()
-        for (m in listOf(5, 10, 15, 30, 45, 60)) {
+        for (m in listOf(10, 20, 30, 45, 60)) {
             items += (if (m == 60) "1 hour" else "$m minutes") to { setSleepTimer(m) }
         }
         items += "Custom…" to { showCustomSleepDialog() }
@@ -6380,8 +6403,7 @@ class MainActivity : Activity() {
     }
 
     private fun setSleepEndOfQueue() {
-        handler.removeCallbacks(sleepFire)
-        sleepDeadline = 0L
+        cancelTimedSleep()
         sleepAfterTrack = false
         sleepAfterQueue = true
         updateSleepLabel()
@@ -6413,15 +6435,23 @@ class MainActivity : Activity() {
     }
 
     private fun setSleepTimer(minutes: Int) {
-        handler.removeCallbacks(sleepFire)
+        // Any previous timer — armed or mid-fade — is fully
+        // cancelled first (callbacks, ramp, volume), so a change
+        // of mind never leaves the player quiet or a stale
+        // deadline armed.
+        cancelTimedSleep()
         sleepAfterTrack = false
         sleepAfterQueue = false
         if (minutes <= 0) {
-            sleepDeadline = 0L
             Toast.makeText(this, "Sleep timer off", Toast.LENGTH_SHORT).show()
         } else {
-            sleepDeadline = System.currentTimeMillis() + minutes * 60_000L
-            handler.postDelayed(sleepFire, minutes * 60_000L)
+            val totalMs = minutes * 60_000L
+            sleepDeadline = System.currentTimeMillis() + totalMs
+            // The ramp occupies the last 30 seconds — or the
+            // whole timer, for a custom duration shorter than
+            // the ramp itself.
+            sleepFadeWindowMs = minOf(SLEEP_FADE_MS, totalMs)
+            handler.postDelayed(sleepFadeStart, totalMs - sleepFadeWindowMs)
             // The single confirmation (spec §6); Android Toast stands
             // in for Spotify's white snackbar.
             Toast.makeText(this, "Your sleep timer is set.", Toast.LENGTH_SHORT).show()
@@ -6430,12 +6460,98 @@ class MainActivity : Activity() {
     }
 
     private fun setSleepEndOfTrack() {
-        handler.removeCallbacks(sleepFire)
-        sleepDeadline = 0L
+        cancelTimedSleep()
         sleepAfterQueue = false
         sleepAfterTrack = true
         updateSleepLabel()
         Toast.makeText(this, "Your sleep timer is set.", Toast.LENGTH_SHORT).show()
+    }
+
+    // ---- 0.6.8: timed sleep fade ----
+    // A timed sleep timer no longer hard-cuts at the deadline
+    // (the pre-0.6.8 path fired a ~2s fade AT expiry). The last
+    // 30 seconds are the fade: [sleepFadeStart] fires one ramp
+    // length before the deadline and [sleepFadeTick] re-derives
+    // the volume from the remaining time on every pass, so the
+    // ramp is a function of the deadline, not of any one player
+    // instance — a track change mid-fade swaps in a fresh player
+    // and the tick pulls it back onto the ramp within 150ms
+    // (startPlaybackInternal also seeds it at the ramp value).
+    // At zero the player pauses and volume returns to unity:
+    // the next play, whenever it comes, starts full.
+
+    private val sleepFadeStart = Runnable { beginSleepFade() }
+
+    private val sleepFadeTick = object : Runnable {
+        override fun run() {
+            if (!sleepFadeRunning) return
+            if (sleepDeadline - System.currentTimeMillis() <= 0L) {
+                finishSleepTimer()
+                return
+            }
+            player?.setVolume(sleepFadeVolumeNow())
+            // Defensive only: a crossfade partner cannot exist
+            // in the fade window (beginSleepFade settled any
+            // running one and beginCrossfade is guarded), but a
+            // silent partner beats a surprise one.
+            outPlayer?.setVolume(0f)
+            handler.postDelayed(this, 150)
+        }
+    }
+
+    /** The ramp value for *right now*: 1 at the top of the fade
+     *  window, 0 at the deadline. */
+    private fun sleepFadeVolumeNow(): Float {
+        if (sleepFadeWindowMs <= 0L) return 1f
+        val remaining = sleepDeadline - System.currentTimeMillis()
+        return (remaining.toFloat() / sleepFadeWindowMs).coerceIn(0f, 1f)
+    }
+
+    private fun beginSleepFade() {
+        if (sleepDeadline <= 0L || sleepFadeRunning) return
+        sleepFadeRunning = true
+        // Sleep wins over every transition: a crossfade in
+        // flight settles now, an armed gapless prep is
+        // discarded, and neither re-arms while the fade runs
+        // (both read sleepFadeRunning in their guards).
+        if (outPlayer != null) finishCrossfadeNow()
+        discardGaplessPrep()
+        handler.post(sleepFadeTick)
+    }
+
+    /** The deadline itself: pause, restore unity volume, clear
+     *  the timer. Volume is restored NOW, on the paused player,
+     *  so no later play can ever inherit the bottom of the ramp. */
+    private fun finishSleepTimer() {
+        handler.removeCallbacks(sleepFadeTick)
+        sleepFadeRunning = false
+        sleepDeadline = 0L
+        sleepFadeWindowMs = 0L
+        gaplessFire?.let { handler.removeCallbacks(it) }
+        gaplessFire = null
+        val p = player
+        if (p != null && p.isPlaying) p.pause()
+        p?.setVolume(1f)
+        updateSleepLabel()
+        refreshPlaybackUi()
+        Toast.makeText(this, "Sleep timer ended", Toast.LENGTH_SHORT).show()
+    }
+
+    /** Cancels the TIMED sleep timer wherever it stands — armed
+     *  or mid-fade: callbacks removed, ramp abandoned, volume
+     *  back to unity. Called by every timer-mode change, by the
+     *  manual-pause path and by the conclusive stop. The
+     *  end-of-track / end-of-queue modes are boundary modes, not
+     *  this timer, and are not touched here. */
+    private fun cancelTimedSleep() {
+        handler.removeCallbacks(sleepFadeStart)
+        handler.removeCallbacks(sleepFadeTick)
+        val wasFading = sleepFadeRunning
+        sleepFadeRunning = false
+        sleepDeadline = 0L
+        sleepFadeWindowMs = 0L
+        if (wasFading) player?.setVolume(1f)
+        updateSleepLabel()
     }
 
     /** Sleep-timer expiry fades the volume out over ~2s, then pauses
@@ -8657,7 +8773,8 @@ class MainActivity : Activity() {
         visualizerAnimator?.cancel()
         flushListened()
         handler.removeCallbacks(crossfadeTick)
-        handler.removeCallbacks(sleepFire)
+        handler.removeCallbacks(sleepFadeStart)
+        handler.removeCallbacks(sleepFadeTick)
         discardGaplessPrep()
         // Release EVERY player this instance created — the main
         // player, the crossfade partner, the ARMED GAPLESS PREP
