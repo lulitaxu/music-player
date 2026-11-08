@@ -13,6 +13,10 @@
          hides the notification. WAKE_LOCK pairs with ExoPlayer's
          WAKE_MODE_NETWORK so screen-off streaming does not stall. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Connectivity state (0.6.13): the No Internet page reads
+         the active network's capabilities (online or not — never
+         traffic content). Normal permission, auto-granted. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Built-in equalizer (0.6.8): creating audio effects on the
          player's own audio session takes MODIFY_AUDIO_SETTINGS —

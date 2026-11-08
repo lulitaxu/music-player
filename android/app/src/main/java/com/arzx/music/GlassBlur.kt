@@ -59,6 +59,15 @@ class GlassBlurDrawable(
     private val path = Path()
     private val loc = IntArray(2)
 
+    /** The drawable alpha, kept in a FIELD (0.6.13 audit fix):
+     *  [draw] calls paint.reset() before every layer, which
+     *  silently wiped the alpha setAlpha had just stored on the
+     *  paint — setAlpha was a no-op and any fade of a glass
+     *  surface snapped instead of fading. Re-applied after
+     *  each reset in [draw]. */
+    private var drawableAlpha = 255
+    private var drawableColorFilter: ColorFilter? = null
+
     override fun draw(canvas: Canvas) {
         val b = bounds
         if (b.isEmpty) return
@@ -87,6 +96,8 @@ class GlassBlurDrawable(
             if (!src.isEmpty) {
                 paint.reset()
                 paint.isFilterBitmap = true
+                paint.alpha = drawableAlpha
+                paint.colorFilter = drawableColorFilter
                 canvas.drawBitmap(bmp, src, bf, paint)
             }
         }
@@ -96,6 +107,8 @@ class GlassBlurDrawable(
         paint.reset()
         paint.style = Paint.Style.FILL
         paint.color = tintProvider()
+        paint.alpha = drawableAlpha
+        paint.colorFilter = drawableColorFilter
         canvas.drawRect(bf, paint)
         canvas.restoreToCount(save)
         // Hairline rim, inset so it never bleeds outside the fill.
@@ -105,6 +118,8 @@ class GlassBlurDrawable(
             paint.style = Paint.Style.STROKE
             paint.strokeWidth = strokeWidthPx
             paint.color = stroke
+            paint.alpha = drawableAlpha
+            paint.colorFilter = drawableColorFilter
             val inset = strokeWidthPx / 2f
             val sf = RectF(bf).apply { inset(inset, inset) }
             if (radiusPx > 0f) {
@@ -116,11 +131,13 @@ class GlassBlurDrawable(
     }
 
     override fun setAlpha(alpha: Int) {
-        paint.alpha = alpha
+        drawableAlpha = alpha
+        invalidateSelf()
     }
 
     override fun setColorFilter(colorFilter: ColorFilter?) {
-        paint.colorFilter = colorFilter
+        drawableColorFilter = colorFilter
+        invalidateSelf()
     }
 
     @Deprecated("Drawable opacity contract")

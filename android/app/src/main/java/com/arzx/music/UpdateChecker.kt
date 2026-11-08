@@ -73,8 +73,33 @@ object UpdateChecker {
         val notes: String,
         val apkUrl: String,
         val apkName: String,
-        val pageUrl: String
+        val pageUrl: String,
+        /** SHA-256 (hex) of the release APK, from version.json
+         *  (0.6.13 audit fix): the downloaded APK is verified
+         *  against this before the installer ever sees it. Null
+         *  for a release whose version.json carries no hash —
+         *  such a download is REFUSED, never installed blind. */
+        val sha256: String? = null
     )
+
+    /** A versionName from a remote document is data, not truth:
+     *  it is interpolated into download URLs and file names, so
+     *  only the strict dotted form is ever accepted (0.6.13). */
+    private val VERSION_NAME_RE = Regex("""^\d+\.\d+\.\d+$""")
+    private val SHA256_RE = Regex("""^[0-9a-fA-F]{64}$""")
+
+    private fun sha256Of(file: File): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                digest.update(buf, 0, n)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
 
     private val ioExecutor = Executors.newSingleThreadExecutor()
 
@@ -194,7 +219,11 @@ object UpdateChecker {
         if (code < 0 || vname.isEmpty()) {
             throw UpdateCheckException("version.json lacks versionCode/versionName")
         }
-        return Release(code, vname, "", apkUrlFor(vname), "arzxsh-$vname.apk", tagPageUrl(vname))
+        if (!VERSION_NAME_RE.matches(vname)) {
+            throw UpdateCheckException("version.json has a malformed versionName")
+        }
+        val sha = vj.optString("sha256").takeIf { SHA256_RE.matches(it) }?.lowercase()
+        return Release(code, vname, "", apkUrlFor(vname), "arzxsh-$vname.apk", tagPageUrl(vname), sha)
     }
 
     /**
@@ -209,30 +238,44 @@ object UpdateChecker {
         val notes = root.optString("body")
         val assets = root.optJSONArray("assets")
             ?: throw UpdateCheckException("release JSON has no asset list")
-        var apkUrl: String? = null
-        var apkName: String? = null
         var versionJsonUrl: String? = null
+        // 0.6.13 audit fix: an asset URL is only ever trusted
+        // when it is https AND hosted by GitHub itself — the
+        // asset list is remote data, and "first .apk wins" let
+        // any asset (or a tampered listing) choose the binary.
+        fun trustedAssetUrl(url: String): Boolean {
+            if (!url.startsWith("https://")) return false
+            val host = try {
+                URL(url).host
+            } catch (_: Exception) {
+                null
+            } ?: return false
+            return host == "github.com" || host.endsWith(".githubusercontent.com")
+        }
+        val apkAssets = ArrayList<Pair<String, String>>()
         for (i in 0 until assets.length()) {
             val a = assets.optJSONObject(i) ?: continue
             val name = a.optString("name")
             val url = a.optString("browser_download_url")
-            if (!url.startsWith("https://")) continue
+            if (!trustedAssetUrl(url)) continue
             when {
                 name == "version.json" -> versionJsonUrl = url
-                name.endsWith(".apk") && apkUrl == null -> {
-                    apkUrl = url
-                    apkName = name
-                }
+                name.endsWith(".apk") -> apkAssets += name to url
             }
         }
-        val apk = apkUrl ?: throw UpdateCheckException("latest release has no APK asset")
         var code = -1
         var vname = tag.removePrefix("v")
+        var sha: String? = null
         if (versionJsonUrl != null) {
             try {
                 val vj = JSONObject(getText(versionJsonUrl, "application/octet-stream"))
                 code = vj.optInt("versionCode", -1)
-                vj.optString("versionName").takeIf { it.isNotEmpty() }?.let { vname = it }
+                // A versionName out of remote JSON must pass the
+                // same strict shape check as the primary path;
+                // a malformed one is ignored, never interpolated.
+                vj.optString("versionName").removePrefix("v")
+                    .takeIf { VERSION_NAME_RE.matches(it) }?.let { vname = it }
+                sha = vj.optString("sha256").takeIf { SHA256_RE.matches(it) }?.lowercase()
             } catch (_: Exception) {
                 // Fall through to the tag fallback below.
             }
@@ -246,7 +289,12 @@ object UpdateChecker {
             val installedCode = installedVersionCode(ctx)
             code = if (nameIsNewer(vname, installedName)) installedCode + 1 else installedCode
         }
-        return Release(code, vname, notes, apk, apkName ?: "arzxsh.apk", pageUrl)
+        // The APK asset must be THE contract asset for this
+        // version — never "some .apk attached to the release".
+        val expectedName = "arzxsh-$vname.apk"
+        val apk = apkAssets.firstOrNull { it.first == expectedName }
+            ?: throw UpdateCheckException("latest release has no $expectedName asset")
+        return Release(code, vname, notes, apk.second, apk.first, pageUrl, sha)
     }
 
     /** One-byte range probe proving a constructed APK URL
@@ -319,11 +367,28 @@ object UpdateChecker {
     private fun apkFile(ctx: Context, rel: Release): File =
         File(File(ctx.cacheDir, "updates").apply { mkdirs() }, "arzxsh-${rel.versionName}.apk")
 
-    /** The already-downloaded APK for [rel], if present: after
-     *  the unknown-sources grant detour, tapping Update again
-     *  goes straight to the installer. */
-    fun downloadedApk(ctx: Context, rel: Release): File? =
-        apkFile(ctx, rel).takeIf { it.exists() && it.length() > 0 }
+    /** The already-downloaded APK for [rel], if present AND
+     *  verified: after the unknown-sources grant detour, tapping
+     *  Update again goes straight to the installer. 0.6.13 audit
+     *  fix: an existing file is no longer trusted for merely
+     *  existing — without the release's SHA-256, or with a digest
+     *  that does not match, the file is deleted and the caller
+     *  falls through to a fresh (verified) download. */
+    fun downloadedApk(ctx: Context, rel: Release): File? {
+        val f = apkFile(ctx, rel)
+        if (!f.exists() || f.length() == 0L) return null
+        val expected = rel.sha256
+        val ok = expected != null && try {
+            sha256Of(f) == expected
+        } catch (_: Exception) {
+            false
+        }
+        if (!ok) {
+            f.delete()
+            return null
+        }
+        return f
+    }
 
     /**
      * Downloads the release APK into the app's cache dir.
@@ -341,8 +406,18 @@ object UpdateChecker {
         val appCtx = ctx.applicationContext
         ioExecutor.execute {
             val dest = apkFile(appCtx, rel)
-            if (dest.exists() && dest.length() > 0) {
-                onDone(dest, null)
+            // 0.6.13 audit fix: an update is installed ONLY when
+            // it can be verified against the release's SHA-256.
+            // A release with no hash on record is refused up
+            // front — an unverifiable binary is never handed to
+            // the system installer.
+            val expected = rel.sha256
+            if (expected == null) {
+                onDone(null, "this release carries no checksum to verify the download against")
+                return@execute
+            }
+            downloadedApk(appCtx, rel)?.let { verified ->
+                onDone(verified, null)
                 return@execute
             }
             val tmp = File(dest.parentFile, dest.name + ".part")
@@ -362,10 +437,10 @@ object UpdateChecker {
                     throw UpdateCheckException(httpDetail(code, errBody))
                 }
                 val total = conn.contentLengthLong
+                var read = 0L
                 conn.inputStream.use { input ->
                     tmp.outputStream().use { out ->
                         val buf = ByteArray(64 * 1024)
-                        var read = 0L
                         var lastPct = -1
                         while (true) {
                             val n = input.read(buf)
@@ -382,10 +457,25 @@ object UpdateChecker {
                         }
                     }
                 }
+                // A stream that ends early (or overruns) is a
+                // corrupt update: it is deleted by the catch
+                // below, never renamed into place (0.6.13).
+                if (total > 0 && read != total) {
+                    throw UpdateCheckException("truncated download ($read of $total bytes)")
+                }
                 if (tmp.length() == 0L) throw UpdateCheckException("empty download")
                 if (!tmp.renameTo(dest)) {
                     tmp.copyTo(dest, overwrite = true)
                     tmp.delete()
+                }
+                // The final gate: the bytes on disk must BE the
+                // release the user was offered. A mismatch means
+                // the file is deleted and the error surfaces —
+                // the installer is never launched on it.
+                val actual = sha256Of(dest)
+                if (actual != expected) {
+                    dest.delete()
+                    throw UpdateCheckException("checksum mismatch — download discarded")
                 }
                 onProgress(100)
                 onDone(dest, null)
@@ -395,5 +485,115 @@ object UpdateChecker {
                 onDone(null, detail)
             }
         }
+    }
+
+    // ------------------------------------------------------------ pending-update reminders (0.6.13)
+
+    /**
+     * A found-but-not-installed update is REMEMBERED (Arz's
+     * rule): one notification when it is first seen, ONE more
+     * after 48h if it is still not installed, then silence; and
+     * the in-app prompt may reappear at most once per 24h. The
+     * record dies the moment the installed version catches up.
+     * All state is four small preference values; the activity
+     * owns the dialog and the notification, this object owns
+     * the bookkeeping.
+     */
+    private const val REMINDER_PREFS = "arzxsh_update_reminders"
+    private const val KEY_CODE = "pending_code"
+    private const val KEY_NAME = "pending_name"
+    private const val KEY_SHA = "pending_sha256"
+    private const val KEY_FIRST_SEEN = "pending_first_seen"
+    private const val KEY_LAST_REMINDED = "pending_last_reminded"
+    private const val KEY_NOTIF_COUNT = "pending_notif_count"
+    private const val KEY_NOTIF_LAST = "pending_notif_last"
+
+    const val REMIND_AFTER_MS = 24L * 3600L * 1000L
+    const val SECOND_NOTIF_AFTER_MS = 48L * 3600L * 1000L
+
+    private fun reminderPrefs(ctx: Context) =
+        ctx.getSharedPreferences(REMINDER_PREFS, Context.MODE_PRIVATE)
+
+    /** Records [rel] as the pending update (called whenever a
+     *  check finds it newer than the installed build). A NEWER
+     *  version than the recorded one resets the reminder clock;
+     *  re-seeing the same version changes nothing. A release
+     *  that is not newer clears any stale record instead. */
+    fun recordPending(ctx: Context, rel: Release) {
+        if (rel.versionCode <= installedVersionCode(ctx)) {
+            clearPending(ctx)
+            return
+        }
+        val p = reminderPrefs(ctx)
+        if (p.getInt(KEY_CODE, -1) == rel.versionCode) return
+        p.edit()
+            .putInt(KEY_CODE, rel.versionCode)
+            .putString(KEY_NAME, rel.versionName)
+            .putString(KEY_SHA, rel.sha256)
+            .putLong(KEY_FIRST_SEEN, System.currentTimeMillis())
+            .putLong(KEY_LAST_REMINDED, 0L)
+            .putInt(KEY_NOTIF_COUNT, 0)
+            .putLong(KEY_NOTIF_LAST, 0L)
+            .apply()
+    }
+
+    /** The pending update as a [Release], reconstructed from
+     *  the naming contract (no network), or null when there is
+     *  none — including when the installed build has caught up,
+     *  which clears the record on the spot. */
+    fun pendingRelease(ctx: Context): Release? {
+        val p = reminderPrefs(ctx)
+        val code = p.getInt(KEY_CODE, -1)
+        if (code < 0) return null
+        if (installedVersionCode(ctx) >= code) {
+            clearPending(ctx)
+            return null
+        }
+        val name = p.getString(KEY_NAME, null)?.takeIf { VERSION_NAME_RE.matches(it) }
+            ?: run {
+                clearPending(ctx)
+                return null
+            }
+        val sha = p.getString(KEY_SHA, null)?.takeIf { SHA256_RE.matches(it) }
+        return Release(code, name, "", apkUrlFor(name), "arzxsh-$name.apk", tagPageUrl(name), sha)
+    }
+
+    fun pendingLastReminded(ctx: Context): Long =
+        reminderPrefs(ctx).getLong(KEY_LAST_REMINDED, 0L)
+
+    /** Stamps the in-app prompt as shown just now, so it can
+     *  reappear at most once per [REMIND_AFTER_MS]. */
+    fun markReminded(ctx: Context) {
+        val p = reminderPrefs(ctx)
+        if (p.getInt(KEY_CODE, -1) < 0) return
+        p.edit().putLong(KEY_LAST_REMINDED, System.currentTimeMillis()).apply()
+    }
+
+    /** True when a notification is owed for the pending
+     *  version: the first one, or the single 48h follow-up.
+     *  Never a third. */
+    fun notificationDue(ctx: Context): Boolean {
+        val p = reminderPrefs(ctx)
+        val code = p.getInt(KEY_CODE, -1)
+        if (code < 0 || installedVersionCode(ctx) >= code) return false
+        return when (p.getInt(KEY_NOTIF_COUNT, 0)) {
+            0 -> true
+            1 -> System.currentTimeMillis() - p.getLong(KEY_NOTIF_LAST, 0L) >=
+                SECOND_NOTIF_AFTER_MS
+            else -> false
+        }
+    }
+
+    fun markNotified(ctx: Context) {
+        val p = reminderPrefs(ctx)
+        if (p.getInt(KEY_CODE, -1) < 0) return
+        p.edit()
+            .putInt(KEY_NOTIF_COUNT, p.getInt(KEY_NOTIF_COUNT, 0) + 1)
+            .putLong(KEY_NOTIF_LAST, System.currentTimeMillis())
+            .apply()
+    }
+
+    fun clearPending(ctx: Context) {
+        reminderPrefs(ctx).edit().clear().apply()
     }
 }

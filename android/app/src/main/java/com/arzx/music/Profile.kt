@@ -172,6 +172,12 @@ object Profile {
                     return false
                 }
             }
+            // 0.6.13 audit fix: the intermediate bitmaps are
+            // dead once compressed — recycle each DISTINCT
+            // instance (createBitmap can return the source
+            // itself when the crop is the whole image, so
+            // identity, not role, decides).
+            listOf(src, cropped, scaled).distinct().forEach { it.recycle() }
             if (!tmp.renameTo(dest)) {
                 tmp.copyTo(dest, overwrite = true)
                 tmp.delete()

@@ -187,6 +187,11 @@ class PlaybackService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // The artwork loader's file: allowlist anchor (0.6.13):
+        // set here as well as in the activity, since the
+        // service can be the first component up in a fresh
+        // process and it reads artwork through the loader.
+        ArtworkLoader.appFilesDir = filesDir
         val nm = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= 26) {
             nm?.createNotificationChannel(

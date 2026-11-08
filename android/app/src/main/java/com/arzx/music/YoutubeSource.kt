@@ -42,30 +42,52 @@ private class HttpDownloader : Downloader() {
             values.forEach { value -> conn.addRequestProperty(name, value) }
         }
         conn.setRequestProperty("Accept-Encoding", "gzip")
-        val data = request.dataToSend()
-        if (data != null) {
-            conn.doOutput = true
-            conn.outputStream.use { it.write(data) }
-        }
-        val code = conn.responseCode
-        val raw: InputStream? = if (code in 200..299) conn.inputStream else conn.errorStream
-        var body = ""
-        if (raw != null) {
-            val encoding = conn.getHeaderField("Content-Encoding") ?: ""
-            val decoded: InputStream = when {
-                encoding.contains("gzip", ignoreCase = true) -> GZIPInputStream(raw)
-                encoding.contains("deflate", ignoreCase = true) -> InflaterInputStream(raw)
-                else -> raw
+        try {
+            val data = request.dataToSend()
+            if (data != null) {
+                conn.doOutput = true
+                conn.outputStream.use { it.write(data) }
             }
-            body = decoded.use { s ->
-                val buf = ByteArrayOutputStream()
-                s.copyTo(buf)
-                buf.toString(Charsets.UTF_8.name())
+            val code = conn.responseCode
+            val raw: InputStream? = if (code in 200..299) conn.inputStream else conn.errorStream
+            var body = ""
+            if (raw != null) {
+                val encoding = conn.getHeaderField("Content-Encoding") ?: ""
+                val decoded: InputStream = when {
+                    encoding.contains("gzip", ignoreCase = true) -> GZIPInputStream(raw)
+                    encoding.contains("deflate", ignoreCase = true) -> InflaterInputStream(raw)
+                    else -> raw
+                }
+                body = decoded.use { s ->
+                    // 0.6.13 audit fix: a response body is
+                    // buffered whole, so it is CAPPED — a hostile
+                    // or broken endpoint must not be able to grow
+                    // memory until the process dies.
+                    val buf = ByteArrayOutputStream()
+                    val chunk = ByteArray(64 * 1024)
+                    var total = 0
+                    while (true) {
+                        val n = s.read(chunk)
+                        if (n < 0) break
+                        total += n
+                        if (total > MAX_BODY_BYTES) {
+                            throw java.io.IOException("response body too large")
+                        }
+                        buf.write(chunk, 0, n)
+                    }
+                    buf.toString(Charsets.UTF_8.name())
+                }
             }
+            val headers = HashMap<String, List<String>>()
+            conn.headerFields.forEach { (name, values) -> if (name != null) headers[name] = values }
+            return Response(code, conn.responseMessage ?: "", headers, body, conn.url.toString())
+        } finally {
+            conn.disconnect()
         }
-        val headers = HashMap<String, List<String>>()
-        conn.headerFields.forEach { (name, values) -> if (name != null) headers[name] = values }
-        return Response(code, conn.responseMessage ?: "", headers, body, conn.url.toString())
+    }
+
+    private companion object {
+        const val MAX_BODY_BYTES = 16 * 1024 * 1024
     }
 }
 
@@ -199,6 +221,12 @@ object YoutubeSource {
      * first. Throws on extraction/network failure.
      */
     fun resolveAudioUrl(videoId: String, quality: String = "high"): String? {
+        // 0.6.13 audit fix: the id is interpolated into the watch
+        // URL — anything that is not shaped like a video id fails
+        // fast instead of smuggling path/query into the request.
+        if (!Regex("^[A-Za-z0-9_-]{6,20}$").matches(videoId)) {
+            throw IllegalArgumentException("invalid video id")
+        }
         ensureInit()
         val extractor = ServiceList.YouTube.getStreamExtractor(
             "https://www.youtube.com/watch?v=$videoId"
@@ -216,7 +244,10 @@ object YoutubeSource {
             else -> m4a.maxByOrNull { it.averageBitrate }
                 ?: streams.maxByOrNull { it.averageBitrate }
         }
-        return best?.content?.takeIf { it.isNotEmpty() }
+        // Only https stream URLs are ever handed to the player /
+        // downloader (0.6.13): a cleartext or scheme-relative
+        // answer is treated as no stream at all.
+        return best?.content?.takeIf { it.startsWith("https://") }
     }
 }
 
@@ -330,6 +361,14 @@ object StreamResolver {
 
     fun rememberGood(videoId: String, quality: String, resolved: Resolved) {
         if (resolved.url == null) return
+        // 0.6.13 audit fix: the cache was unbounded — over a
+        // long session every resolved track+quality pair stayed
+        // resident forever. Capped at ~64 entries, oldest first
+        // out (the 5-minute TTL already makes old entries the
+        // least valuable).
+        if (goodCache.size >= 64 && !goodCache.containsKey(goodKey(videoId, quality))) {
+            goodCache.entries.minByOrNull { it.value.atMs }?.let { goodCache.remove(it.key) }
+        }
         goodCache[goodKey(videoId, quality)] = CachedGood(resolved, System.currentTimeMillis())
     }
 

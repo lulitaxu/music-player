@@ -249,11 +249,43 @@ object Downloads {
     fun resumeInterruptedAsync(ctx: Context, quality: String) {
         val appCtx = ctx.applicationContext
         dlExecutor.execute {
-            dir(appCtx).listFiles()?.forEach { if (it.name.endsWith(".part")) it.delete() }
+            // Orphan sweep (0.6.13 audit fixes): .part files AND
+            // .segN segment files — but NEVER a file belonging
+            // to a transfer running right now. This executor is
+            // process-lifetime, so a call landing mid-transfer
+            // used to unlink live temp files out from under the
+            // writers; their completion then failed on a dead
+            // inode. Active keys are matched by their sanitized
+            // file-name prefix.
+            val activePrefixes = synchronized(this@Downloads) {
+                activeKeys.map { it.replace(Regex("[^A-Za-z0-9_-]"), "_") }
+            }
+            fun ownedByActive(name: String): Boolean {
+                val base = name.removeSuffix(".part")
+                    .replace(Regex("""\.seg\d+$"""), "")
+                    .substringBeforeLast('.')
+                return activePrefixes.any {
+                    base == it || base.startsWith("$it-") || base.startsWith("$it.")
+                }
+            }
+            dir(appCtx).listFiles()?.forEach { f ->
+                val orphan = f.name.endsWith(".part") ||
+                    Regex(""".*\.seg\d+$""").matches(f.name)
+                if (orphan && !ownedByActive(f.name)) f.delete()
+            }
             val tracks = statusTrackMap(appCtx)
-            statusMap(appCtx).forEach { (k, s) ->
+            statusMap(appCtx).entries.toList().forEach { (k, s) ->
                 if (s.state == ST_QUEUED || s.state == ST_DOWNLOADING) {
-                    tracks[k]?.let { start(appCtx, it, quality) }
+                    val t = tracks[k]
+                    if (t != null) {
+                        start(appCtx, t, quality)
+                    } else {
+                        // A resumable state with NO track metadata
+                        // (corrupt state_tracks) can never resume
+                        // and must not render as "downloading"
+                        // forever — clear it (0.6.13).
+                        clearStatus(appCtx, k)
+                    }
                 }
             }
         }
@@ -288,11 +320,24 @@ object Downloads {
         cache?.let { return it }
         val raw = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString("items", null) ?: return emptyList()
-        val parsed = try {
-            val arr = JSONArray(raw)
-            List(arr.length()) { i ->
+        // 0.6.13 audit fix: entries parse PER ITEM. One malformed
+        // entry (an older build's shape, a torn write) used to
+        // fail the WHOLE array, the empty result was cached, and
+        // the next completion's writeAll persisted that empty
+        // list over the real index — every download orphaned by
+        // one bad row. Now a bad item is skipped, and a wholly
+        // unparseable blob is returned uncached so a later read
+        // can still recover.
+        val arr = try {
+            JSONArray(raw)
+        } catch (_: Exception) {
+            return emptyList()
+        }
+        val parsed = ArrayList<Entry>(arr.length())
+        for (i in 0 until arr.length()) {
+            try {
                 val o = arr.getJSONObject(i)
-                Entry(
+                parsed += Entry(
                     Track(
                         o.getString("id"), o.getString("title"), o.getString("artist"),
                         o.optInt("duration"),
@@ -303,9 +348,9 @@ object Downloads {
                     ),
                     o.getString("fileName")
                 )
+            } catch (_: Exception) {
+                // Skip the bad item; the rest of the index stands.
             }
-        } catch (_: Exception) {
-            emptyList()
         }
         cache = parsed
         return parsed
@@ -338,11 +383,38 @@ object Downloads {
 
     /** Deletes every downloaded file and clears the index. */
     fun removeAll(ctx: Context) {
-        entries(ctx).forEach { File(dir(ctx), it.fileName).delete() }
-        dir(ctx).listFiles()?.forEach { if (it.name.endsWith(".part")) it.delete() }
+        // 0.6.13 audit fix: transfers in flight get a "remove"
+        // stop intent FIRST, so a completion landing after the
+        // wipe lands in the removed branch instead of writing
+        // its entry (and file) straight back into the index.
+        val known = HashMap<String, Track>()
+        statusTrackMap(ctx).forEach { (k, t) -> known[k] = t }
+        entries(ctx).forEach { known[key(it.track)] = it.track }
+        val active = synchronized(this) { activeKeys.toList() }
+        active.forEach { k -> known[k]?.let { removePending(ctx, it) } }
+        entries(ctx).forEach { e ->
+            File(dir(ctx), e.fileName).delete()
+            deleteSegSiblings(ctx, e.fileName)
+        }
+        dir(ctx).listFiles()?.forEach { f ->
+            if (f.name.endsWith(".part") || Regex(""".*\.seg\d+$""").matches(f.name)) {
+                f.delete()
+            }
+        }
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .remove("states").remove("state_tracks").apply()
+        synchronized(this) {
+            statusCache?.clear()
+            statusTrackCache?.clear()
+        }
         writeAll(ctx, emptyList())
+    }
+
+    /** Segment temp files of one download ("<file>.seg0" …). */
+    private fun deleteSegSiblings(ctx: Context, fileName: String) {
+        dir(ctx).listFiles()?.forEach { f ->
+            if (f.name.startsWith("$fileName.seg")) f.delete()
+        }
     }
 
     /**
@@ -395,11 +467,26 @@ object Downloads {
                 }
             }
             SOURCE_LOCAL -> throw RuntimeException("already on this device")
-            else -> "https://api.audius.co/v1/tracks/${track.id}/stream?app_name=arzxsh"
+            // 0.6.13: the id is a URL PATH segment — encoded as
+            // one, so a `/`, `?` or `#` in bad metadata cannot
+            // rewrite the request.
+            else -> "https://api.audius.co/v1/tracks/" +
+                java.net.URLEncoder.encode(track.id, "UTF-8").replace("+", "%20") +
+                "/stream?app_name=arzxsh"
         }
         val ext = url.substringBefore("?").substringAfterLast('.', "").lowercase()
             .takeIf { it in setOf("m4a", "mp3", "opus", "webm", "aac", "ogg") } ?: "m4a"
-        val fileName = key(track).replace(Regex("[^A-Za-z0-9_-]"), "_") + "." + ext
+        // 0.6.13 audit fix: the sanitized key is LOSSY — two ids
+        // differing only in stripped characters used to map to
+        // the same file and overwrite each other. A short hash
+        // of the raw key keeps names collision-free. (Files
+        // downloaded before this keep their old names; only new
+        // downloads use the hashed scheme.)
+        val keyHash = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(key(track).toByteArray(Charsets.UTF_8))
+            .take(4).joinToString("") { "%02x".format(it) }
+        val fileName = key(track).replace(Regex("[^A-Za-z0-9_-]"), "_") +
+            "-" + keyHash + "." + ext
         val tmp = File(dir(ctx), "$fileName.part")
 
         fun openConn(u: String, range: String?): HttpURLConnection =
@@ -430,6 +517,13 @@ object Downloads {
                             if (n < 0) break
                             out.write(buf, 0, n)
                             read += n
+                            // 0.6.13: never write past the
+                            // declared length — a stream offering
+                            // MORE than it declared is aborted,
+                            // not stored.
+                            if (total > 0 && read > total) {
+                                throw RuntimeException("download larger than declared")
+                            }
                             if (total > 0) {
                                 val pct = (read * 100 / total).toInt().coerceIn(0, 99)
                                 if (pct != lastPct) {
@@ -437,6 +531,13 @@ object Downloads {
                                     onProgress(pct)
                                 }
                             }
+                        }
+                        // A connection that closes early yields
+                        // a SHORT file: refuse it instead of
+                        // indexing a truncated download as a
+                        // complete one (0.6.13 HIGH).
+                        if (total > 0 && read != total) {
+                            throw RuntimeException("truncated download")
                         }
                     }
                 }
@@ -477,13 +578,24 @@ object Downloads {
                                         BufferedOutputStream(segFiles[i].outputStream(), 256 * 1024).use { out ->
                                             val buf = ByteArray(256 * 1024)
                                             var segRead = 0L
+                                            val segExpected = end - start + 1
                                             while (true) {
                                                 if (!shouldContinue()) throw StoppedException()
                                                 if (failure.get() != null) throw RangeUnsupportedException()
                                                 val n = input.read(buf)
                                                 if (n < 0) break
-                                                out.write(buf, 0, n)
                                                 segRead += n
+                                                // 0.6.13: a 206 that
+                                                // streams PAST the
+                                                // requested range is
+                                                // aborted here, at
+                                                // the read — not
+                                                // after the excess
+                                                // already hit disk.
+                                                if (segRead > segExpected) {
+                                                    throw RangeUnsupportedException()
+                                                }
+                                                out.write(buf, 0, n)
                                                 val agg = downloaded.addAndGet(n.toLong())
                                                 val pct = (agg * 100 / total).toInt().coerceIn(0, 99)
                                                 synchronized(segFiles) {
@@ -600,106 +712,125 @@ object Downloads {
 
     @Synchronized
     fun remove(ctx: Context, track: Track) {
+        // 0.6.13: an in-flight transfer for this track gets its
+        // "remove" intent FIRST — its completion then lands in
+        // the removed branch instead of resurrecting the entry
+        // the user just deleted. (Also covers a track with no
+        // index entry yet, which the old body silently skipped.)
+        removePending(ctx, track)
         val all = entries(ctx)
         val entry = all.firstOrNull { key(it.track) == key(track) } ?: return
         File(dir(ctx), entry.fileName).delete()
+        deleteSegSiblings(ctx, entry.fileName)
         clearStatus(ctx, key(track))
         writeAll(ctx, all.filter { key(it.track) != key(track) })
     }
 
     // ------------------------------------------------------------ vault states
 
+    // 0.6.13 audit fix: the two vault maps live in MEMORY,
+    // loaded once, and persistence serializes the in-memory
+    // copy. setStatus runs on every progress tick (up to ~10
+    // per download × 3 parallel); the old code re-PARSED both
+    // full JSON blobs on every single call, inside the object
+    // monitor, stalling completions behind prefs reads.
+    @Volatile
+    private var statusCache: LinkedHashMap<String, Status>? = null
+
+    @Volatile
+    private var statusTrackCache: HashMap<String, Track>? = null
+
+    @Synchronized
     private fun statusMap(ctx: Context): LinkedHashMap<String, Status> {
+        statusCache?.let { return it }
         val out = LinkedHashMap<String, Status>()
         val raw = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getString("states", null) ?: return out
-        try {
-            val o = JSONObject(raw)
-            val keys = o.keys()
-            while (keys.hasNext()) {
-                val k = keys.next()
-                val s = o.getJSONObject(k)
-                out[k] = Status(
-                    s.getString("state"),
-                    s.optInt("progress"),
-                    s.optString("error", null)?.takeIf { it.isNotEmpty() }
-                )
+            .getString("states", null)
+        if (raw != null) {
+            try {
+                val o = JSONObject(raw)
+                val keys = o.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val s = o.getJSONObject(k)
+                    out[k] = Status(
+                        s.getString("state"),
+                        s.optInt("progress"),
+                        s.optString("error", null)?.takeIf { it.isNotEmpty() }
+                    )
+                }
+            } catch (_: Exception) {
             }
-        } catch (_: Exception) {
         }
+        statusCache = out
         return out
     }
 
     /** Track metadata for state rows, so the Downloads tab can
      *  render a failed/paused track without the file index. */
-    private fun statusTrackMap(ctx: Context): Map<String, Track> {
+    @Synchronized
+    private fun statusTrackMap(ctx: Context): MutableMap<String, Track> {
+        statusTrackCache?.let { return it }
+        val out = HashMap<String, Track>()
         val raw = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getString("state_tracks", null) ?: return emptyMap()
-        return try {
-            val o = JSONObject(raw)
-            val out = HashMap<String, Track>()
-            val keys = o.keys()
-            while (keys.hasNext()) {
-                val k = keys.next()
-                trackFromJson(o.getJSONObject(k))?.let { out[k] = it }
+            .getString("state_tracks", null)
+        if (raw != null) {
+            try {
+                val o = JSONObject(raw)
+                val keys = o.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    trackFromJson(o.getJSONObject(k))?.let { out[k] = it }
+                }
+            } catch (_: Exception) {
             }
-            out
-        } catch (_: Exception) {
-            emptyMap()
         }
+        statusTrackCache = out
+        return out
+    }
+
+    /** Serializes the in-memory maps. Callers hold the monitor
+     *  (every entry point below is @Synchronized). */
+    private fun persistStates(ctx: Context) {
+        val map = statusCache ?: return
+        val tracks = statusTrackCache ?: return
+        val o = JSONObject()
+        map.forEach { (k, s) ->
+            o.put(k, JSONObject().apply {
+                put("state", s.state)
+                put("progress", s.progress)
+                put("error", s.error ?: JSONObject.NULL)
+            })
+        }
+        val to = JSONObject()
+        tracks.forEach { (k, t) -> to.put(k, trackToJson(t)) }
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("states", o.toString())
+            .putString("state_tracks", to.toString())
+            .apply()
     }
 
     @Synchronized
     fun setStatus(ctx: Context, track: Track, state: String, progress: Int = 0, error: String? = null) {
-        val map = statusMap(ctx)
-        map[key(track)] = Status(state, progress, error)
-        val tracks = statusTrackMap(ctx).toMutableMap()
-        tracks[key(track)] = track
-        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val o = JSONObject()
-        map.forEach { (k, s) ->
-            o.put(k, JSONObject().apply {
-                put("state", s.state)
-                put("progress", s.progress)
-                put("error", s.error ?: JSONObject.NULL)
-            })
-        }
-        val to = JSONObject()
-        tracks.forEach { (k, t) -> to.put(k, trackToJson(t)) }
-        prefs.edit()
-            .putString("states", o.toString())
-            .putString("state_tracks", to.toString())
-            .apply()
+        statusMap(ctx)[key(track)] = Status(state, progress, error)
+        statusTrackMap(ctx)[key(track)] = track
+        persistStates(ctx)
     }
 
     @Synchronized
     fun clearStatus(ctx: Context, key: String) {
-        val map = statusMap(ctx)
-        if (map.remove(key) == null) return
-        val tracks = statusTrackMap(ctx).toMutableMap()
-        tracks.remove(key)
-        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val o = JSONObject()
-        map.forEach { (k, s) ->
-            o.put(k, JSONObject().apply {
-                put("state", s.state)
-                put("progress", s.progress)
-                put("error", s.error ?: JSONObject.NULL)
-            })
-        }
-        val to = JSONObject()
-        tracks.forEach { (k, t) -> to.put(k, trackToJson(t)) }
-        prefs.edit()
-            .putString("states", o.toString())
-            .putString("state_tracks", to.toString())
-            .apply()
+        if (statusMap(ctx).remove(key) == null) return
+        statusTrackMap(ctx).remove(key)
+        persistStates(ctx)
     }
 
     /** Status for a track not in the downloaded index, else null. */
+    @Synchronized
     fun statusOf(ctx: Context, track: Track): Status? =
         statusMap(ctx)[key(track)]
 
     /** All non-downloaded vault rows: (track, status), failed first. */
+    @Synchronized
     fun pendingRows(ctx: Context): List<Pair<Track, Status>> {
         val tracks = statusTrackMap(ctx)
         val downloaded = entries(ctx).map { key(it.track) }.toHashSet()

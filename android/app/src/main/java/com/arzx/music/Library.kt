@@ -68,21 +68,32 @@ object Playlists {
     fun all(ctx: Context): List<Playlist> {
         cached?.let { return it }
         val raw = prefs(ctx).getString(KEY, null) ?: return emptyList()
-        val parsed = try {
-            val arr = JSONArray(raw)
-            List(arr.length()) { i ->
+        // 0.6.13 audit fix: PER-ITEM parse. One malformed
+        // playlist object used to fail the whole array; the
+        // empty result was cached and the next write persisted
+        // it — every playlist gone because of one bad row. Bad
+        // items are skipped; a wholly unparseable blob is
+        // returned uncached.
+        val arr = try {
+            JSONArray(raw)
+        } catch (_: Exception) {
+            return emptyList()
+        }
+        val parsed = ArrayList<Playlist>(arr.length())
+        for (i in 0 until arr.length()) {
+            try {
                 val o = arr.getJSONObject(i)
                 val ta = o.optJSONArray("tracks") ?: JSONArray()
-                Playlist(
+                parsed += Playlist(
                     o.getString("id"),
                     o.optString("name", "Playlist"),
                     o.optLong("createdAt"),
                     List(ta.length()) { j -> trackFromJson(ta.getJSONObject(j)) }
                         .filterNotNull(),
                 )
+            } catch (_: Exception) {
+                // Skip the bad playlist; the rest stand.
             }
-        } catch (_: Exception) {
-            emptyList()
         }
         cached = parsed
         return parsed
@@ -106,10 +117,16 @@ object Playlists {
         prefs(ctx).edit().putString(KEY, arr.toString()).apply()
     }
 
+    // 0.6.13 audit fix: every read-modify-write mutator in
+    // this file is @Synchronized. The header invites calls
+    // "from any thread", and two concurrent updates used to
+    // interleave read → map → write and silently lose one.
+    @Synchronized
     private fun update(ctx: Context, id: String, change: (Playlist) -> Playlist) {
         write(ctx, all(ctx).map { if (it.id == id) change(it) else it })
     }
 
+    @Synchronized
     fun create(ctx: Context, name: String): Playlist {
         val p = Playlist(
             id = "pl_" + System.currentTimeMillis().toString(36) +
@@ -122,17 +139,20 @@ object Playlists {
         return p
     }
 
+    @Synchronized
     fun rename(ctx: Context, id: String, name: String) {
         val n = name.trim()
         if (n.isEmpty()) return
         update(ctx, id) { it.copy(name = n) }
     }
 
+    @Synchronized
     fun delete(ctx: Context, id: String) {
         write(ctx, all(ctx).filter { it.id != id })
     }
 
     /** Appends the track unless the playlist already holds it. */
+    @Synchronized
     fun addTrack(ctx: Context, id: String, track: Track): Boolean {
         var added = false
         update(ctx, id) { p ->
@@ -146,6 +166,7 @@ object Playlists {
         return added
     }
 
+    @Synchronized
     fun removeTrackAt(ctx: Context, id: String, index: Int) {
         update(ctx, id) { p ->
             if (index in p.tracks.indices) {
@@ -155,6 +176,7 @@ object Playlists {
     }
 
     /** Moves the track at [from] to [to] (explicit reorder control). */
+    @Synchronized
     fun moveTrack(ctx: Context, id: String, from: Int, to: Int) {
         update(ctx, id) { p ->
             if (from !in p.tracks.indices || to !in p.tracks.indices || from == to) {
@@ -223,11 +245,13 @@ object Favorites {
         prefs(ctx).edit().putString(KEY, arr.toString()).apply()
     }
 
+    @Synchronized
     fun add(ctx: Context, track: Track) {
         val cur = liked(ctx).filter { trackKey(it) != trackKey(track) }
         write(ctx, listOf(track) + cur)
     }
 
+    @Synchronized
     fun remove(ctx: Context, track: Track) {
         write(ctx, liked(ctx).filter { trackKey(it) != trackKey(track) })
     }
@@ -261,6 +285,7 @@ object PlayHistory {
     private fun prefs(ctx: Context) =
         ctx.getSharedPreferences(LIB_PREFS, Context.MODE_PRIVATE)
 
+    @Synchronized
     fun record(ctx: Context, track: Track) {
         val events = events(ctx).toMutableList()
         events.add(0, track to System.currentTimeMillis())
@@ -380,6 +405,7 @@ object LocalTracks {
     }
 
     /** Adds newly imported tracks, skipping URIs already imported. */
+    @Synchronized
     fun addAll(ctx: Context, tracks: List<Track>): Int {
         val cur = all(ctx)
         val known = cur.map { it.id }.toHashSet()
@@ -388,6 +414,7 @@ object LocalTracks {
         return fresh.size
     }
 
+    @Synchronized
     fun remove(ctx: Context, track: Track) {
         write(ctx, all(ctx).filter { it.id != track.id })
     }

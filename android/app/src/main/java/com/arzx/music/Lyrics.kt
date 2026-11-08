@@ -62,6 +62,16 @@ data class LyricsData(
 object Lyrics {
     private const val UA = "arzxsh/0.6.0 (personal music player; github.com/lulitaxu/music-player)"
     private const val MISS_TTL_MS = 7L * 24 * 3600 * 1000
+
+    /** A miss caused by every provider THROWING (offline, DNS,
+     *  provider down) is not knowledge — it expires in an hour
+     *  instead of suppressing retries for a week (0.6.13). */
+    private const val FAIL_MISS_TTL_MS = 3600 * 1000L
+
+    /** Positive results expire too (0.6.13): a wrong search-gate
+     *  match used to be permanent until a manual cache clear. */
+    private const val HIT_TTL_MS = 90L * 24 * 3600 * 1000
+    private const val MAX_CACHE_FILES = 1000
     private const val CACHE_VER = 2
 
     /** Per-provider outcomes of the most recent [fetch], for the
@@ -95,8 +105,13 @@ object Lyrics {
             if (o.optInt("ver") != CACHE_VER) return null
             val rep = o.optString("rep", "").takeIf { it.isNotEmpty() }
             if (o.optBoolean("miss")) {
-                val fresh = System.currentTimeMillis() - o.optLong("ts") < MISS_TTL_MS
+                val ttl = if (o.optBoolean("failMiss")) FAIL_MISS_TTL_MS else MISS_TTL_MS
+                val fresh = System.currentTimeMillis() - o.optLong("ts") < ttl
                 if (fresh) Cached(null, miss = true, report = rep) else null
+            } else if (System.currentTimeMillis() - o.optLong("ts") > HIT_TTL_MS) {
+                // Stale hit (pre-0.6.13 entries carry no ts and
+                // read as epoch 0 — they expire here too, once).
+                null
             } else {
                 val syncedArr = o.optJSONArray("synced")
                 val synced = syncedArr?.let { arr ->
@@ -122,14 +137,21 @@ object Lyrics {
         }
     }
 
-    private fun writeCache(ctx: Context, track: Track, data: LyricsData?, report: String = "") {
+    private fun writeCache(
+        ctx: Context,
+        track: Track,
+        data: LyricsData?,
+        report: String = "",
+        failMiss: Boolean = false
+    ) {
         try {
             val o = JSONObject()
             o.put("ver", CACHE_VER)
+            o.put("ts", System.currentTimeMillis())
             if (report.isNotEmpty()) o.put("rep", report)
             if (data == null) {
                 o.put("miss", true)
-                o.put("ts", System.currentTimeMillis())
+                if (failMiss) o.put("failMiss", true)
             } else {
                 o.put("source", data.source)
                 o.put("instrumental", data.instrumental)
@@ -142,9 +164,35 @@ object Lyrics {
                 data.plainLines.forEach { plain.put(it) }
                 o.put("plain", plain)
             }
-            cacheFile(ctx, track).writeText(o.toString())
+            // Atomic publish (0.6.13): fetch now also runs from
+            // download completion, concurrently with the lyrics
+            // screen — a bare writeText could interleave two
+            // writers into unparseable JSON. Temp + rename.
+            val dest = cacheFile(ctx, track)
+            val tmp = File(dest.parentFile, dest.name + ".tmp")
+            tmp.writeText(o.toString())
+            if (!tmp.renameTo(dest)) {
+                tmp.copyTo(dest, overwrite = true)
+                tmp.delete()
+            }
+            evictCacheOverflow(ctx, keep = dest)
         } catch (_: Exception) {
             // Cache failure must never break lyrics display.
+        }
+    }
+
+    /** Bounds the cache directory (0.6.13): one file per track
+     *  ever fetched grew without limit. Oldest files beyond
+     *  [MAX_CACHE_FILES] are evicted on write. */
+    private fun evictCacheOverflow(ctx: Context, keep: File) {
+        try {
+            val files = dir(ctx).listFiles() ?: return
+            if (files.size <= MAX_CACHE_FILES) return
+            files.filter { it != keep }
+                .sortedBy { it.lastModified() }
+                .take(files.size - MAX_CACHE_FILES)
+                .forEach { it.delete() }
+        } catch (_: Exception) {
         }
     }
 
@@ -173,7 +221,14 @@ object Lyrics {
             ?: lyricsOvh(cleanTitle, cleanArtist, notes)
             ?: if (changed) lyricsOvh(track.title, track.artist, notes) else null
         lastReport = notes.joinToString(" · ")
-        writeCache(ctx, track, result, lastReport)
+        // A miss only earns the long TTL when at least one
+        // provider actually ANSWERED (an HTTP status came back).
+        // If every attempt threw — offline, DNS, providers down —
+        // the miss is a failure, cached for an hour, not a week.
+        val anyResponse = notes.any {
+            it.contains("HTTP ") || Regex(""": 200\b""").containsMatchIn(it)
+        }
+        writeCache(ctx, track, result, lastReport, failMiss = result == null && !anyResponse)
         return result
     }
 
@@ -237,10 +292,30 @@ object Lyrics {
             setRequestProperty("User-Agent", UA)
             setRequestProperty("Accept", "application/json")
         }
-        val code = conn.responseCode
-        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-        val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
-        return code to text
+        try {
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            // 0.6.13: capped read — the old readText() buffered
+            // an unbounded response (search payloads are partly
+            // attacker-influenceable via track metadata).
+            // Overflow throws and counts as a provider failure.
+            val text = stream?.bufferedReader()?.use { reader ->
+                val sb = StringBuilder()
+                val buf = CharArray(8192)
+                while (true) {
+                    val n = reader.read(buf)
+                    if (n < 0) break
+                    sb.append(buf, 0, n)
+                    if (sb.length > 2 * 1024 * 1024) {
+                        throw java.io.IOException("lyrics response too large")
+                    }
+                }
+                sb.toString()
+            } ?: ""
+            return code to text
+        } finally {
+            conn.disconnect()
+        }
     }
 
     private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
@@ -373,7 +448,13 @@ object Lyrics {
             notes += "lyrics.ovh: skipped (no artist)"
             null
         } else {
-            val url = "https://api.lyrics.ovh/v1/" + enc(artist) + "/" + enc(title)
+            // Path segments, not a query string: the form
+            // encoder's "+" for spaces is NOT decoded as a
+            // space in a path, so multi-word artists/titles
+            // 404'd here (0.6.13). Query-string uses of enc()
+            // elsewhere are correct as they are.
+            val url = "https://api.lyrics.ovh/v1/" +
+                enc(artist).replace("+", "%20") + "/" + enc(title).replace("+", "%20")
             val (code, text) = get(url)
             if (code != 200) {
                 notes += "lyrics.ovh: HTTP $code"

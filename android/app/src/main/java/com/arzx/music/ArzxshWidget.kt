@@ -64,6 +64,17 @@ object ArzxshWidget {
     @Volatile
     private var artForKey: String? = null
 
+    /** The rounded copy of [artBitmap] (0.6.13 audit fix):
+     *  [roundedArt] allocated a fresh bitmap on EVERY render —
+     *  and renders happen per state push. The rounded copy is
+     *  cached against its source bitmap instance; a new source
+     *  (track change) is the only thing that recomputes it. */
+    @Volatile
+    private var roundedArtBitmap: Bitmap? = null
+
+    @Volatile
+    private var roundedArtSource: Bitmap? = null
+
     /** Signature of the last pushed render. The funnel can fire
      *  several snapshots for one user action; identical renders
      *  are dropped here instead of IPC-spamming the launcher
@@ -83,9 +94,13 @@ object ArzxshWidget {
         if (state == null) {
             artBitmap = null
             artForKey = null
+            roundedArtBitmap = null
+            roundedArtSource = null
         } else if (artForKey != state.trackKey) {
             artForKey = state.trackKey
             artBitmap = null
+            roundedArtBitmap = null
+            roundedArtSource = null
             val url = state.artworkUrl
             if (url != null) {
                 ArtworkLoader.bitmapFor(url, 256) { bmp ->
@@ -140,6 +155,15 @@ object ArzxshWidget {
      *  pre-rounded on a canvas — the widget's art used to sit in
      *  the rounded card with square corners poking out of it.
      *  Runs only on state-change renders, never per frame. */
+    private fun roundedArtCached(context: Context, src: Bitmap): Bitmap {
+        val hit = roundedArtBitmap
+        if (hit != null && roundedArtSource === src) return hit
+        val out = roundedArt(context, src)
+        roundedArtBitmap = out
+        roundedArtSource = src
+        return out
+    }
+
     private fun roundedArt(context: Context, src: Bitmap): Bitmap {
         val radius = 14f * context.resources.displayMetrics.density
         val out = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
@@ -161,7 +185,7 @@ object ArzxshWidget {
         views.setTextViewText(R.id.widget_artist, s?.artist ?: "Tap to open")
         val art = artBitmap
         if (s != null && art != null) {
-            views.setImageViewBitmap(R.id.widget_art, roundedArt(context, art))
+            views.setImageViewBitmap(R.id.widget_art, roundedArtCached(context, art))
         } else {
             views.setImageViewResource(R.id.widget_art, R.drawable.ic_logo)
         }

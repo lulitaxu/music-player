@@ -77,6 +77,10 @@ kotlin {
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
+    // Pull-to-refresh (0.6.13): the shell's one ScrollView sits
+    // inside a SwipeRefreshLayout; a pull re-runs the current
+    // screen's own loader.
+    implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0")
     // RecyclerView (0.6.3, audit S1): the queue overlay is the
     // one list that owns its viewport, so it gets true view
     // recycling. (Shell screens live inside one big ScrollView

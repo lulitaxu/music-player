@@ -177,16 +177,33 @@ object YtmApi {
     }
 
     private fun readBody(conn: HttpURLConnection, raw: InputStream): String {
-        val encoding = conn.getHeaderField("Content-Encoding") ?: ""
-        val decoded: InputStream = when {
-            encoding.contains("gzip", ignoreCase = true) -> GZIPInputStream(raw)
-            encoding.contains("deflate", ignoreCase = true) -> InflaterInputStream(raw)
-            else -> raw
-        }
-        return decoded.use { s ->
-            val buf = ByteArrayOutputStream()
-            s.copyTo(buf)
-            buf.toString(Charsets.UTF_8.name())
+        // 0.6.13 audit fix: bodies are buffered whole, so reads
+        // are capped (~16MB) and the connection is always
+        // released — callers never touch [conn] after this.
+        try {
+            val encoding = conn.getHeaderField("Content-Encoding") ?: ""
+            val decoded: InputStream = when {
+                encoding.contains("gzip", ignoreCase = true) -> GZIPInputStream(raw)
+                encoding.contains("deflate", ignoreCase = true) -> InflaterInputStream(raw)
+                else -> raw
+            }
+            return decoded.use { s ->
+                val buf = ByteArrayOutputStream()
+                val chunk = ByteArray(64 * 1024)
+                var total = 0
+                while (true) {
+                    val n = s.read(chunk)
+                    if (n < 0) break
+                    total += n
+                    if (total > 16 * 1024 * 1024) {
+                        throw RuntimeException("Innertube response too large")
+                    }
+                    buf.write(chunk, 0, n)
+                }
+                buf.toString(Charsets.UTF_8.name())
+            }
+        } finally {
+            conn.disconnect()
         }
     }
 
@@ -1096,7 +1113,11 @@ object YtmApi {
                 val f = arr.optJSONObject(i) ?: continue
                 val mime = f.optString("mimeType")
                 if (!progressive && !mime.startsWith("audio/")) continue
-                val url = f.optString("url").takeIf { it.isNotEmpty() }
+                // 0.6.13: only https URLs are ever candidates —
+                // a cleartext stream URL is treated as absent
+                // (the app is usesCleartextTraffic=false anyway,
+                // so it could only ever fail downstream).
+                val url = f.optString("url").takeIf { it.startsWith("https://") }
                 if (url != null) {
                     candidates.add(StreamCandidate(f.optInt("bitrate"), url, progressive))
                 } else if (f.has("signatureCipher") || f.has("cipher")) {
@@ -1199,7 +1220,16 @@ object YtmApi {
      */
     fun resolveStream(videoId: String, quality: String = "normal"): YtmStreamResult {
         val attempts = ArrayList<String>()
+        // 0.6.13 audit fix: an overall deadline for the walk —
+        // five contexts at up to 8s each plus the visitor fetch
+        // could otherwise stack past a minute before the caller
+        // (a download, the gapless prep) saw any answer at all.
+        val deadline = System.currentTimeMillis() + 30_000L
         for (label in streamAttemptLabels()) {
+            if (attempts.isNotEmpty() && System.currentTimeMillis() > deadline) {
+                attempts += "deadline reached (30s) — remaining contexts skipped"
+                break
+            }
             val r = resolveStreamAttempt(videoId, quality, label)
             if (r.url != null) return r
             attempts += r.report

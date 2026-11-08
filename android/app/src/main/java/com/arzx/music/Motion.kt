@@ -161,7 +161,26 @@ object MotionPress {
     private const val SECONDARY_DAMPING = 0.70f
     private const val SECONDARY_STIFFNESS = 900f
 
+    /** Attachment markers (0.6.13 audit fix): attach() REPLACES
+     *  the view's touch listener, so a second attach on the same
+     *  view silently discarded the first press treatment (and
+     *  any other listener the view owned). A debug guard now
+     *  makes the double-attach loud instead of silent. A
+     *  registry marker rather than View.setTag: several views
+     *  here already use their tag (the artwork loader's load
+     *  key), and clobbering it would break image delivery.
+     *  UI-thread confined, like the Springs registry. */
+    private val attached = WeakHashMap<View, Boolean>()
+
     fun attach(view: View, primary: Boolean, off: () -> Boolean) {
+        if (attached.containsKey(view)) {
+            android.util.Log.w(
+                "MotionPress",
+                "attach() called twice on the same view — second call ignored"
+            )
+            return
+        }
+        attached[view] = true
         val damping = if (primary) PRIMARY_DAMPING else SECONDARY_DAMPING
         val stiffness = if (primary) PRIMARY_STIFFNESS else SECONDARY_STIFFNESS
         view.setOnTouchListener { v, e ->

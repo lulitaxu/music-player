@@ -1,6 +1,10 @@
 package com.arzx.music
 
 import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
@@ -38,6 +42,7 @@ import android.util.LruCache
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.ViewTreeObserver
 import android.view.VelocityTracker
 import android.view.View
 import android.view.ViewConfiguration
@@ -51,11 +56,16 @@ import android.view.animation.LinearInterpolator
 import android.view.animation.PathInterpolator
 import android.view.inputmethod.EditorInfo
 import android.widget.*
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import org.json.JSONArray
 import org.json.JSONObject
+import java.lang.ref.WeakReference
 import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.net.URL
@@ -123,6 +133,47 @@ object ArtworkLoader {
     /** Hero art, blurred backdrops and ambient sampling: the
      *  player's surfaces never wait behind list rows. */
     private val heroPool = Executors.newSingleThreadExecutor()
+
+    /** The app's internal files dir, anchored by MainActivity /
+     *  PlaybackService on create (0.6.13 audit fix): file: artwork
+     *  URLs are only ever honored under its local_art directory —
+     *  a track whose metadata points at an arbitrary local path
+     *  must not get that file read and rendered. */
+    @Volatile
+    var appFilesDir: java.io.File? = null
+
+    /** In-flight decodes by "url@bucket" (0.6.13 audit fix):
+     *  concurrent loads of the same image (row + mini + hero in
+     *  one frame burst) used to each fetch and decode it; they
+     *  now share the leader's single fetch/decode. */
+    private val inFlight = HashMap<String, ArrayList<(Bitmap?) -> Unit>>()
+
+    private fun decodeShared(
+        url: String,
+        bucket: Int,
+        exec: java.util.concurrent.Executor,
+        cb: (Bitmap?) -> Unit
+    ) {
+        val key = "$url@$bucket"
+        synchronized(inFlight) {
+            val waiters = inFlight[key]
+            if (waiters != null) {
+                waiters.add(cb)
+                return
+            }
+            inFlight[key] = arrayListOf(cb)
+        }
+        exec.execute {
+            val bmp = try {
+                decode(url, bucket)
+            } catch (_: Throwable) {
+                null
+            }
+            if (bmp != null) cache.put(key, bmp)
+            val cbs = synchronized(inFlight) { inFlight.remove(key) } ?: emptyList()
+            cbs.forEach { it(bmp) }
+        }
+    }
 
     /** Bytes currently held by the in-memory artwork cache. */
     fun cacheBytes(): Long = cache.snapshot().values.sumOf { it.byteCount.toLong() }
@@ -193,20 +244,40 @@ object ArtworkLoader {
         into.setImageDrawable(null)
         // Hero-size work jumps the row queue (audit S3).
         val exec = if (bucket >= 1024) heroPool else pool
-        exec.execute {
-            var bmp = decode(url, bucket)
-            if (bmp != null) {
-                cache.put(key, bmp)
-            } else if (!fallbackUrl.isNullOrEmpty() && fallbackUrl != url) {
-                bmp = decode(fallbackUrl, bucket)
-                if (bmp != null) cache.put(key, bmp)
-            }
-            val result = bmp
-            into.post {
-                if (result != null && into.tag == key) {
+        // Delivery (0.6.13 audit fix): results land via the MAIN
+        // handler — never on the decode thread — and only while
+        // the view still wants THIS load (tag match). A view
+        // that is not attached yet gets one chance on attach;
+        // a recycled or re-purposed view never receives it.
+        fun deliver(result: Bitmap?) {
+            if (result == null) return
+            Handler(Looper.getMainLooper()).post {
+                if (into.tag != key) return@post
+                if (into.isAttachedToWindow) {
                     into.setImageBitmap(result)
                     onReady?.invoke()
+                } else {
+                    into.addOnAttachStateChangeListener(
+                        object : View.OnAttachStateChangeListener {
+                            override fun onViewAttachedToWindow(v: View) {
+                                v.removeOnAttachStateChangeListener(this)
+                                if (v.tag == key) {
+                                    into.setImageBitmap(result)
+                                    onReady?.invoke()
+                                }
+                            }
+
+                            override fun onViewDetachedFromWindow(v: View) {}
+                        }
+                    )
                 }
+            }
+        }
+        decodeShared(url, bucket, exec) { bmp ->
+            if (bmp != null) {
+                deliver(bmp)
+            } else if (!fallbackUrl.isNullOrEmpty() && fallbackUrl != url) {
+                decodeShared(fallbackUrl, bucket, exec) { fb -> deliver(fb) }
             }
         }
     }
@@ -223,9 +294,7 @@ object ArtworkLoader {
             Handler(Looper.getMainLooper()).post { onReady(bmp) }
             return
         }
-        heroPool.execute {
-            val bmp = decode(url, bucket)
-            if (bmp != null) cache.put(key, bmp)
+        decodeShared(url, bucket, heroPool) { bmp ->
             Handler(Looper.getMainLooper()).post { onReady(bmp) }
         }
     }
@@ -244,16 +313,26 @@ object ArtworkLoader {
             into.setImageBitmap(hit)
             return
         }
-        heroPool.execute {
-            // The blur output is 28px wide, but it is generated by
-            // DOWNSCALING the caller's (high-resolution) URL — v5.1
-            // passes the w1080 hero URL — never by upscaling a
-            // thumbnail; a 256px decode keeps the gradients smooth.
-            val small = decode(url, 256)
+        // 0.6.13 audit fix: the placeholder clears AT LOAD START.
+        // A cache miss used to leave the PREVIOUS track's
+        // backdrop on screen until the new blur landed — the
+        // wrong artwork ghosting under the new track.
+        into.setImageDrawable(null)
+        // The blur output is 28px wide, but it is generated by
+        // DOWNSCALING the caller's (high-resolution) URL — v5.1
+        // passes the w1080 hero URL — never by upscaling a
+        // thumbnail; a 256px decode keeps the gradients smooth.
+        decodeShared(url, 256, heroPool) { small ->
             val blurred = small?.let { blur(it) }
             if (blurred != null) cache.put(key, blurred)
-            into.post {
-                if (blurred != null && into.tag == key) into.setImageBitmap(blurred)
+            Handler(Looper.getMainLooper()).post {
+                if (into.tag == key) {
+                    // A failed decode clears the view too (when
+                    // it is still this load's view): no stale
+                    // backdrop survives a track change.
+                    if (blurred != null) into.setImageBitmap(blurred)
+                    else into.setImageDrawable(null)
+                }
             }
         }
     }
@@ -313,6 +392,25 @@ object ArtworkLoader {
         return Color.HSVToColor(floatArrayOf(best * 10f + 5f, 0.62f, 0.42f))
     }
 
+    /** Hard cap on one artwork response (0.6.13): cover art is
+     *  kilobytes; anything past ~8MB is not cover art, and the
+     *  old unbounded readBytes() let it land in memory whole. */
+    private const val MAX_ART_BYTES = 8 * 1024 * 1024
+
+    private fun readCapped(input: java.io.InputStream, max: Int): ByteArray? {
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(64 * 1024)
+        var total = 0
+        while (true) {
+            val n = input.read(buf)
+            if (n < 0) break
+            total += n
+            if (total > max) return null
+            out.write(buf, 0, n)
+        }
+        return out.toByteArray()
+    }
+
     /** Fetch source bytes, serving repeat buckets of the same URL
      *  from the byte cache (0.6.3): one network fetch now feeds the
      *  row decode, the hero decode, the blur and the ambient sample
@@ -321,18 +419,52 @@ object ArtworkLoader {
         bytesCache.get(url)?.let { return it }
         val bytes = try {
             if (url.startsWith("file:")) {
-                // Local artwork extracted at import time lives on disk.
-                java.io.FileInputStream(java.io.File(java.net.URI(url))).use { it.readBytes() }
-            } else {
-                val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 10_000
-                    readTimeout = 10_000
-                    // Some artwork CDNs refuse the default Java user agent;
-                    // identify the app like every other request it makes.
-                    setRequestProperty("User-Agent", "arzxsh (Android)")
+                // Local artwork extracted at import time lives
+                // ONLY in filesDir/local_art. The path is
+                // canonicalized and confined there (0.6.13):
+                // track metadata naming any other local file is
+                // refused, never read.
+                val base = appFilesDir?.let {
+                    java.io.File(it, "local_art").canonicalFile
+                } ?: return null
+                val target = java.io.File(java.net.URI(url)).canonicalFile
+                if (!target.path.startsWith(base.path + java.io.File.separator)) {
+                    null
+                } else {
+                    java.io.FileInputStream(target).use { readCapped(it, MAX_ART_BYTES) }
                 }
-                if (conn.responseCode !in 200..299) null
-                else conn.inputStream.use { it.readBytes() }
+            } else if (url.startsWith("https://")) {
+                // https only, and never a private / link-local /
+                // loopback host (0.6.13): artwork URLs come from
+                // remote metadata, and the loader must not become
+                // a LAN probe on their say-so.
+                val host = URL(url).host
+                val addr = if (host.isNullOrEmpty()) null else try {
+                    java.net.InetAddress.getByName(host)
+                } catch (_: Exception) {
+                    null
+                }
+                if (addr == null || addr.isLoopbackAddress || addr.isLinkLocalAddress ||
+                    addr.isSiteLocalAddress
+                ) {
+                    null
+                } else {
+                    val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                        connectTimeout = 10_000
+                        readTimeout = 10_000
+                        // Some artwork CDNs refuse the default Java user agent;
+                        // identify the app like every other request it makes.
+                        setRequestProperty("User-Agent", "arzxsh (Android)")
+                    }
+                    try {
+                        if (conn.responseCode !in 200..299) null
+                        else conn.inputStream.use { readCapped(it, MAX_ART_BYTES) }
+                    } finally {
+                        conn.disconnect()
+                    }
+                }
+            } else {
+                null
             }
         } catch (_: Exception) {
             null
@@ -348,17 +480,32 @@ object ArtworkLoader {
         return try {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            // 0.6.13 audit fix: invalid bounds mean "not an
+            // image we can size" — the old code fell back to a
+            // FULL-SIZE decode of an arbitrary byte blob, the
+            // OOM path on a 4GB-class device. Refuse instead.
             if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                null
             } else {
+                // Sample from the LONGEST edge (the old loop
+                // required BOTH axes to stay above the bucket,
+                // so a wide banner decoded nearly full-size),
+                // then keep total pixels bounded too.
                 var sample = 1
-                while (bounds.outWidth / (sample * 2) >= maxPx &&
-                    bounds.outHeight / (sample * 2) >= maxPx
+                while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= maxPx) {
+                    sample *= 2
+                }
+                while (sample < 64 &&
+                    (bounds.outWidth / sample).toLong() * (bounds.outHeight / sample) > 4_500_000L
                 ) {
                     sample *= 2
                 }
                 val opts = BitmapFactory.Options().apply { inSampleSize = sample }
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+                try {
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+                } catch (_: OutOfMemoryError) {
+                    null
+                }
             }
         } catch (_: Exception) {
             null
@@ -668,6 +815,12 @@ class MainActivity : Activity() {
      *  Transition code (crossfade, gapless) reads it and stays
      *  out of the way — sleep wins over every transition. */
     private var sleepFadeRunning = false
+
+    /** The sleep-expiry volume fade (0.6.13): a field, not a
+     *  local, so onDestroy and every sleep-cancel path can
+     *  removeCallbacks it — as an anonymous local it outlived
+     *  both. */
+    private var sleepFadeOut: Runnable? = null
     /** Length of the current timer's fade ramp: the last 30s,
      *  or the whole timer when a custom duration is shorter. */
     private var sleepFadeWindowMs = 0L
@@ -834,6 +987,12 @@ class MainActivity : Activity() {
     private lateinit var npBuffering: ProgressBar
     private var lastMiniProgress = -1
 
+    /** Last MediaSession position push (0.6.13): the ticker
+     *  re-pushes the bridge position while playing, throttled
+     *  to ~8s — it used to be written once at load time and
+     *  went stale for the whole track. */
+    private var lastPosPushMs = 0L
+
     // ---- v6: skeleton loading placeholders ----
     /** Placeholder blocks currently on screen, pulsed by ONE shared
      *  animator (alpha only — GPU-cheap on the Helio G95). Cleared
@@ -871,7 +1030,12 @@ class MainActivity : Activity() {
     // Local profile (0.6.4, WS-2): every header avatar box ever
     // built by this instance (tab retention keeps more than one
     // alive), so a photo/name change refreshes all of them.
-    private val avatarBoxes = ArrayList<FrameLayout>()
+    // 0.6.13 audit fix: WEAK references — the list used to hold
+    // every box ever built forever, and each profile change
+    // re-decoded the photo into long-dead headers. Dead boxes
+    // now drop out of the registry on their own; retained
+    // roots keep theirs alive through the tree itself.
+    private val avatarBoxes = ArrayList<WeakReference<FrameLayout>>()
     private var profilePreviewBox: FrameLayout? = null
     private var profileDialog: android.app.AlertDialog? = null
 
@@ -1069,6 +1233,7 @@ class MainActivity : Activity() {
         // service stops mirroring a ghost in the shade.
         instanceId = PlayerRegistry.claim()
         PlaybackBridge.clearState()
+        ArtworkLoader.appFilesDir = filesDir
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         eqController = EqController(this)
         recentTracks.addAll(loadRecents())
@@ -1108,6 +1273,10 @@ class MainActivity : Activity() {
         // Quiet update check (0.6.3, WS-E): at most once a day,
         // and it only ever speaks when an update EXISTS.
         checkForUpdates(manual = false)
+        // Update reminder (0.6.13): a pending update found by an
+        // earlier check re-prompts on app start at most once
+        // per 24h — no network needed, the record is on disk.
+        maybeRemindPendingUpdate()
     }
 
     /**
@@ -1136,6 +1305,23 @@ class MainActivity : Activity() {
     private var shellRoot: FrameLayout? = null
     private var overlaysBuilt = false
 
+    /** The shell's ONE content-padding layout listener (0.6.13
+     *  audit fix): a named instance, removed before every
+     *  re-add, so shell rebuilds (theme / glass changes) cannot
+     *  stack another copy onto the window's observer each time. */
+    private val shellLayoutListener =
+        ViewTreeObserver.OnGlobalLayoutListener { fitContentPadding() }
+
+    /** Pull-to-refresh wrapper around the shell ScrollView
+     *  (0.6.13): a pull re-runs the current screen's loader. */
+    private lateinit var swipeRefresh: androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+
+    /** The live Search screen's re-run hook + last query
+     *  (0.6.13): pull-to-refresh on Search re-runs the visible
+     *  search instead of rebuilding the screen and losing it. */
+    private var searchRerun: (() -> Unit)? = null
+    private var lastSearchQuery: String = ""
+
     /** Builds the four overlay trees on first need (0.6.3, S7):
      *  called at the top of every overlay entry point. A shell
      *  rebuild (theme/glass change) resets the flag in showShell,
@@ -1153,6 +1339,12 @@ class MainActivity : Activity() {
     // ---------------------------------------------------------------- shell
 
     private fun showShell() {
+        // Retire the previous shell's padding listener before
+        // its bar is replaced (the window observer outlives the
+        // view; see shellLayoutListener).
+        if (::bottomBar.isInitialized) {
+            bottomBar.viewTreeObserver.removeOnGlobalLayoutListener(shellLayoutListener)
+        }
         val root = FrameLayout(this).apply { setBackgroundColor(bgColor) }
 
         val scroll = ScrollView(this)
@@ -1161,7 +1353,17 @@ class MainActivity : Activity() {
             setPadding(dp(22), dp(10), dp(22), dp(196))
         }
         scroll.addView(content, LinearLayout.LayoutParams(-1, -2))
-        root.addView(scroll, FrameLayout.LayoutParams(-1, -1))
+        // Pull-to-refresh (0.6.13): EVERY screen rides this one
+        // ScrollView, so wrapping it once gives Home, Search,
+        // Library, Downloads and the pushed pages a working
+        // reload — a pull re-runs the current screen's loader.
+        swipeRefresh = androidx.swiperefreshlayout.widget.SwipeRefreshLayout(this).apply {
+            addView(scroll, ViewGroup.LayoutParams(-1, -1))
+            setColorSchemeColors(accent)
+            setProgressBackgroundColorSchemeColor(surface2)
+            setOnRefreshListener { onPullRefresh() }
+        }
+        root.addView(swipeRefresh, FrameLayout.LayoutParams(-1, -1))
         // 0.6.9 glass: the chrome blur snapshot refreshes ~250ms
         // after scrolling settles (never per frame — see
         // GlassBlur.kt for the trade-off).
@@ -1279,8 +1481,12 @@ class MainActivity : Activity() {
         // (inspo), plus the buffering state: while a track resolves
         // or buffers, the line goes indeterminate.
         val miniWrap = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val miniLp = LinearLayout.LayoutParams(-1, if (getPreferences(MODE_PRIVATE).getBoolean("setting_Compact mini-player", false)) dp(48) else dp(58))
+        val miniLp = LinearLayout.LayoutParams(-1, dp(58))
         miniWrap.addView(mini, miniLp)
+        // Compact sizing is applied by the one helper the
+        // Settings toggle also calls (0.6.13): build and toggle
+        // can no longer disagree about the geometry.
+        applyMiniSize()
         miniProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 1000
             progress = 0
@@ -1394,7 +1600,11 @@ class MainActivity : Activity() {
         // guard kept the stale default), and later height changes
         // (compact mini-player) were only covered if a post happened
         // to land after layout. A layout listener cannot miss.
-        bottomBar.viewTreeObserver.addOnGlobalLayoutListener { fitContentPadding() }
+        // 0.6.13: the listener is a NAMED instance, removed from
+        // the OLD bar's observer at the top of showShell() —
+        // shell rebuilds share the window's observer, and the
+        // old anonymous listeners stacked one per rebuild.
+        bottomBar.viewTreeObserver.addOnGlobalLayoutListener(shellLayoutListener)
         bottomBar.post { fitContentPadding() }
         // 0.6.9 glass: register the blurred chrome surfaces and
         // take the first snapshot once the shell is laid out.
@@ -1418,6 +1628,64 @@ class MainActivity : Activity() {
             lastFitPadding = target
             content.setPadding(dp(22), dp(10), dp(22), target)
         }
+    }
+
+    /**
+     * The mini player's two sizes, applied from ONE place
+     * (0.6.13 audit fix): normal 58dp (42dp artwork + 8dp
+     * vertical padding each side); compact 52dp — the artwork
+     * stays 42dp and the vertical padding tightens to 5dp, so
+     * the contents FIT instead of clipping (the old compact
+     * height was 48dp over the same 58dp of content). The
+     * Settings toggle only flipped the height before, and
+     * nothing re-ran when it changed mid-session beyond that
+     * one layout param; height + padding now move together,
+     * and the layout listener re-fits the content inset.
+     */
+    private fun applyMiniSize() {
+        if (!::mini.isInitialized) return
+        val compact = getPreferences(MODE_PRIVATE)
+            .getBoolean("setting_Compact mini-player", false)
+        val lp = mini.layoutParams as? LinearLayout.LayoutParams ?: return
+        lp.height = dp(if (compact) 52 else 58)
+        mini.layoutParams = lp
+        val vPad = if (compact) dp(5) else dp(8)
+        mini.setPadding(dp(8), vPad, dp(12), vPad)
+    }
+
+    /**
+     * Pull-to-refresh (0.6.13): re-runs the CURRENT screen's own
+     * loader — the same functions Retry uses. Tab roots rebuild
+     * fresh (their retained trees are dropped first, or the
+     * "refresh" would just re-attach the old tree); Search
+     * re-runs its visible query through the live screen's hook;
+     * pushed pages (artist / album / playlist / …) re-render
+     * through the back-stack entry that built them. The spinner
+     * stops on a short delay: the loaders render into the same
+     * tree in place, and none exposes a completion callback.
+     */
+    private fun onPullRefresh() {
+        when (displayedRootTab) {
+            "Home" -> buildHome(warmRefresh = true)
+            "Search" -> {
+                val rerun = searchRerun
+                if (rerun != null && lastSearchQuery.isNotBlank()) {
+                    rerun()
+                } else {
+                    retainedRoots.remove("Search")
+                    showSearch()
+                }
+            }
+            "Library" -> refreshLibraryAfterMutation()
+            "Downloads" -> {
+                retainedRoots.remove("Downloads")
+                showDownloads()
+            }
+            else -> navStack.lastOrNull()?.restore?.invoke()
+        }
+        handler.postDelayed({
+            if (::swipeRefresh.isInitialized) swipeRefresh.isRefreshing = false
+        }, 1100)
     }
 
     private fun setActiveTab(name: String) {
@@ -1722,7 +1990,14 @@ class MainActivity : Activity() {
             lp.marginEnd = dp(12)
             swatchRow.addView(sw, lp)
         }
-        box.addView(swatchRow)
+        // 0.6.13: six 40dp swatches + margins overflow narrow
+        // screens and the last preset was CLIPPED — the row now
+        // scrolls horizontally instead of truncating.
+        val swatchScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(swatchRow)
+        }
+        box.addView(swatchScroll)
         val hueNow = getPreferences(MODE_PRIVATE).getFloat("theme_hue", 145f)
         val hueLabel = label("Custom hue · ${hueNow.toInt()}°", 13f, white50, semiboldTf)
         val hlLp = LinearLayout.LayoutParams(-1, -2)
@@ -1985,7 +2260,7 @@ class MainActivity : Activity() {
                         audius ?: listOf(featured)
                     }
                     val kicker = if (featured.source == SOURCE_YOUTUBE) {
-                        "TRENDING ON YOUTUBE MUSIC"
+                        "TRENDING"
                     } else {
                         "FEATURED MIX"
                     }
@@ -1998,14 +2273,21 @@ class MainActivity : Activity() {
                     any = true
                 }
                 if (charts != null && charts.songs.isNotEmpty()) {
-                    content.addView(sectionTitle("Trending on YouTube Music"))
+                    content.addView(sectionTitle("Trending"))
                     val top = charts.songs.take(12)
                     addRows(top, withHairlines = true, queueContext = top)
                     any = true
                 } else if (chartsErr != null) {
-                    // A dead YouTube section shows WHY, never a silent hole.
-                    content.addView(sectionTitle("Trending on YouTube Music"))
-                    content.addView(errorLine("YouTube unavailable: $chartsErr"))
+                    // A dead section says so plainly, never a
+                    // silent hole and never the raw error
+                    // (0.6.13: the exception goes to the log).
+                    android.util.Log.e("Home", "charts failed: $chartsErr")
+                    if (isOffline()) {
+                        content.addView(offlineStateView { buildHome(warmRefresh = false) })
+                    } else {
+                        content.addView(sectionTitle("Trending"))
+                        content.addView(errorLine("This section couldn't load right now."))
+                    }
                     any = true
                 }
                 if (charts != null && charts.artists.isNotEmpty()) {
@@ -2043,8 +2325,11 @@ class MainActivity : Activity() {
                                 mixBox.removeAllViews()
                                 val m = mix
                                 if (m == null || m.isEmpty()) {
+                                    android.util.Log.e(
+                                        "Home", "mix failed: ${mixErr ?: "empty radio"}"
+                                    )
                                     mixBox.addView(
-                                        statusLine("Mix unavailable: ${mixErr ?: "empty radio"}")
+                                        statusLine("Mix unavailable right now.")
                                     )
                                 } else {
                                     mixBox.addView(
@@ -2067,14 +2352,18 @@ class MainActivity : Activity() {
                 val showAudiusSection = mode != "youtube" ||
                     charts == null || charts.songs.isEmpty()
                 if (showAudiusSection && audius != null && audius.size > 1) {
-                    content.addView(sectionTitle("Trending on Audius"))
+                    content.addView(sectionTitle("More trending"))
                     val rest = audius.drop(1).take(12)
                     addRows(rest, withHairlines = true, queueContext = rest)
                     any = true
                 }
                 if (!any) {
-                    content.addView(label("Nothing to play right now", 18f, Color.WHITE, boldTf))
-                    content.addView(label("Trending tracks are unavailable right now.", 14f, white50))
+                    if (isOffline()) {
+                        content.addView(offlineStateView { buildHome(warmRefresh = false) })
+                    } else {
+                        content.addView(label("Nothing to play right now", 18f, Color.WHITE, boldTf))
+                        content.addView(label("Trending tracks are unavailable right now.", 14f, white50))
+                    }
                 }
             }
         }
@@ -2101,7 +2390,12 @@ class MainActivity : Activity() {
         lp.topMargin = dp(16)
         card.layoutParams = lp
         val img = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
-        ArtworkLoader.load(largeArt(track), img, track.artworkSmall)
+        // 0.6.13: the hero is a full-width surface — decode for
+        // the screen width, not the loader's 512px fallback.
+        ArtworkLoader.load(
+            largeArt(track), img, track.artworkSmall,
+            resources.displayMetrics.widthPixels
+        )
         card.addView(img, FrameLayout.LayoutParams(-1, -1))
         val shade = View(this).apply {
             background = GradientDrawable(
@@ -2145,9 +2439,24 @@ class MainActivity : Activity() {
         lateinit var browseBox: LinearLayout
         lateinit var input: EditText
 
+        // This search's skeleton blocks, tracked SEPARATELY
+        // (0.6.13 audit fix): skelBlock registers into the
+        // activity-wide list, and a search's blocks used to stay
+        // registered after its results rendered (or the search
+        // was cleared) — the shared pulse animator kept writing
+        // alpha into detached views from every past search.
+        var searchSkeletons: List<View> = emptyList()
+        fun dropSearchSkeletons() {
+            if (searchSkeletons.isNotEmpty()) {
+                skeletonViews.removeAll(searchSkeletons)
+                searchSkeletons = emptyList()
+            }
+        }
+
         fun runSearch(query: String) {
             val q = query.trim()
             if (q.isEmpty()) return
+            lastSearchQuery = q
             searchInFlight = true
             val myEpoch = searchEpoch
             browseBox.visibility = View.GONE
@@ -2156,10 +2465,13 @@ class MainActivity : Activity() {
             resultsBox.addView(sectionTitle("Results for \"$q\""))
             // Skeleton mirrors the results layout (0.6.1): a hero
             // block where the Top result card lands, then rows.
+            dropSearchSkeletons()
+            val skelBefore = skeletonViews.size
             val heroSkel = skelBlock(100, 14)
             (heroSkel.layoutParams as LinearLayout.LayoutParams).bottomMargin = dp(16)
             resultsBox.addView(heroSkel)
             skelRows(resultsBox, 5)
+            searchSkeletons = skeletonViews.subList(skelBefore, skeletonViews.size).toList()
             val mode = sourceMode()
             executor.execute {
                 // 0.6.3 (audit S5): the five source calls are
@@ -2250,11 +2562,14 @@ class MainActivity : Activity() {
                     // the epoch check comes first now.
                     if (myEpoch != searchEpoch) return@runOnUiThread
                     searchInFlight = false
+                    dropSearchSkeletons()
                     resultsBox.removeAllViews()
                     resultsBox.addView(sectionTitle("Results for \"$q\""))
                     val nothing = found.isEmpty() && ytArtists.isEmpty() &&
                         ytAlbums.isEmpty() && ytPlaylists.isEmpty()
-                    if (nothing) {
+                    if (nothing && isOffline()) {
+                        resultsBox.addView(offlineStateView { runSearch(q) })
+                    } else if (nothing) {
                         if (audius == null && ytErr != null) {
                             resultsBox.addView(label("Playable results are unavailable right now.", 14f, white50))
                         } else {
@@ -2289,7 +2604,10 @@ class MainActivity : Activity() {
                                 resultsBox.addView(ytmPlaylistRow(ref))
                             }
                         }
-                        // Source status: always on screen, success or failure.
+                        // Source status (0.6.13 scrub): failures
+                        // are stated PLAINLY — no source names,
+                        // no raw errors on screen; the detail
+                        // goes to the log.
                         val errors = listOfNotNull(
                             ytErr?.let { "songs: $it" },
                             ytArtistsErr?.let { "artists: $it" },
@@ -2297,26 +2615,23 @@ class MainActivity : Activity() {
                             ytPlaylistsErr?.let { "playlists: $it" }
                         )
                         if (errors.isNotEmpty()) {
-                            resultsBox.addView(errorLine("YouTube unavailable: " + errors.joinToString(" · ")))
+                            android.util.Log.e(
+                                "Search", "source errors: " + errors.joinToString(" · ")
+                            )
+                            resultsBox.addView(errorLine("Some results couldn't load right now."))
                         }
                         if (mode == "youtube" && ytSongs.isEmpty() && !audius.isNullOrEmpty()) {
-                            // Search-level fallback, stated on screen:
-                            // YouTube failed or came back empty, so
-                            // Audius is carrying this search.
-                            resultsBox.addView(statusLine("YouTube songs unavailable — showing Audius results instead."))
+                            // Search-level fallback, stated on
+                            // screen: the main catalog failed or
+                            // came back empty, so the other
+                            // catalog is carrying this search.
+                            resultsBox.addView(statusLine("Some songs couldn't load — showing other results instead."))
                         }
                         if (mode == "audius") {
-                            resultsBox.addView(statusLine("Source: Audius only — YouTube Music is off."))
+                            resultsBox.addView(statusLine("Showing the community catalog only."))
                         }
                         if (ytNote != null) {
-                            resultsBox.addView(statusLine("YouTube: $ytNote"))
-                        }
-                        if (mode != "audius" && errors.isEmpty() && ytNote == null) {
-                            resultsBox.addView(
-                                statusLine(
-                                    "YouTube Music: ${ytSongs.size} songs · ${ytArtists.size} artists · ${ytAlbums.size} albums · ${ytPlaylists.size} playlists"
-                                )
-                            )
+                            android.util.Log.d("Search", "song search note: $ytNote")
                         }
                     }
                     if (found.isNotEmpty()) {
@@ -2376,6 +2691,7 @@ class MainActivity : Activity() {
             contentDescription = "Clear search"
             setOnClickListener {
                 input.text?.clear()
+                dropSearchSkeletons()
                 resultsBox.removeAllViews()
                 resultsBox.visibility = View.GONE
                 browseBox.visibility = View.VISIBLE
@@ -2414,6 +2730,10 @@ class MainActivity : Activity() {
         }
         field.addView(input, LinearLayout.LayoutParams(0, -1, 1f))
         field.addView(clearBtn, LinearLayout.LayoutParams(dp(38), -1))
+        // Pull-to-refresh hook (0.6.13): re-runs the visible
+        // query on THIS live screen (the closure owns the real
+        // results box), never a rebuild that would lose it.
+        searchRerun = { runSearch(input.text?.toString().orEmpty()) }
 
         // Source selector: the same three states as Settings →
         // Music source, two-way synced through the one preference.
@@ -2442,8 +2762,8 @@ class MainActivity : Activity() {
             }
         }
         listOf(
-            "youtube" to "YouTube Music",
-            "audius" to "Audius",
+            "youtube" to "Main catalog",
+            "audius" to "Community",
             "both" to "Both"
         ).forEach { (mode, name) ->
             val tv = label(name, 13f, white55, mediumTf).apply {
@@ -2509,7 +2829,7 @@ class MainActivity : Activity() {
         browseBox.addView(sectionTitle("Moods & Genres"))
         val moodsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         browseBox.addView(moodsBox)
-        renderMoodsInto(moodsBox, gen, "Moods live on YouTube Music — switch the source above to browse them.")
+        renderMoodsInto(moodsBox, gen, "Moods live in the main catalog — switch the source above to browse them.")
         content.addView(browseBox)
 
         if (tracks.isEmpty()) {
@@ -3014,10 +3334,10 @@ class MainActivity : Activity() {
         )
         block(
             "Poppins (typeface)",
-            "Copyright 2020 The Poppins Project Authors (github.com/itfoundry/Poppins).\\n" +
+            "Copyright 2020 The Poppins Project Authors (github.com/itfoundry/Poppins).\n" +
                 "Licensed under the SIL Open Font License, Version 1.1. Poppins is the app's " +
                 "bundled typeface (Regular / Medium / SemiBold / Bold), fetched from the " +
-                "google/fonts repository.\\n" +
+                "google/fonts repository.\n" +
                 "License: scripts.sil.org/OFL",
             first = false
         )
@@ -3051,8 +3371,8 @@ class MainActivity : Activity() {
                 showMenu(
                     "Music source",
                     listOf(
-                        "YouTube Music" to { setSourceMode("youtube"); showSettings() },
-                        "Audius" to { setSourceMode("audius"); showSettings() },
+                        "Main catalog" to { setSourceMode("youtube"); showSettings() },
+                        "Community" to { setSourceMode("audius"); showSettings() },
                         "Both" to { setSourceMode("both"); showSettings() }
                     )
                 )
@@ -3066,7 +3386,7 @@ class MainActivity : Activity() {
         val qualitySub = if (dataSaverOn()) {
             "Data saver mode is on — the lowest stream quality is used"
         } else {
-            "$qualityName · steers YouTube stream selection"
+            "$qualityName · steers stream selection"
         }
         content.addView(settingsRow("Streaming quality", qualitySub, iconRes = R.drawable.ic_signal) {
             showMenu(
@@ -3314,14 +3634,32 @@ class MainActivity : Activity() {
                     rel == null -> if (manual) {
                         showUpdateCheckFailed(failDetail)
                     }
-                    rel.versionCode > UpdateChecker.installedVersionCode(this) ->
+                    rel.versionCode > UpdateChecker.installedVersionCode(this) -> {
+                        // 0.6.13 reminder bookkeeping: record
+                        // the pending update (first-seen is kept
+                        // across re-checks of the same version),
+                        // prompt as before, and post the
+                        // at-most-twice-per-version notification
+                        // when one is due.
+                        UpdateChecker.recordPending(this, rel)
                         showUpdatePrompt(rel, fromAuto = !manual)
-                    else -> if (manual) {
-                        Toast.makeText(
-                            this,
-                            "You're on the latest version (${UpdateChecker.installedVersionName(this)})",
-                            Toast.LENGTH_LONG
-                        ).show()
+                        if (UpdateChecker.notificationDue(this)) {
+                            postUpdateNotification(rel)
+                            UpdateChecker.markNotified(this)
+                        }
+                    }
+                    else -> {
+                        // Not newer: any pending record is stale
+                        // (the installed build caught up, or the
+                        // release was pulled) — clear it.
+                        UpdateChecker.clearPending(this)
+                        if (manual) {
+                            Toast.makeText(
+                                this,
+                                "You're on the latest version (${UpdateChecker.installedVersionName(this)})",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
                     }
                 }
             }
@@ -3353,22 +3691,104 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun showUpdatePrompt(rel: UpdateChecker.Release, fromAuto: Boolean) {
-        if (fromAuto) {
+    /** True while the update dialog is on screen (0.6.13):
+     *  the check, the Settings row and the start-up reminder
+     *  all funnel into showUpdatePrompt, and none of them may
+     *  stack a second dialog over the first. */
+    private var updatePromptShowing = false
+
+    /**
+     * The update dialog, from three doors (0.6.13): the update
+     * check itself (auto — at most once per version, EVER, via
+     * the prompted-code pref), a manual Settings tap (always),
+     * and the reminder path (fromReminder — the 24h-cadence
+     * re-prompt for a pending update the user hasn't installed;
+     * it bypasses the once-ever auto gate but stamps the
+     * reminder clock, and "Later" stamps it too, so the dialog
+     * can never nag more than once a day). The showing guard
+     * keeps the doors from stacking dialogs on each other.
+     */
+    private fun showUpdatePrompt(
+        rel: UpdateChecker.Release,
+        fromAuto: Boolean,
+        fromReminder: Boolean = false
+    ) {
+        if (updatePromptShowing || isFinishing || isDestroyed) return
+        if (fromAuto && !fromReminder) {
             // Auto-prompts: at most once per version, ever.
             val prefs = getPreferences(MODE_PRIVATE)
             if (prefs.getInt("update_prompted_code", 0) >= rel.versionCode) return
             prefs.edit().putInt("update_prompted_code", rel.versionCode).apply()
         }
+        // If this version is the recorded pending update, the
+        // dialog showing IS a reminder — stamp the clock.
+        val pending = UpdateChecker.pendingRelease(this)
+        if (pending != null && pending.versionCode == rel.versionCode) {
+            UpdateChecker.markReminded(this)
+        }
         val notes = rel.notes.trim().let {
             if (it.length > 600) it.substring(0, 600) + "…" else it
         }
+        updatePromptShowing = true
         android.app.AlertDialog.Builder(this)
             .setTitle("Update available — ${rel.versionName}")
             .setMessage(if (notes.isEmpty()) "A new version of arzxsh is ready to install." else notes)
             .setPositiveButton("Update") { _, _ -> startUpdateDownload(rel) }
             .setNegativeButton("Later", null)
+            .setOnDismissListener { updatePromptShowing = false }
             .show()
+    }
+
+    /** The reminder notification for a pending update (0.6.13):
+     *  the app's standard channel pattern (PlaybackService's),
+     *  posted at most twice per version — once when found, once
+     *  more after 48h (UpdateChecker.notificationDue owns the
+     *  bookkeeping). Tapping it opens MainActivity, whose
+     *  start-up reminder re-shows the update dialog. */
+    private fun postUpdateNotification(rel: UpdateChecker.Release) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        val mgr = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= 26) {
+            mgr.createNotificationChannel(
+                NotificationChannel(
+                    "arzxsh-updates", "App updates",
+                    NotificationManager.IMPORTANCE_DEFAULT
+                )
+            )
+        }
+        val open = PendingIntent.getActivity(
+            this, 21,
+            Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notif = Notification.Builder(this, "arzxsh-updates")
+            .setSmallIcon(R.drawable.ic_stat_logo)
+            .setContentTitle("arzxsh update available")
+            .setContentText("Version ${rel.versionName} is ready to install")
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .build()
+        mgr.notify(4712, notif)
+    }
+
+    /** App-start reminder (0.6.13): a pending update recorded by
+     *  an earlier check re-prompts here when the last reminder
+     *  is over 24h old. pendingRelease() itself clears the
+     *  record once the installed build has caught up, so an
+     *  updated app never reminds about itself. */
+    private fun maybeRemindPendingUpdate() {
+        val pending = UpdateChecker.pendingRelease(this) ?: return
+        val last = UpdateChecker.pendingLastReminded(this)
+        if (System.currentTimeMillis() - last > UpdateChecker.REMIND_AFTER_MS) {
+            showUpdatePrompt(pending, fromAuto = false, fromReminder = true)
+        }
     }
 
     private fun startUpdateDownload(rel: UpdateChecker.Release) {
@@ -3462,8 +3882,16 @@ class MainActivity : Activity() {
 
     private fun openReleasePage(rel: UpdateChecker.Release) {
         if (rel.pageUrl.isEmpty()) return
+        // 0.6.13 audit fix: the URL comes from a remote JSON —
+        // only ever hand the browser an https github.com page.
+        val uri = try {
+            Uri.parse(rel.pageUrl)
+        } catch (_: Exception) {
+            return
+        }
+        if (uri.scheme != "https" || uri.host != "github.com") return
         try {
-            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(rel.pageUrl)))
+            startActivity(Intent(Intent.ACTION_VIEW, uri))
         } catch (_: Exception) {
             // No browser either: the Settings row can be retried.
         }
@@ -3600,7 +4028,10 @@ class MainActivity : Activity() {
         chunkBuildsInFlight++
         var idx = 0
         fun step() {
-            if (!alive()) {
+            // 0.6.13: a dying activity ends the build too — the
+            // caller's alive() checks the screen generation, not
+            // the instance's life.
+            if (isFinishing || isDestroyed || !alive()) {
                 chunkBuildsInFlight--
                 onDone?.invoke(false)
                 return
@@ -3742,34 +4173,217 @@ class MainActivity : Activity() {
     }
 
     /**
-     * Page-level load failure, human first (0.6.3, WS-D Bug C):
-     * a plain-language headline that says what happened and what
-     * to do, the raw error kept as the small secondary line
-     * underneath (diagnostics stay available; they just stop
-     * BEING the message — 0.6.2's artist page headline was the
-     * raw "RuntimeException: Innertube browse HTTP 400"), and a
-     * working Retry.
+     * The shared error-state Retry (0.6.13): a PROMINENT
+     * accent pill — 48dp tall, generous horizontal padding,
+     * white bold label. The pre-0.6.13 retry was a small
+     * text-sized pill that read as a caption, not a button.
+     */
+    private fun retryButton(onClick: () -> Unit): TextView =
+        label("Retry", 15f, Color.WHITE, boldTf).apply {
+            gravity = Gravity.CENTER
+            minHeight = dp(48)
+            setPadding(dp(28), 0, dp(28), 0)
+            background = GradientDrawable().apply {
+                setColor(accent)
+                cornerRadius = dp(999).toFloat()
+            }
+            isClickable = true
+            setOnClickListener { onClick() }
+            MotionPress.attach(this, primary = true) { springsOff() }
+        }
+
+    /** True when the device has no internet-capable network
+     *  (0.6.13): drives the No Internet page. A SecurityException
+     *  or a missing service reads as ONLINE — the page loaders'
+     *  own errors remain the fallback signal. */
+    private fun isOffline(): Boolean {
+        val cm = getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return false
+        return try {
+            val net = cm.activeNetwork ?: return true
+            val caps = cm.getNetworkCapabilities(net) ?: return true
+            !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * The interactive No Internet page (0.6.13): shown wherever
+     * a network screen fails while the device is offline.
+     * Signal icon in a surface disc (soft pulse while waiting,
+     * stilled by Reduce Motion), honest copy that downloads
+     * still play, a Retry that re-tests before re-running the
+     * screen's loader, a shortcut to Downloads, and a Wi-Fi
+     * settings link. While the view is attached it listens for
+     * the network coming back and auto-retries ~600ms after it
+     * does; the callback unregisters on detach and is guarded
+     * against firing into a dead screen.
+     */
+    private fun offlineStateView(onRetry: () -> Unit): View {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(24), dp(44), dp(24), dp(32))
+        }
+        val disc = FrameLayout(this).apply { background = solidBg(999f, surface) }
+        val iconView = icon(R.drawable.ic_signal, white75)
+        disc.addView(iconView, FrameLayout.LayoutParams(dp(34), dp(34), Gravity.CENTER))
+        box.addView(disc, LinearLayout.LayoutParams(dp(76), dp(76)))
+        val title = label("No internet connection", 18f, Color.WHITE, boldTf).apply {
+            gravity = Gravity.CENTER
+        }
+        val titleLp = LinearLayout.LayoutParams(-1, -2)
+        titleLp.topMargin = dp(18)
+        box.addView(title, titleLp)
+        val sub = label(
+            "Your downloaded songs still play. Check your connection and try again.",
+            14f, white50
+        ).apply { gravity = Gravity.CENTER }
+        val subLp = LinearLayout.LayoutParams(-1, -2)
+        subLp.topMargin = dp(6)
+        box.addView(sub, subLp)
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        val aLp = LinearLayout.LayoutParams(-1, -2)
+        aLp.topMargin = dp(22)
+        actions.layoutParams = aLp
+        actions.addView(retryButton {
+            sub.text = "Checking connection…"
+            box.postDelayed({
+                if (!box.isAttachedToWindow || isFinishing || isDestroyed) {
+                    return@postDelayed
+                }
+                if (isOffline()) {
+                    sub.text = "Still offline — check your connection and try again."
+                } else {
+                    onRetry()
+                }
+            }, 650)
+        })
+        val dlBtn = pillButton("Downloads", filled = false) {
+            setActiveTab("Downloads")
+            showDownloads()
+        }
+        val dlLp = LinearLayout.LayoutParams(dp(150), dp(48))
+        dlLp.marginStart = dp(12)
+        actions.addView(dlBtn, dlLp)
+        box.addView(actions)
+        val wifi = label("Wi-Fi settings", 14.5f, accent, semiboldTf).apply {
+            gravity = Gravity.CENTER
+            isClickable = true
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setOnClickListener {
+                try {
+                    startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
+                } catch (_: Exception) {
+                    Toast.makeText(
+                        this@MainActivity, "Couldn't open Wi-Fi settings",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }
+        val wLp = LinearLayout.LayoutParams(-2, -2)
+        wLp.topMargin = dp(10)
+        box.addView(wifi, wLp)
+        // Live recovery + pulse, bound to the view's attachment:
+        // both die with the view, so a navigated-away page can
+        // neither leak a callback nor retry into a dead screen.
+        var pulse: ValueAnimator? = null
+        var netCallback: ConnectivityManager.NetworkCallback? = null
+        var recovered = false
+        box.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) {
+                if (!springsOff()) {
+                    pulse = ValueAnimator.ofFloat(0.45f, 1f).apply {
+                        duration = 1300
+                        repeatCount = ValueAnimator.INFINITE
+                        repeatMode = ValueAnimator.REVERSE
+                        addUpdateListener { iconView.alpha = it.animatedValue as Float }
+                        start()
+                    }
+                }
+                val cm = getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager
+                    ?: return
+                val cb = object : ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: Network) {
+                        runOnUiThread {
+                            if (recovered || isFinishing || isDestroyed ||
+                                !box.isAttachedToWindow
+                            ) {
+                                return@runOnUiThread
+                            }
+                            recovered = true
+                            sub.text = "Back online"
+                            box.postDelayed({
+                                if (box.isAttachedToWindow && !isDestroyed) onRetry()
+                            }, 600)
+                        }
+                    }
+                }
+                netCallback = cb
+                try {
+                    cm.registerNetworkCallback(
+                        NetworkRequest.Builder()
+                            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                            .build(),
+                        cb
+                    )
+                } catch (_: Exception) {
+                    netCallback = null
+                }
+            }
+
+            override fun onViewDetachedFromWindow(v: View) {
+                pulse?.cancel()
+                pulse = null
+                val cm = getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager
+                val cb = netCallback
+                netCallback = null
+                if (cm != null && cb != null) {
+                    try {
+                        cm.unregisterNetworkCallback(cb)
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        })
+        return box
+    }
+
+    /**
+     * Page-level load failure (0.6.13 rework): PLAIN copy only —
+     * raw exception text, class names and JSON never reach the
+     * screen (the raw error goes to the log instead), the Retry
+     * is the shared prominent button, and when the device is
+     * offline the interactive No Internet page takes over.
      */
     private fun addPageError(box: LinearLayout, what: String, err: String?, retry: () -> Unit) {
+        if (!err.isNullOrEmpty()) {
+            android.util.Log.e("PageLoad", "$what failed: $err")
+        }
+        if (isOffline()) {
+            box.addView(offlineStateView(retry))
+            return
+        }
         val human = when {
-            err.isNullOrEmpty() -> "Something went wrong loading this $what."
+            err.isNullOrEmpty() -> "This page isn't available right now."
             err.contains("HTTP 400") || err.contains("HTTP 404") ->
-                "YouTube rejected this $what link — it may be out of date. " +
-                    "Go back and open it again from a fresh search, or retry."
-            err.contains("HTTP") ->
-                "YouTube's server answered with an error. Try again in a moment."
+                "This page isn't available right now."
             err.contains("UnknownHost") || err.contains("Socket") ||
                 err.contains("Connect") || err.contains("IO") ->
-                "Couldn't reach YouTube. Check your connection and try again."
-            else -> "YouTube couldn't load this $what right now. Try again in a moment."
+                "Couldn't load this. Check your connection and try again."
+            else -> "Couldn't load this page. Try again in a moment."
         }
         box.addView(label(human, 15f, white75))
-        if (!err.isNullOrEmpty()) box.addView(errorLine(err))
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val lp = LinearLayout.LayoutParams(-2, -2)
         lp.topMargin = dp(16)
         row.layoutParams = lp
-        row.addView(pillButton("Retry", filled = true) { retry() })
+        row.addView(retryButton { retry() })
         box.addView(row)
     }
 
@@ -3948,8 +4562,38 @@ class MainActivity : Activity() {
             } catch (t: Throwable) {
                 err = shortErr(t)
             }
+            // HTTP 400 fallback (0.6.13): some artist ids that
+            // search hands out are rejected by the browse call
+            // (invalid argument) — the page is then built from
+            // SEARCH instead: the artist's own tracks become the
+            // page's song list and the normal render below runs
+            // unchanged. Only a fallback that also comes back
+            // empty falls through to the error state.
+            if (page == null && err?.contains("HTTP 400") == true &&
+                !fallbackName.isNullOrBlank()
+            ) {
+                try {
+                    val found = YoutubeSource.searchSongs(fallbackName).tracks
+                    val own = found.filter {
+                        it.artist.contains(fallbackName, ignoreCase = true)
+                    }
+                    val tracks = (if (own.isNotEmpty()) own else found).take(20)
+                    if (tracks.isNotEmpty()) {
+                        page = YtmArtistPage(
+                            id = artistId,
+                            name = fallbackName,
+                            artworkSmall = fallbackArt ?: tracks.first().artworkSmall,
+                            artworkLarge = fallbackArt ?: tracks.first().artworkLarge,
+                            topSongs = tracks
+                        )
+                        err = null
+                    }
+                } catch (t: Throwable) {
+                    android.util.Log.e("ArtistPage", "search fallback failed: $t")
+                }
+            }
             runOnUiThread {
-                if (gen != generation) return@runOnUiThread
+                if (gen != generation || isFinishing || isDestroyed) return@runOnUiThread
                 clearSkeletons()
                 content.removeAllViews()
                 addScreenBackArrow()
@@ -4069,7 +4713,7 @@ class MainActivity : Activity() {
                 err = shortErr(t)
             }
             runOnUiThread {
-                if (gen != generation) return@runOnUiThread
+                if (gen != generation || isFinishing || isDestroyed) return@runOnUiThread
                 clearSkeletons()
                 content.removeAllViews()
                 addScreenBackArrow()
@@ -4215,12 +4859,19 @@ class MainActivity : Activity() {
                 err = shortErr(t)
             }
             runOnUiThread {
-                if (gen != generation) return@runOnUiThread
+                if (gen != generation || isFinishing || isDestroyed) return@runOnUiThread
                 box.removeAllViews()
                 clearSkeletons()
                 val list = cats
                 if (list == null || list.isEmpty()) {
-                    box.addView(errorLine("Moods unavailable: ${err ?: "empty response"}"))
+                    // 0.6.13: plain copy on screen; the raw
+                    // error (or its absence) goes to the log.
+                    android.util.Log.e("Moods", "unavailable: ${err ?: "empty response"}")
+                    if (isOffline()) {
+                        box.addView(offlineStateView { renderMoodsInto(box, gen, audiusHint) })
+                    } else {
+                        box.addView(errorLine("Moods unavailable right now."))
+                    }
                 } else {
                     var lastGroup: String? = null
                     var chipRow: LinearLayout? = null
@@ -4284,7 +4935,7 @@ class MainActivity : Activity() {
                 err = shortErr(t)
             }
             runOnUiThread {
-                if (gen != generation) return@runOnUiThread
+                if (gen != generation || isFinishing || isDestroyed) return@runOnUiThread
                 clearSkeletons()
                 content.removeView(skelBox)
                 val l = list
@@ -4355,7 +5006,7 @@ class MainActivity : Activity() {
                 err = shortErr(t)
             }
             runOnUiThread {
-                if (gen != generation) return@runOnUiThread
+                if (gen != generation || isFinishing || isDestroyed) return@runOnUiThread
                 clearSkeletons()
                 content.removeAllViews()
                 addScreenBackArrow()
@@ -4395,6 +5046,19 @@ class MainActivity : Activity() {
                     gravity = Gravity.CENTER
                 })
                 content.addView(head)
+                if (tracks.isEmpty()) {
+                    // 0.6.13 audit fix (HIGH): an EMPTY playlist
+                    // used to build Play/Shuffle buttons whose
+                    // handlers dereference tracks.first() /
+                    // tracks[playOrder…] — a guaranteed crash.
+                    // Mirror showAlbum's guard: a plain
+                    // "No tracks" state and no actions at all.
+                    content.addView(label("No tracks", 15f, white50).apply {
+                        gravity = Gravity.CENTER
+                        setPadding(0, dp(22), 0, 0)
+                    })
+                    return@runOnUiThread
+                }
                 val actions = LinearLayout(this).apply {
                     orientation = LinearLayout.HORIZONTAL
                     gravity = Gravity.CENTER
@@ -5031,6 +5695,23 @@ class MainActivity : Activity() {
             lastMiniProgress = mini
             miniProgress.progress = mini
         }
+        // MediaSession position push (0.6.13 audit fix): the
+        // service-side position state was written once at load
+        // and went stale for the whole track, so the
+        // notification / lockscreen position froze. The ticker
+        // re-pushes it while playing, throttled to ~8s and under
+        // the same ownership guards as every other bridge write.
+        val nowMs = SystemClock.elapsedRealtime()
+        if (p.isPlaying && nowMs - lastPosPushMs > 8000L) {
+            lastPosPushMs = nowMs
+            val t = current
+            if (t != null && PlayerRegistry.isOwner(instanceId) && !bridgeMuted) {
+                PlaybackBridge.push(
+                    this, t, PlaybackBridge.STATE_PLAYING, p.positionMs, p.durationMs
+                )
+                ArzxshWidget.syncFromState(this, PlaybackBridge.state)
+            }
+        }
         if (!::nowPlaying.isInitialized || nowPlaying.visibility != View.VISIBLE || seeking) return
         updateSleepLabel()
         // Jank pass: the 500ms ticker touches ONLY the seek bar and
@@ -5172,7 +5853,10 @@ class MainActivity : Activity() {
             }
             beginYtResolution(track, token)
         } else {
-            startPlayback("https://api.audius.co/v1/tracks/${track.id}/stream?app_name=arzxsh")
+            // 0.6.13: the id is ONE path segment — encode it as
+            // such (an id with / or ? used to corrupt the URL).
+            val seg = java.net.URLEncoder.encode(track.id, "UTF-8").replace("+", "%20")
+            startPlayback("https://api.audius.co/v1/tracks/$seg/stream?app_name=arzxsh")
         }
     }
 
@@ -5244,6 +5928,12 @@ class MainActivity : Activity() {
             return
         }
         playerExecutor.execute {
+            // 0.6.13 audit fix: re-check the token BEFORE the
+            // network resolve too — the executor serializes
+            // behind earlier stages, and a superseded ladder
+            // used to burn a full resolve (up to 30s) before its
+            // UI-side check noticed it was stale.
+            if (token != playToken) return@execute
             val resolved = StreamResolver.resolveYoutubeStage(track.id, ytQuality, label)
             runOnUiThread {
                 if (token != playToken) return@runOnUiThread
@@ -5342,10 +6032,10 @@ class MainActivity : Activity() {
                     q2[idx] = found
                     queue = q2
                 }
-                pendingNpNotice = "YouTube failed — playing the Audius version."
+                pendingNpNotice = "That version failed — playing another version instead."
                 Toast.makeText(
                     this@MainActivity,
-                    "YouTube failed — playing the Audius version.",
+                    "That version failed — playing another version instead.",
                     Toast.LENGTH_LONG
                 ).show()
                 play(found)
@@ -5353,8 +6043,12 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Prints a playback failure on Now Playing and keeps it there. */
+    /** Shows a playback failure on Now Playing and keeps it
+     *  there. 0.6.13: the caller-composed diagnostic (source,
+     *  ladder report, exception text) goes to the LOG ONLY —
+     *  the screen gets one plain line, never internals. */
     private fun showPlaybackError(text: String) {
+        android.util.Log.e("Playback", text)
         if (!::npError.isInitialized) return
         // Any printed outcome is terminal for the current resolve:
         // the buffering indicators stand down.
@@ -5362,7 +6056,7 @@ class MainActivity : Activity() {
             buffering = false
             updateBufferingUi()
         }
-        npError.text = text
+        npError.text = "Couldn't play this track. Try another one."
         npError.visibility = View.VISIBLE
     }
 
@@ -5465,7 +6159,12 @@ class MainActivity : Activity() {
                 .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
                 .setUsage(C.USAGE_MEDIA)
                 .build(),
-            false
+            // 0.6.13 audit fix: handleAudioFocus TRUE — the
+            // app shipped with focus handling OFF, so other
+            // apps' audio (calls aside, which the telephony
+            // layer handles) talked straight over playback and
+            // arzxsh never ducked or paused for anyone.
+            true
         )
         val item = when {
             uri != null -> MediaItem.fromUri(uri)
@@ -5821,10 +6520,13 @@ class MainActivity : Activity() {
                 }
             }
             else -> // Audius: the canonical stream endpoint, the
-                // same URL play() starts for an Audius track.
+                // same URL play() starts for an Audius track (id
+                // encoded as one path segment, 0.6.13).
                 prepareGapless(
                     next,
-                    "https://api.audius.co/v1/tracks/${next.id}/stream?app_name=arzxsh",
+                    "https://api.audius.co/v1/tracks/" +
+                        java.net.URLEncoder.encode(next.id, "UTF-8").replace("+", "%20") +
+                        "/stream?app_name=arzxsh",
                     null
                 )
         }
@@ -5857,7 +6559,12 @@ class MainActivity : Activity() {
                 .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
                 .setUsage(C.USAGE_MEDIA)
                 .build(),
-            false
+            // 0.6.13 audit fix: handleAudioFocus TRUE — the
+            // app shipped with focus handling OFF, so other
+            // apps' audio (calls aside, which the telephony
+            // layer handles) talked straight over playback and
+            // arzxsh never ducked or paused for anyone.
+            true
         )
         exo.setWakeMode(C.WAKE_MODE_NETWORK)
         val holder = EnginePlayer(exo)
@@ -5958,6 +6665,15 @@ class MainActivity : Activity() {
         flushListened()
         saveRecent(next)
         com.arzx.music.PlayHistory.record(this, next)
+        // 0.6.13 audit fix: the ladder state follows the track —
+        // beginYtResolution sets ytTrack/ytQuality for
+        // foreground plays, but a gapless activation never did,
+        // so when the ACTIVATED player errored, onPlayerFailed
+        // saw a stale ytTrack (the previous song): it evicted
+        // the wrong cache entry and the Audius fallback matched
+        // the wrong title, or skipped entirely.
+        ytTrack = next
+        ytQuality = effectiveQuality()
         playToken++
         queueIndex = nextIdx
         prep.activated = true
@@ -6232,7 +6948,7 @@ class MainActivity : Activity() {
      */
     private fun startRadioFor(seed: Track) {
         if (seed.source != SOURCE_YOUTUBE) {
-            Toast.makeText(this, "Radio is available for YouTube tracks", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Radio isn't available for this track", Toast.LENGTH_SHORT).show()
             return
         }
         Toast.makeText(this, "Starting radio…", Toast.LENGTH_SHORT).show()
@@ -6365,10 +7081,19 @@ class MainActivity : Activity() {
         val p = player
         if (p != null) {
             p.pause()
-        } else if (buffering || current != null) {
-            // Nothing built yet: cancel the pending start so the
-            // late READY cannot autoplay (same rule as the
-            // mid-resolution pause in togglePlayback).
+        }
+        // 0.6.13 audit fix (HIGH): the pending-start cancel used
+        // to live in the else branch — a stop DURING a crossfade
+        // (player non-null: the outgoing fading player; the new
+        // track still resolving on the ladder) only paused, so
+        // the late ladder callback started the new track over
+        // the stop. While buffering, Stop ALWAYS suppresses and
+        // invalidates, player or not.
+        if (buffering || (p == null && current != null)) {
+            // Nothing built yet (or still resolving): cancel the
+            // pending start so the late READY cannot autoplay
+            // (same rule as the mid-resolution pause in
+            // togglePlayback).
             suppressAutoPlay = true
             playToken++
         }
@@ -6430,16 +7155,25 @@ class MainActivity : Activity() {
             val npKey = t.id + "|" + (t.artworkLarge ?: t.artworkSmall ?: "")
             val trackChanged = npKey != lastNpArtKey
             lastNpArtKey = npKey
-            ArtworkLoader.load(hero, npArtwork, t.artworkSmall, resources.displayMetrics.widthPixels) {
-                if (trackChanged) fadeInNpArtwork()
+            // 0.6.13 audit fix: the hero decode request, the
+            // blurred backdrop AND the seek reset now run ONLY
+            // on a real track change — refreshPlaybackUi is
+            // called on every play/pause/state change, and the
+            // unguarded versions re-decoded the backdrop and
+            // snapped an in-progress seek bar back to 0:00 on
+            // every one of them.
+            if (trackChanged) {
+                ArtworkLoader.load(hero, npArtwork, t.artworkSmall, resources.displayMetrics.widthPixels) {
+                    fadeInNpArtwork()
+                }
+                ArtworkLoader.loadBlurred(hero, npBackdrop)
+                npSeek.progress = 0
+                npElapsed.text = "0:00"
+                lastNpElapsed = "0:00"
+                npRemaining.text = fmt(t.duration * 1000)
+                lastNpRemaining = npRemaining.text.toString()
             }
-            ArtworkLoader.loadBlurred(hero, npBackdrop)
             updateHeart()
-            npSeek.progress = 0
-            npElapsed.text = "0:00"
-            lastNpElapsed = "0:00"
-            npRemaining.text = fmt(t.duration * 1000)
-            lastNpRemaining = npRemaining.text.toString()
             // "Playing from {context}" top bar (v6): the owning
             // screen set the context; fall back to the artist.
             if (::npContextSmall.isInitialized) {
@@ -6764,6 +7498,7 @@ class MainActivity : Activity() {
                 null
             }
             runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
                 if (npLyricsKey != key) return@runOnUiThread
                 npLyrics = data
                 npLyricIdx = -2
@@ -6858,9 +7593,9 @@ class MainActivity : Activity() {
     }
 
     private fun sourceModeName(mode: String): String = when (mode) {
-        "audius" -> "Audius"
+        "audius" -> "Community"
         "both" -> "Both"
-        else -> "YouTube Music"
+        else -> "Main catalog"
     }
 
     private fun streamQuality(): String =
@@ -7226,6 +7961,10 @@ class MainActivity : Activity() {
     private fun cancelTimedSleep() {
         handler.removeCallbacks(sleepFadeStart)
         handler.removeCallbacks(sleepFadeTick)
+        // The expiry fade-out is a sleep callback too (0.6.13):
+        // cancelling the timer abandons a mid-flight ramp.
+        sleepFadeOut?.let { handler.removeCallbacks(it) }
+        sleepFadeOut = null
         val wasFading = sleepFadeRunning
         sleepFadeRunning = false
         sleepDeadline = 0L
@@ -7261,12 +8000,20 @@ class MainActivity : Activity() {
                 if (step < 20) {
                     handler.postDelayed(this, 100)
                 } else {
+                    sleepFadeOut = null
                     p.pause()
                     p.setVolume(1f)
                     refreshPlaybackUi()
                 }
             }
         }
+        // 0.6.13 audit fix: the fade lives in a FIELD now — as
+        // an anonymous local it could never be cancelled, so a
+        // destroyed activity's fade kept posting into its dead
+        // handler and a sleep-cancel left the ramp running
+        // underneath the restored volume.
+        sleepFadeOut?.let { handler.removeCallbacks(it) }
+        sleepFadeOut = fade
         handler.post(fade)
     }
 
@@ -7368,6 +8115,25 @@ class MainActivity : Activity() {
             .show()
     }
 
+    /**
+     * Library refresh after a playlist mutation (0.6.13 audit
+     * fix, HIGH): a plain showLibrary() here RESTORED the
+     * retained pre-change tree — the new playlist was invisible,
+     * a deleted one resurrected, until a tab switch forced a
+     * rebuild. The mutation path drops the retained tree, and
+     * when Library is the visible tab it also clears
+     * displayedRootTab first, so beginScreen's saveCurrentRoot
+     * cannot re-save the stale LIVE tree under the Library key
+     * on the way in.
+     */
+    private fun refreshLibraryAfterMutation() {
+        retainedRoots.remove("Library")
+        if (displayedRootTab == "Library") {
+            displayedRootTab = null
+            showLibrary()
+        }
+    }
+
     private fun showLibrary() {
         navRoot("tab:library") { showLibrary() }
         if (restoreRoot("Library")) return
@@ -7387,7 +8153,7 @@ class MainActivity : Activity() {
         val createBtn = pillButton("+ New Playlist", filled = true) {
             showNameDialog("New Playlist", "") { name ->
                 Playlists.create(this, name)
-                showLibrary()
+                refreshLibraryAfterMutation()
             }
         }
         val createLp = LinearLayout.LayoutParams(dp(168), dp(42))
@@ -7666,7 +8432,17 @@ class MainActivity : Activity() {
                 "Rename" to {
                     showNameDialog("Rename Playlist", p.name) { name ->
                         Playlists.rename(this, p.id, name)
-                        if (visibleScreen == "Library") showLibrary()
+                        // 0.6.13: refresh whichever surface shows
+                        // the name — the Library list (mutation
+                        // path, never the retained tree) or the
+                        // playlist page itself, whose header used
+                        // to keep the old name until re-entry.
+                        if (visibleScreen == "Playlist") {
+                            retainedRoots.remove("Library")
+                            showPlaylist(p.id)
+                        } else {
+                            refreshLibraryAfterMutation()
+                        }
                     }
                 },
                 "Delete Playlist" to {
@@ -7675,7 +8451,7 @@ class MainActivity : Activity() {
                             "Delete" to {
                                 Playlists.delete(this, p.id)
                                 Toast.makeText(this, "Playlist deleted", Toast.LENGTH_SHORT).show()
-                                showLibrary()
+                                refreshLibraryAfterMutation()
                             },
                             "Cancel" to {}
                         )
@@ -8131,11 +8907,17 @@ class MainActivity : Activity() {
     private fun onDownloadEvent(key: String, event: String) {
         runOnUiThread {
             if (isFinishing || isDestroyed) return@runOnUiThread
-            val pending = Downloads.pendingRows(this@MainActivity)
-                .firstOrNull { Downloads.key(it.first) == key }
             if (event == "progress") {
-                val st = pending?.second
-                dlProgressViews[key]?.let { (bar, tv) ->
+                // 0.6.13 audit fix: progress events fire per
+                // chunk; the vault scan (pendingRows reads both
+                // state stores) now runs ONLY when a progress row
+                // for this key is actually on screen. Off-screen
+                // progress costs one map lookup.
+                val row = dlProgressViews[key]
+                if (row != null) {
+                    val st = Downloads.pendingRows(this@MainActivity)
+                        .firstOrNull { Downloads.key(it.first) == key }?.second
+                    val (bar, tv) = row
                     val pct = st?.progress ?: 0
                     bar.isIndeterminate = pct <= 0
                     if (pct > 0) bar.progress = pct
@@ -8144,6 +8926,10 @@ class MainActivity : Activity() {
                 refreshDownloadButton()
                 return@runOnUiThread
             }
+            // Terminal events only: the toast title may need the
+            // pending row (a paused/failed track has no entry).
+            val pending = Downloads.pendingRows(this@MainActivity)
+                .firstOrNull { Downloads.key(it.first) == key }
             val entry = Downloads.entries(this).firstOrNull { Downloads.key(it.track) == key }
             val title = entry?.track?.title ?: pending?.first?.title
             when (event) {
@@ -8562,6 +9348,7 @@ class MainActivity : Activity() {
                 null
             }
             runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
                 if (lyricsKey != key) return@runOnUiThread
                 lyricsLoading = false
                 renderLyrics(data)
@@ -8579,13 +9366,11 @@ class MainActivity : Activity() {
             data == null -> {
                 lyricsStatus.text = "Lyrics unavailable for this track."
                 lyricsList.addView(label("No lyrics provider had this song.", 15f, white50))
-                // Printed diagnosis, same philosophy as Now Playing:
-                // the last fetch's per-provider outcomes, so a phone
-                // screenshot names the layer that failed.
+                // 0.6.13: the per-provider fetch report is
+                // diagnostics — it goes to the log, never the
+                // screen (raw internals in the UI read as a bug).
                 if (Lyrics.lastReport.isNotEmpty()) {
-                    lyricsList.addView(label(Lyrics.lastReport, 12.5f, white50).apply {
-                        setPadding(0, dp(10), 0, 0)
-                    })
+                    android.util.Log.e("Lyrics", Lyrics.lastReport)
                 }
             }
             data.instrumental -> {
@@ -8600,7 +9385,6 @@ class MainActivity : Activity() {
                 // hue; upcoming lines sit dim, the current line
                 // burns full-bright, sung lines dim further (the
                 // three states are applied in updateLyricsHighlight).
-                val seekOffset = lyricsTrack?.let { LyricOffsets.effectiveMs(this, it) } ?: 0L
                 val views = ArrayList<TextView>(lines.size)
                 lines.forEach { line ->
                     val tv = label(line.text.ifEmpty { "♪" }, 26f, Color.argb(120, 255, 255, 255), semiboldTf).apply {
@@ -8609,6 +9393,15 @@ class MainActivity : Activity() {
                         setOnClickListener {
                             // Tap-to-seek lands where the highlight
                             // says the line is: offset applied.
+                            // 0.6.13: the offset is read AT TAP
+                            // TIME — a per-track offset set or
+                            // auto-derived after this list rendered
+                            // used to be invisible to the tap,
+                            // which had captured the render-time
+                            // value.
+                            val seekOffset = lyricsTrack?.let {
+                                LyricOffsets.effectiveMs(this@MainActivity, it)
+                            } ?: 0L
                             // The glow leaves the old line HERE:
                             // resetting the active index would
                             // otherwise orphan its shadow (the
@@ -8660,6 +9453,17 @@ class MainActivity : Activity() {
             Springs.scale(it, 1f, 0.75f, 700f, instant = springsOff())
         }
         lyricsActiveLine = idx
+        if (idx < 0) {
+            // Seeked before the first line (0.6.13 audit fix):
+            // NO line is live, so every line returns to the
+            // initial upcoming base color — the ramp below would
+            // otherwise style distances from a phantom line and
+            // the previously active line kept its white read.
+            lyricsLineViews.forEach {
+                it.setTextColor(Color.argb(120, 255, 255, 255))
+            }
+            return
+        }
         // 0.6.13 DISTANCE FADE (Apple Music inspo): non-active
         // lines are no longer two flat dim levels — brightness
         // now falls off with DISTANCE from the live line, near
@@ -8825,7 +9629,11 @@ class MainActivity : Activity() {
         // rows on screen instead of building 200 row trees.
         val items = ArrayList<QueueItem>()
         items.add(QueueItem.Chips)
-        if (queue.isEmpty() || queueIndex < 0) {
+        // 0.6.13: the range check is a real `in indices` — a
+        // stale queueIndex PAST the end (queue shrank under it)
+        // used to pass the `queueIndex < 0` test and crash on
+        // queue[queueIndex] below.
+        if (queue.isEmpty() || queueIndex !in queue.indices) {
             items.add(QueueItem.Note("Queue is empty."))
         } else {
             items.add(QueueItem.Section("Now Playing", clear = false))
@@ -9171,9 +9979,12 @@ class MainActivity : Activity() {
                     updateVisualizerState()
                 }
                 if (name == "Compact mini-player") {
-                    val lp = mini.layoutParams as LinearLayout.LayoutParams
-                    lp.height = dp(if (checked) 48 else 58)
-                    mini.layoutParams = lp
+                    // 0.6.13: re-layout through the shared
+                    // helper (height AND padding) — the old
+                    // inline path set a 48dp height over 58dp
+                    // of content (42 artwork + 16 padding) and
+                    // the bar clipped its own contents.
+                    applyMiniSize()
                     // The layout listener re-fits the content inset.
                 }
                 onChange?.invoke(checked)
@@ -9224,9 +10035,16 @@ class MainActivity : Activity() {
         if (permanent) {
             miniVisualizerBars = arr
         } else {
-            // Rows rebuild wholesale on every render; cap the
+            // Rows rebuild wholesale on every render; prune the
             // registry so detached sets don't accumulate.
-            if (visualizerBarSets.size > 24) visualizerBarSets.clear()
+            // 0.6.13: prune ONLY the detached — the old
+            // size-triggered clear() wiped LIVE sets too, and
+            // rows rebuilt at that moment lost their animation
+            // silently (a clear at render-time races the sets
+            // other visible rows just registered).
+            visualizerBarSets.removeAll { set ->
+                set.firstOrNull()?.isAttachedToWindow != true
+            }
             visualizerBarSets.add(arr)
             // Registry hygiene (0.6.3, audit S4): a set leaves
             // the registry when its row leaves the window, so
@@ -9534,7 +10352,7 @@ class MainActivity : Activity() {
                 setOnClickListener { showProfileSheet() }
             }
             fillAvatar(avatarBox, 34)
-            avatarBoxes.add(avatarBox)
+            avatarBoxes.add(WeakReference(avatarBox))
             // No top margin (vertical centering handles placement);
             // the end side keeps the content's standard 22dp inset via
             // the content padding, aligned with every other row.
@@ -9627,9 +10445,14 @@ class MainActivity : Activity() {
     }
 
     /** Refreshes every live header avatar after a profile
-     *  change (tab retention can keep several roots alive). */
+     *  change (tab retention can keep several roots alive).
+     *  Dead weak references are pruned as they are found. */
     private fun refreshAvatars() {
-        for (box in avatarBoxes) fillAvatar(box, 34)
+        val iter = avatarBoxes.iterator()
+        while (iter.hasNext()) {
+            val box = iter.next().get()
+            if (box == null) iter.remove() else fillAvatar(box, 34)
+        }
     }
 
     /**
@@ -9783,6 +10606,18 @@ class MainActivity : Activity() {
         // or start a player inside this dying instance.
         playToken++
         suppressAutoPlay = true
+        // 0.6.13: the profile bottom sheet and the sleep-expiry
+        // fade join the teardown explicitly — the dialog
+        // outlived the activity before (a leaked window on
+        // rotation), and the fade's posts kept landing in the
+        // dead instance's handler.
+        try {
+            profileDialog?.dismiss()
+        } catch (_: Exception) {
+        }
+        profileDialog = null
+        sleepFadeOut?.let { handler.removeCallbacks(it) }
+        sleepFadeOut = null
         handler.removeCallbacks(ticker)
         handler.removeCallbacks(lyricsTicker)
         // 0.6.9: no spring, scroll animator or blur work outlives
