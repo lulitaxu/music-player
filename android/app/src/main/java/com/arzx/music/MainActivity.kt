@@ -792,6 +792,10 @@ class MainActivity : Activity() {
     private var lyricsLoading = false
     /** Track the lyrics overlay is showing (offset controls act on it). */
     private var lyricsTrack: Track? = null
+    /** The running lyrics auto-scroll animator (0.6.9): at most
+     *  one exists; a user touch on the lyrics scroll cancels it
+     *  so the highlight never fights the reader's finger. */
+    private var lyricsScrollAnim: ValueAnimator? = null
     /** Spinner shown in the lyrics header while a fetch runs. */
     private lateinit var lyricsSpinner: ProgressBar
     /** Offset row value label in the lyrics overlay. */
@@ -6678,20 +6682,27 @@ class MainActivity : Activity() {
             menuList.addView(row)
         }
         menuOverlay.visibility = View.VISIBLE
-        if (reduceMotion()) {
+        if (springsOff()) {
             menuOverlay.alpha = 1f
             menuPanel.translationY = 0f
             return
         }
+        // 0.6.9 sheet entrance: the dim fades in on a spring while
+        // the panel springs up from a 28dp offset — a decay
+        // entrance (fast attack, soft settle) replacing the
+        // alpha-only 150ms fade + fixed 220ms decelerate slide.
         menuOverlay.alpha = 0f
-        menuOverlay.animate().alpha(1f).setDuration(150).start()
+        Springs.alpha(menuOverlay, 1f, 0.9f, 700f, instant = false)
         menuPanel.translationY = dp(28).toFloat()
-        menuPanel.animate().translationY(0f).setDuration(220)
-            .setInterpolator(DecelerateInterpolator()).start()
+        Springs.translationY(menuPanel, 0f, 0.82f, 620f, instant = false)
     }
 
     private fun hideMenu() {
-        if (::menuOverlay.isInitialized) menuOverlay.visibility = View.GONE
+        if (::menuOverlay.isInitialized) {
+            Springs.cancel(menuOverlay)
+            Springs.cancel(menuPanel)
+            menuOverlay.visibility = View.GONE
+        }
     }
 
     /** The Now Playing ⋯ menu. Radio lives here; sleep timer, artist
@@ -7906,7 +7917,17 @@ class MainActivity : Activity() {
         })
         ctrlRow.addView(offBox, LinearLayout.LayoutParams(0, -2, 1f))
         inner.addView(ctrlRow)
-        lyricsScroll = ScrollView(this)
+        lyricsScroll = ScrollView(this).apply {
+            // 0.6.9: grabbing the lyrics kills any running
+            // auto-scroll animation instantly — the reader wins.
+            setOnTouchListener { _, e ->
+                if (e.actionMasked == MotionEvent.ACTION_DOWN) {
+                    lyricsScrollAnim?.cancel()
+                    lyricsScrollAnim = null
+                }
+                false
+            }
+        }
         lyricsList = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(10), 0, dp(40))
@@ -7944,7 +7965,12 @@ class MainActivity : Activity() {
 
     private fun hideLyrics() {
         handler.removeCallbacks(lyricsTicker)
-        if (::lyricsOverlay.isInitialized) lyricsOverlay.visibility = View.GONE
+        if (::lyricsOverlay.isInitialized) {
+            Springs.cancel(lyricsOverlay)
+            lyricsScrollAnim?.cancel()
+            lyricsScrollAnim = null
+            lyricsOverlay.visibility = View.GONE
+        }
     }
 
     /** Highlight driver for the lyrics overlay: 150ms cadence so
@@ -7981,8 +8007,17 @@ class MainActivity : Activity() {
         )
         lyricsOverlay.visibility = View.VISIBLE
         refreshOffsetLabel()
-        lyricsOverlay.alpha = 0f
-        lyricsOverlay.animate().alpha(1f).setDuration(180).start()
+        // 0.6.9: spring entrance (fade + rise from 24dp) instead
+        // of the alpha-only 180ms fade.
+        if (springsOff()) {
+            lyricsOverlay.alpha = 1f
+            lyricsOverlay.translationY = 0f
+        } else {
+            lyricsOverlay.alpha = 0f
+            lyricsOverlay.translationY = dp(24).toFloat()
+            Springs.alpha(lyricsOverlay, 1f, 0.9f, 700f, instant = false)
+            Springs.translationY(lyricsOverlay, 0f, 0.85f, 650f, instant = false)
+        }
         handler.removeCallbacks(lyricsTicker)
         handler.post(lyricsTicker)
         lyricsTitle.text = t.title
@@ -8116,6 +8151,8 @@ class MainActivity : Activity() {
             // The glow belongs to the current line ONLY: it leaves
             // with the highlight.
             setLyricGlow(it, 0)
+            // 0.6.9: the activation scale leaves with it too.
+            Springs.scale(it, 1f, 0.75f, 700f, instant = springsOff())
         }
         lyricsActiveLine = idx
         val view = lyricsLineViews.getOrNull(idx) ?: return
@@ -8124,10 +8161,51 @@ class MainActivity : Activity() {
         // Luminous halo around the live line (inspo board): soft
         // shadowLayer, no bitmap work, set once per line change.
         setLyricGlow(view, 18)
+        // 0.6.9: the live line grows a touch as it activates
+        // (Apple Music's synced-lyrics read), anchored at the
+        // left edge where the text starts; transform only, so the
+        // list layout never moves.
+        view.pivotX = 0f
+        Springs.scale(view, 1.04f, 0.75f, 700f, instant = springsOff())
         // Keep the current line centered-ish (inspo): a third of
         // the viewport down, not pinned to a fixed offset.
         val y = (view.top - lyricsScroll.height / 3).coerceAtLeast(0)
-        if (reduceMotion()) lyricsScroll.scrollTo(0, y) else lyricsScroll.smoothScrollTo(0, y)
+        scrollLyricsTo(y)
+    }
+
+    /** Animated lyrics auto-scroll (0.6.9): a single cancellable
+     *  animator glides the scroll to [y]; a user touch on the
+     *  lyrics scroll cancels it (buildLyricsOverlay) and a new
+     *  line target replaces it, so the highlight never fights
+     *  the reader. Motion off keeps the instant scrollTo. */
+    private fun scrollLyricsTo(y: Int) {
+        lyricsScrollAnim?.cancel()
+        lyricsScrollAnim = null
+        if (springsOff()) {
+            lyricsScroll.scrollTo(0, y)
+            return
+        }
+        val from = lyricsScroll.scrollY
+        if (from == y) return
+        lyricsScrollAnim = ValueAnimator.ofInt(from, y).apply {
+            duration = 380
+            interpolator = iosEase
+            addUpdateListener { a ->
+                if (::lyricsScroll.isInitialized) {
+                    lyricsScroll.scrollTo(0, a.animatedValue as Int)
+                }
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(a: android.animation.Animator) {
+                    if (lyricsScrollAnim === a) lyricsScrollAnim = null
+                }
+
+                override fun onAnimationCancel(a: android.animation.Animator) {
+                    if (lyricsScrollAnim === a) lyricsScrollAnim = null
+                }
+            })
+            start()
+        }
     }
 
     // ------------------------------------------------------------ queue screen
@@ -8215,8 +8293,17 @@ class MainActivity : Activity() {
         }
         queueRecycler.adapter = QueueAdapter(items)
         queueOverlay.visibility = View.VISIBLE
-        queueOverlay.alpha = 0f
-        queueOverlay.animate().alpha(1f).setDuration(180).start()
+        // 0.6.9: spring entrance (fade + rise from 24dp) instead
+        // of the alpha-only 180ms fade.
+        if (springsOff()) {
+            queueOverlay.alpha = 1f
+            queueOverlay.translationY = 0f
+        } else {
+            queueOverlay.alpha = 0f
+            queueOverlay.translationY = dp(24).toFloat()
+            Springs.alpha(queueOverlay, 1f, 0.9f, 700f, instant = false)
+            Springs.translationY(queueOverlay, 0f, 0.85f, 650f, instant = false)
+        }
     }
 
     /**
@@ -8423,7 +8510,10 @@ class MainActivity : Activity() {
     }
 
     private fun hideQueue() {
-        if (::queueOverlay.isInitialized) queueOverlay.visibility = View.GONE
+        if (::queueOverlay.isInitialized) {
+            Springs.cancel(queueOverlay)
+            queueOverlay.visibility = View.GONE
+        }
     }
 
     /** Removes one non-current track from the queue, remapping the
@@ -8907,12 +8997,18 @@ class MainActivity : Activity() {
             content.addView(brand, 0)
         }
         content.addView(head)
-        // Cheap 150ms fade so tab switches don't hard-cut.
-        if (reduceMotion()) {
+        // Tab/page switches (0.6.9): fade + an 8dp vertical
+        // slide on one cheap spring pair, replacing the flat
+        // 150ms fade — no stagger, nothing per-row, transform
+        // and alpha only.
+        if (springsOff()) {
             content.alpha = 1f
+            content.translationY = 0f
         } else {
             content.alpha = 0f
-            content.animate().alpha(1f).setDuration(150).start()
+            content.translationY = dp(8).toFloat()
+            Springs.alpha(content, 1f, 0.9f, 800f, instant = false)
+            Springs.translationY(content, 0f, 0.88f, 750f, instant = false)
         }
     }
 
