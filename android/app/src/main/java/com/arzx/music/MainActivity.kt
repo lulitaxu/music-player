@@ -2794,6 +2794,16 @@ class MainActivity : Activity() {
             val chip = label(name, 13.5f, white55, mediumTf).apply {
                 gravity = Gravity.CENTER
                 isClickable = true
+                // 0.6.12 FIX (Arz's screenshot, "that long type
+                // shi"): the four preset chips together are wider
+                // than the dialog on a phone screen, and a plain
+                // horizontal row CRUSHES its last chip ("Vocal")
+                // into a sliver, wrapping its label one letter per
+                // line into a tall pill. Chips are single-line now
+                // and the row scrolls horizontally (below), so a
+                // chip can never be compressed again.
+                maxLines = 1
+                isSingleLine = true
                 setPadding(dp(13), dp(7), dp(13), dp(7))
                 setOnClickListener {
                     eqController.setPreset(name)
@@ -2806,7 +2816,16 @@ class MainActivity : Activity() {
             chipRow.addView(chip, lp)
             chips[name] = chip
         }
-        box.addView(chipRow)
+        // The row sits in a scrollbar-free horizontal scroller:
+        // on wide screens it looks identical to a plain row; on
+        // narrow ones the chips keep their natural width and the
+        // row scrolls instead of crushing the last chip.
+        val chipScroller = android.widget.HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            addView(chipRow)
+        }
+        box.addView(chipScroller)
         refreshChips = {
             val active = eqController.presetName
             for ((name, chip) in chips) {
@@ -2923,6 +2942,10 @@ class MainActivity : Activity() {
             .create()
         refreshChips()
         dialog.show()
+        // The stock dialog button wears the PHONE's theme color
+        // (a random green on Arz's Realme) — tint it to the app
+        // accent so the sheet reads as one designed surface.
+        dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE)?.setTextColor(accent)
     }
 
     private fun setStreamQuality(q: String) {
@@ -6605,17 +6628,25 @@ class MainActivity : Activity() {
             }
             return
         }
-        val glow = GradientDrawable().apply {
-            shape = GradientDrawable.OVAL
-            gradientType = GradientDrawable.RADIAL_GRADIENT
-            setGradientCenter(0.5f, 0.30f)
-            gradientRadius = resources.displayMetrics.heightPixels * 0.75f
-            colors = intArrayOf(
+        // 0.6.12 FIX (Arz's screenshot: "the background is a
+        // fucking egg"): this drawable used to be shape OVAL with
+        // a radial gradient, which CLIPS the wash to the ellipse
+        // inscribed in the full-screen layer — a giant tinted egg
+        // floating on the page background, worst since 0.6.11
+        // tinted the page itself so the edge showed even harder.
+        // The ambient is now a full-bleed rectangle wash: the
+        // artwork color, strong at the top, melting into the page
+        // background with no edge anywhere (the Spotify-style
+        // ambience this was always meant to be).
+        val glow = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(
                 Color.argb(235, Color.red(c), Color.green(c), Color.blue(c)),
-                Color.argb(120, Color.red(c), Color.green(c), Color.blue(c)),
+                Color.argb(150, Color.red(c), Color.green(c), Color.blue(c)),
+                bgColor,
                 bgColor
             )
-        }
+        )
         npAmbient.background = glow
         npAmbient.visibility = View.VISIBLE
         if (animate && !reduceMotion()) {
