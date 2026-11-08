@@ -651,6 +651,10 @@ class MainActivity : Activity() {
     private var shuffleOn = false
     private var repeatMode = 0 // 0 = off, 1 = all, 2 = one
     private var playOrder: List<Int> = emptyList()
+    /** Built-in EQ (0.6.8): owns the audiofx effects riding the
+     *  current player's audio session. Created in onCreate,
+     *  synced from refreshPlaybackUi, released in onDestroy. */
+    private lateinit var eqController: EqController
     private var sleepDeadline = 0L
     /** 0.6.8 sleep fade: true while the timed sleep timer is
      *  inside its final volume ramp (see beginSleepFade).
@@ -1025,6 +1029,7 @@ class MainActivity : Activity() {
         instanceId = PlayerRegistry.claim()
         PlaybackBridge.clearState()
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
+        eqController = EqController(this)
         recentTracks.addAll(loadRecents())
         // Last-good Innertube client memory persists on disk so the
         // stream resolver tries the working context first.
@@ -2547,6 +2552,189 @@ class MainActivity : Activity() {
             .show()
     }
 
+    /** Built-in equalizer sheet (0.6.8): master switch, preset
+     *  chips, one vertical slider per band and a bass-boost
+     *  slider — every control wired straight to [EqController],
+     *  which persists the change and pushes it to the live audio
+     *  session in the same call. The pre-0.6.8 system effects
+     *  panel stays one tap away at the bottom. Lives in Settings
+     *  → Audio, on the row that used to open the system panel
+     *  directly: a sheet, like Crossfade and the lyrics offset,
+     *  because that is this app's settings idiom. */
+    private fun showEqualizerSheet() {
+        // Attach to the live session first (owner-only, like the
+        // state funnel) so band count, centres and range are the
+        // device's real ones, not the cached profile.
+        if (PlayerRegistry.isOwner(instanceId)) {
+            eqController.sync(player?.audioSessionId ?: 0)
+        }
+        val bands = eqController.uiBandCount()
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(6), dp(24), 0)
+        }
+        var refreshChips: () -> Unit = {}
+        var refreshSliders: () -> Unit = {}
+
+        // Master switch.
+        val masterRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        masterRow.addView(
+            label("Equalizer", 16f, Color.WHITE, mediumTf),
+            LinearLayout.LayoutParams(0, -2, 1f)
+        )
+        masterRow.addView(Switch(this).apply {
+            isChecked = eqController.enabled
+            thumbTintList = ColorStateList.valueOf(accent)
+            trackTintList = ColorStateList.valueOf(accent)
+            setOnCheckedChangeListener { _, checked -> eqController.enabled = checked }
+        })
+        box.addView(masterRow)
+
+        // Preset chips. "Custom" is a state, not a chip: moving
+        // any slider selects it and every chip simply unlights.
+        val chips = mutableMapOf<String, TextView>()
+        val chipRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(14), 0, dp(2))
+        }
+        for (name in EqController.PRESETS.keys) {
+            val chip = label(name, 13.5f, white55, mediumTf).apply {
+                gravity = Gravity.CENTER
+                isClickable = true
+                setPadding(dp(13), dp(7), dp(13), dp(7))
+                setOnClickListener {
+                    eqController.setPreset(name)
+                    refreshSliders()
+                    refreshChips()
+                }
+            }
+            val lp = LinearLayout.LayoutParams(-2, -2)
+            lp.marginEnd = dp(8)
+            chipRow.addView(chip, lp)
+            chips[name] = chip
+        }
+        box.addView(chipRow)
+        refreshChips = {
+            val active = eqController.presetName
+            for ((name, chip) in chips) {
+                val on = name == active
+                chip.setTextColor(if (on) accent else white55)
+                chip.background = GradientDrawable().apply {
+                    cornerRadius = dp(16).toFloat()
+                    setColor(if (on) surface2 else Color.TRANSPARENT)
+                    setStroke(dp(1), if (on) accent else white50)
+                }
+            }
+        }
+
+        // Band sliders: horizontal SeekBars rotated -90° inside
+        // fixed-height frames — the stock way to get vertical
+        // sliders from the framework widget. Progress 0..200
+        // maps to the stored fraction -1..+1.
+        val seekbars = arrayOfNulls<SeekBar>(bands)
+        val valueLabels = arrayOfNulls<TextView>(bands)
+        val sliderRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(10), 0, 0)
+        }
+        for (band in 0 until bands) {
+            val col = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+            }
+            val value = label(eqController.dbLabel(band), 11f, white55, mediumTf).apply {
+                gravity = Gravity.CENTER
+            }
+            valueLabels[band] = value
+            col.addView(value)
+            val seek = SeekBar(this).apply {
+                max = 200
+                progress = ((eqController.bandFraction(band) + 1f) * 100f).toInt()
+                progressTintList = ColorStateList.valueOf(accent)
+                thumbTintList = ColorStateList.valueOf(accent)
+                rotation = -90f
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                        if (!fromUser) return
+                        eqController.setBandFraction(band, progress / 100f - 1f)
+                        valueLabels[band]?.text = eqController.dbLabel(band)
+                        refreshChips()
+                    }
+
+                    override fun onStartTrackingTouch(sb: SeekBar?) {}
+                    override fun onStopTrackingTouch(sb: SeekBar?) {}
+                })
+            }
+            seekbars[band] = seek
+            val frame = FrameLayout(this)
+            val seekLp = FrameLayout.LayoutParams(dp(150), dp(44))
+            seekLp.gravity = Gravity.CENTER
+            frame.addView(seek, seekLp)
+            val frameLp = LinearLayout.LayoutParams(-1, dp(158))
+            frameLp.topMargin = dp(4)
+            col.addView(frame, frameLp)
+            col.addView(
+                label(eqController.centerLabel(band), 11f, white55, mediumTf).apply {
+                    gravity = Gravity.CENTER
+                }
+            )
+            sliderRow.addView(col, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+        box.addView(sliderRow)
+        refreshSliders = {
+            for (band in 0 until bands) {
+                seekbars[band]?.progress =
+                    ((eqController.bandFraction(band) + 1f) * 100f).toInt()
+                valueLabels[band]?.text = eqController.dbLabel(band)
+            }
+        }
+
+        // Bass boost: one horizontal slider, percent of the
+        // audiofx strength range.
+        val bassValue = label(
+            "Bass boost · ${eqController.bassStrength / 10}%", 14f, Color.WHITE, mediumTf
+        )
+        val bassLp = LinearLayout.LayoutParams(-1, -2)
+        bassLp.topMargin = dp(16)
+        box.addView(bassValue, bassLp)
+        box.addView(SeekBar(this).apply {
+            max = 100
+            progress = eqController.bassStrength / 10
+            progressTintList = ColorStateList.valueOf(accent)
+            thumbTintList = ColorStateList.valueOf(accent)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (!fromUser) return
+                    eqController.setBassStrength(progress * 10)
+                    bassValue.text = "Bass boost · $progress%"
+                }
+
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+        })
+
+        lateinit var dialog: android.app.AlertDialog
+        box.addView(label("System effects panel instead", 13.5f, accent, mediumTf).apply {
+            isClickable = true
+            setPadding(0, dp(14), 0, dp(4))
+            setOnClickListener {
+                dialog.dismiss()
+                openEqualizer()
+            }
+        })
+        dialog = android.app.AlertDialog.Builder(this)
+            .setTitle("Equalizer")
+            .setView(box)
+            .setPositiveButton("Done") { _, _ -> showSettings() }
+            .create()
+        refreshChips()
+        dialog.show()
+    }
+
     private fun setStreamQuality(q: String) {
         getPreferences(MODE_PRIVATE).edit().putString("stream_quality", q).apply()
         val name = when (q) {
@@ -2704,8 +2892,13 @@ class MainActivity : Activity() {
         )
 
         content.addView(settingsGroupHeader("Audio"))
-        content.addView(settingsRow("Equalizer", "Opens the system audio effects panel", iconRes = R.drawable.ic_equalizer) {
-            openEqualizer()
+        val eqSub = if (!eqController.enabled) {
+            "Off"
+        } else {
+            "Built-in · ${eqController.presetName} preset"
+        }
+        content.addView(settingsRow("Equalizer", eqSub, iconRes = R.drawable.ic_equalizer) {
+            showEqualizerSheet()
         })
 
         content.addView(settingsGroupHeader("Downloads & storage"))
@@ -5861,6 +6054,13 @@ class MainActivity : Activity() {
                 requestAmbient(t)
             }
         }
+        // Built-in EQ follows the player (0.6.8): re-attach the
+        // effects when the audio session changes. Owner-only,
+        // like the bridge below — a stale instance must never
+        // wire effects onto its dead session over the live one.
+        if (PlayerRegistry.isOwner(instanceId)) {
+            eqController.sync(player?.audioSessionId ?: 0)
+        }
         // Media notification + session mirror (0.6.1): pushed
         // from this one funnel, change-guarded inside.
         pushPlaybackState()
@@ -8775,6 +8975,7 @@ class MainActivity : Activity() {
         handler.removeCallbacks(crossfadeTick)
         handler.removeCallbacks(sleepFadeStart)
         handler.removeCallbacks(sleepFadeTick)
+        if (::eqController.isInitialized) eqController.release()
         discardGaplessPrep()
         // Release EVERY player this instance created — the main
         // player, the crossfade partner, the ARMED GAPLESS PREP
