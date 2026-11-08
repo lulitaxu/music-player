@@ -874,33 +874,13 @@ class MainActivity : Activity() {
      *  is reachable no matter how far the player is scrolled. */
     private lateinit var npCloseBtn: ImageView
 
-    // ---- v6.1: live (audio-reactive) visualizer ----
-    /** The audiofx Visualizer bound to the audible player's
-     *  session; null whenever live levels are not flowing. */
-    private var liveViz: android.media.audiofx.Visualizer? = null
-    /** Session [liveViz] is bound to; -1 = none. */
-    private var liveVizSession = -1
-    /** True while FFT levels (not the decorative pulse) drive the
-     *  bars. */
-    private var liveVizActive = false
-    /** Session whose Visualizer creation/polling already failed:
-     *  never retried (the decorative pulse covers it), so a broken
-     *  OEM Visualizer can't loop the state sync. */
-    private var liveVizFailedSession = -1
-    /** RECORD_AUDIO asked at most once per process; the system
-     *  dialog (or the Settings row) is the re-ask path. */
-    private var vizPermRequested = false
-    /** Preallocated FFT buffer: no per-frame allocation. */
-    private val vizFft = ByteArray(2048)
-    /** Smoothed per-band levels (fast attack, slow decay). */
-    private val vizLevels = FloatArray(4)
-    private val vizTick = object : Runnable {
-        override fun run() {
-            if (!liveVizActive) return
-            pollVizFft()
-            handler.postDelayed(this, if (reduceMotion()) 66L else 33L)
-        }
-    }
+    // ---- visualizer (0.6.7: playback-driven, no audio capture) ----
+    // The audiofx Visualizer is GONE: it needed RECORD_AUDIO, and a
+    // microphone permission in a music player is exactly what Play
+    // Protect flags. The bars are now animated from playback state
+    // and position only (see setVisualizerPulsing): they move while
+    // a track plays, freeze when it stalls, and stop when it stops.
+    // No capture, no permission, nothing recorded — ever.
 
     // ---- v6.1: gapless playback (crossfade-off path) ----
     /** A fully-built second player for the definite next track,
@@ -2761,9 +2741,8 @@ class MainActivity : Activity() {
         content.addView(settingsRow("Theme color", themeName(), iconRes = R.drawable.ic_theme, iconTint = accent) { showThemeSheet() })
         content.addView(setting("Ambient color from artwork", true) { applyAmbient(false) })
         content.addView(setting("Visualizer", true))
-        content.addView(setting("Live visualizer", true) { updateVisualizerState() })
         content.addView(
-            label(liveVizSubtitle(), 12.5f, white50).apply {
+            label("Bars move with playback — no microphone, nothing is captured", 12.5f, white50).apply {
                 setPadding(dp(38), 0, 0, dp(10))
             }
         )
@@ -4607,9 +4586,6 @@ class MainActivity : Activity() {
     private fun releaseActivePlayer() {
         val p = player ?: return
         if (fadeSource === p) fadeSource = null
-        // The session dies with the player: release the Visualizer
-        // bound to it rather than leaking it across tracks.
-        stopLiveViz()
         // A torn-down player has no boundary: drop any gapless prep.
         discardGaplessPrep()
         p.release()
@@ -5051,9 +5027,8 @@ class MainActivity : Activity() {
         fadeStep = 0
         fadeTotalSteps = (fadeMs / 100).coerceAtLeast(1)
         handler.postDelayed(crossfadeTick, 100)
-        // The live visualizer follows `player`, which already
-        // points at the INCOMING (becoming-audible) player.
-        syncVisualizerSession()
+        // The visualizer follows `player` (its position drives the
+        // bars), which already points at the INCOMING player.
     }
 
     /** Ends a running crossfade immediately: outgoing player
@@ -5063,7 +5038,6 @@ class MainActivity : Activity() {
         outPlayer?.release()
         outPlayer = null
         player?.setVolume(1f)
-        syncVisualizerSession()
     }
 
     // ------------------------------------------------- v6.1: gapless playback
@@ -5932,194 +5906,30 @@ class MainActivity : Activity() {
      * playing. (v4 drove it from the setting alone, so the bars
      * "played" next to a pause-state play button.)
      */
-    // ------------------------------------------------- v6.1: live visualizer
+    // --------------------------------------- visualizer (0.6.7)
 
     private fun vizBarsEnabled(): Boolean =
         getPreferences(MODE_PRIVATE).getBoolean("setting_Visualizer", true)
 
-    private fun liveVizOn(): Boolean =
-        getPreferences(MODE_PRIVATE).getBoolean("setting_Live visualizer", true)
-
-    /** The Settings subtitle for Live visualizer — it tells the
-     *  truth about the permission state, in the mandated words. */
-    private fun liveVizSubtitle(): String = when {
-        !liveVizOn() -> "Off — bars use a decorative pulse instead"
-        !vizPermissionGranted() -> "Permission needed — reads audio levels only, nothing is recorded"
-        else -> "Reads audio levels only — nothing is recorded"
-    }
-
-    private fun vizPermissionGranted(): Boolean =
-        checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
-            android.content.pm.PackageManager.PERMISSION_GRANTED
-
-    /**
-     * Keeps the audiofx Visualizer attached to the player that is
-     * (or is becoming) audible. Called from every playback-state
-     * change (via updateVisualizerState / refreshPlaybackUi) plus
-     * the crossfade edges: `player` flips to the incoming player
-     * the moment a fade starts, so following `player` IS following
-     * the audible side of the fade. Cheap when nothing changed —
-     * the session id compare short-circuits.
-     */
-    private fun syncVisualizerSession() {
-        val p = player
-        val want = p != null && isPlayingSafe() && vizBarsEnabled() && liveVizOn()
-        if (!want) {
-            stopLiveViz()
-            return
-        }
-        if (!vizPermissionGranted()) {
-            stopLiveViz()
-            // Ask once per process, with the rationale up front:
-            // the levels are computed on-device and discarded —
-            // nothing is recorded, stored or sent anywhere.
-            if (!vizPermRequested) {
-                vizPermRequested = true
-                Toast.makeText(
-                    this,
-                    "Live visualizer needs microphone permission — it reads audio levels only, nothing is recorded.",
-                    Toast.LENGTH_LONG
-                ).show()
-                if (android.os.Build.VERSION.SDK_INT >= 23) {
-                    requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO), 7717)
-                }
-            }
-            return
-        }
-        val sid = p.audioSessionId
-        if (sid <= 0) {
-            // Session not assigned yet (player not READY);
-            // onPlayerReady re-runs this via refreshPlaybackUi.
-            stopLiveViz()
-            return
-        }
-        if (sid == liveVizFailedSession) {
-            stopLiveViz()
-            return
-        }
-        if (liveViz != null && liveVizSession == sid && liveVizActive) return
-        startLiveViz(sid)
-    }
-
-    private fun startLiveViz(sessionId: Int) {
-        releaseLiveViz()
-        try {
-            val v = android.media.audiofx.Visualizer(sessionId)
-            val maxCapture = android.media.audiofx.Visualizer.getCaptureSizeRange()[1]
-            v.captureSize = maxCapture.coerceAtMost(1024)
-            v.enabled = true
-            liveViz = v
-            liveVizSession = sessionId
-            liveVizActive = true
-            // Real levels drive the bars now; the decorative pulse
-            // stands down (it would fight the FFT writes).
-            setVisualizerPulsing(false)
-            handler.removeCallbacks(vizTick)
-            handler.post(vizTick)
-        } catch (e: Exception) {
-            // Some OEM builds refuse Visualizer creation (or the
-            // session ended mid-flight): mark the session failed
-            // and let the caller's state pass start the decorative
-            // pulse — no retry, no recursion.
-            releaseLiveViz()
-            liveVizActive = false
-            liveVizFailedSession = sessionId
-        }
-    }
-
-    private fun releaseLiveViz() {
-        liveViz?.let {
-            try { it.enabled = false } catch (_: Exception) {}
-            try { it.release() } catch (_: Exception) {}
-        }
-        liveViz = null
-        liveVizSession = -1
-    }
-
-    /** Stops live capture entirely (paused / stopped / backgrounded
-     *  / feature off). The Visualizer is RELEASED, not just
-     *  disabled, so nothing holds the audio session while idle. */
-    private fun stopLiveViz() {
-        handler.removeCallbacks(vizTick)
-        val wasActive = liveVizActive
-        liveVizActive = false
-        releaseLiveViz()
-        if (wasActive) vizLevels.fill(0f)
-    }
-
-    /** One FFT poll (~30fps via vizTick; ~15fps under Reduce
-     *  Motion, which also damps amplitude). Four log-spaced bands
-     *  mapped onto the same 4 bars the decorative pulse used, so
-     *  no layout moves. Fast attack, slow decay smoothing. */
-    private fun pollVizFft() {
-        val v = liveViz ?: run { liveVizActive = false; return }
-        try {
-            if (v.getFft(vizFft) != android.media.audiofx.Visualizer.SUCCESS) return
-        } catch (e: Exception) {
-            // Poll blew up mid-stream: retire this session for good
-            // and fall back to the pulse via the state pass.
-            liveVizFailedSession = liveVizSession
-            stopLiveViz()
-            updateVisualizerState()
-            return
-        }
-        // FFT layout: [0]=DC, [1]=Nyquist, then re/im pairs per
-        // bin. Bands (upper bin edges) are log-spaced for music.
-        val edges = intArrayOf(3, 9, 24, 64)
-        var prev = 1
-        val rm = reduceMotion()
-        for (b in 0 until 4) {
-            var sum = 0f
-            var n = 0
-            for (k in prev..edges[b]) {
-                val re = vizFft[2 * k].toInt()
-                val im = vizFft[2 * k + 1].toInt()
-                sum += kotlin.math.sqrt((re * re + im * im).toFloat())
-                n++
-            }
-            prev = edges[b] + 1
-            var target = if (n > 0) (sum / n) / 110f else 0f
-            if (rm) target *= 0.55f
-            target = target.coerceIn(0f, 1f)
-            val cur = vizLevels[b]
-            vizLevels[b] = if (target > cur) {
-                cur + (target - cur) * 0.6f
-            } else {
-                cur + (target - cur) * 0.18f
-            }
-        }
-        applyVizLevels(miniVisualizerBars)
-        // Attached sets only (0.6.3, S4): a set whose row is in a
-        // discarded tree draws nothing; writing it was pure cost.
-        for (set in visualizerBarSets) {
-            if (set.firstOrNull()?.isAttachedToWindow == true) applyVizLevels(set)
-        }
-    }
-
-    private fun applyVizLevels(bars: Array<View>?) {
-        if (bars == null) return
-        for (i in bars.indices) {
-            val lvl = vizLevels[i % vizLevels.size]
-            bars[i].scaleY = (0.25f + lvl * 1.5f).coerceIn(0.2f, 1.8f)
-        }
-    }
-
     private fun updateVisualizerState() {
         if (!::visualizerView.isInitialized) return
-        // 0.6.1: (re)attach live capture to the audible session
-        // first; the pulse below only runs when live is NOT feeding.
-        syncVisualizerSession()
-        val on = vizBarsEnabled()
-        val show = on && isPlayingSafe()
+        // 0.6.7: no capture session to sync — the bars exist exactly
+        // while the setting is on AND audio is actually playing,
+        // and the pulse phase is read from the player's position.
+        val show = vizBarsEnabled() && isPlayingSafe()
         visualizerView.visibility = if (show) View.VISIBLE else View.GONE
-        setVisualizerPulsing(show && !liveVizActive)
+        setVisualizerPulsing(show)
     }
 
     /** One shared animator pulses every registered visualizer bar
      *  set with per-bar phase offsets: transform-only scaleY, no
-     *  layout passes, no per-frame allocation (the phase is the
-     *  animator's own value). Stops flat (scaleY 1) when off;
-     *  Reduce Motion keeps the bars static. */
+     *  layout passes, no per-frame allocation. Since 0.6.7 the
+     *  phase is derived from the audible player's POSITION (one
+     *  bar cycle per 1150ms of playback), so the motion is
+     *  genuinely playback-driven — it freezes when the stream
+     *  stalls and stops with the track — with no audio capture.
+     *  Stops flat (scaleY 1) when off; Reduce Motion keeps the
+     *  bars static. */
     private fun setVisualizerPulsing(on: Boolean) {
         if (on && !reduceMotion()) {
             if (visualizerAnimator?.isRunning == true) return
@@ -6135,7 +5945,16 @@ class MainActivity : Activity() {
                     val now = SystemClock.uptimeMillis()
                     if (now - lastPulseWriteMs < 33) return@addUpdateListener
                     lastPulseWriteMs = now
-                    val phase = a.animatedValue as Float
+                    // 0.6.7: phase from the playback position, not
+                    // the animator's clock; the animator is only
+                    // the frame ticker now. Fallback to the
+                    // animator value if no player is up yet.
+                    val posMs = player?.positionMs ?: -1L
+                    val phase = if (posMs >= 0L) {
+                        ((posMs % 1150L).toFloat() / 1150f) * (2 * Math.PI).toFloat()
+                    } else {
+                        a.animatedValue as Float
+                    }
                     applyVisualizerPhase(miniVisualizerBars, phase)
                     for (set in visualizerBarSets) {
                         if (set.firstOrNull()?.isAttachedToWindow == true) {
@@ -6857,12 +6676,13 @@ class MainActivity : Activity() {
         super.onStop()
     }
 
-    /** Capture never runs while the app is backgrounded: the
-     *  Visualizer is released here and re-created by the state
-     *  sync on resume if playback is still going. */
+    /** The bar animator never runs while the app is backgrounded:
+     *  cancelled here, re-armed by the state pass on resume if
+     *  playback is still going. (Background PLAYBACK itself is the
+     *  service's business and is untouched.) */
     override fun onPause() {
         super.onPause()
-        stopLiveViz()
+        visualizerAnimator?.cancel()
     }
 
     override fun onResume() {
@@ -6876,17 +6696,11 @@ class MainActivity : Activity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 7718) {
-            // Notification permission answered: granted or not,
-            // playback continues exactly as before.
-            return
-        }
-        if (requestCode != 7717) return
-        // Granted: live levels start on the next state pass.
-        // Denied: the Settings row subtitle now reads "Permission
-        // needed" and the decorative pulse keeps covering.
-        updateVisualizerState()
-        if (visibleScreen == "Settings") showSettings()
+        // 7718 (POST_NOTIFICATIONS) is the only permission request
+        // left in the app: granted or not, playback continues
+        // exactly as before, so there is nothing to do here. (The
+        // old 7717 RECORD_AUDIO request died with the audiofx live
+        // visualizer in 0.6.7.)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -8234,7 +8048,6 @@ class MainActivity : Activity() {
         "Gapless playback" -> R.drawable.ic_queue
         "Ambient color from artwork" -> R.drawable.ic_ambient
         "Visualizer" -> R.drawable.ic_visual
-        "Live visualizer" -> R.drawable.ic_wave
         "Glass effects" -> R.drawable.ic_glass
         "Compact mini-player" -> R.drawable.ic_compact
         "Reduce motion" -> R.drawable.ic_motion
@@ -8846,7 +8659,6 @@ class MainActivity : Activity() {
         handler.removeCallbacks(crossfadeTick)
         handler.removeCallbacks(sleepFire)
         discardGaplessPrep()
-        stopLiveViz()
         // Release EVERY player this instance created — the main
         // player, the crossfade partner, the ARMED GAPLESS PREP
         // and the fade-out source — through the process registry.

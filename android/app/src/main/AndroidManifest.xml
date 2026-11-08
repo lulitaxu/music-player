@@ -1,10 +1,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- Live visualizer only: the audiofx Visualizer reads playback
-         LEVELS from the player's own audio session. Nothing is
-         recorded or stored; the permission is Android's requirement
-         for any Visualizer use. -->
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- No RECORD_AUDIO (0.6.7): the visualizer bars are driven by
+         playback state and position, never by audio capture, so the
+         app needs no microphone permission at all. Play Protect
+         flagged the old audiofx-Visualizer permission as a
+         microphone in a music player; it is gone for good. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <!-- Background playback (0.6.1): the media notification is the
