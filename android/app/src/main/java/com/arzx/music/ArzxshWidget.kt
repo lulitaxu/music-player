@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.widget.RemoteViews
+import androidx.media3.common.util.UnstableApi
 
 /**
  * Home-screen widget (0.6.8): track title, artist, cover art and
@@ -46,6 +47,7 @@ class ArzxshWidgetProvider : AppWidgetProvider() {
     }
 }
 
+@OptIn(UnstableApi::class)
 object ArzxshWidget {
 
     /** Last snapshot handed over by the activity's funnel. */
