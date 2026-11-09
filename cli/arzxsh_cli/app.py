@@ -223,10 +223,20 @@ class ArzxshApp(App):
 
     # -- engine callbacks ------------------------------------------------
     def _engine_track_changed(self, track: dict):
+        # The engine can report a track change while the app is on
+        # its way out (mpv fires end-file during quit). Workers
+        # cannot start then: run_worker raises "App is not running"
+        # and the orphaned coroutine logs a never-awaited warning.
+        if not self.is_running:
+            return
         self._lyrics_track_id = None
         self._lyrics_data = None
         self._refresh_queue_panel()
-        self.run_worker(self._update_np_art(track), exclusive=False)
+        coro = self._update_np_art(track)
+        try:
+            self.run_worker(coro, exclusive=False)
+        except RuntimeError:
+            coro.close()
         self._refresh_current_view_light()
 
     async def _update_np_art(self, track: dict):
@@ -266,7 +276,11 @@ class ArzxshApp(App):
         # correct approach is re-running the current view renderer.
         name, kw = self._view
         if name in ("home", "liked", "local", "playlist_detail", "album", "artist"):
-            self.run_worker(self._rerun_view(), exclusive=True, group="rerun")
+            coro = self._rerun_view()
+            try:
+                self.run_worker(coro, exclusive=True, group="rerun")
+            except RuntimeError:
+                coro.close()
 
     async def _rerun_view(self):
         name, kw = self._view

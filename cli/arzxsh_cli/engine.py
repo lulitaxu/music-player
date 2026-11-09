@@ -35,6 +35,8 @@ class MpvDeck:
         self._read_task: asyncio.Task | None = None
         self.on_end_file = on_end_file
         self.on_file_loaded = on_file_loaded
+        self._closing = False
+        self._handler_tasks: set[asyncio.Task] = set()
         self.track_id: str | None = None
         self.volume = 0  # 0..100 deck-local (master scaling applied by engine)
         self.ready = False
@@ -86,11 +88,22 @@ class MpvDeck:
                     # Never await handlers inline: a handler may
                     # itself send commands whose replies only this
                     # loop can deliver (inline awaiting deadlocks).
-                    asyncio.create_task(self.on_end_file(self))
+                    # Handlers are tracked so shutdown can cancel
+                    # them; an untracked handler outlives the app
+                    # and crashes calling back into a dead UI.
+                    if not self._closing:
+                        self._spawn(self.on_end_file(self))
                 elif event == "file-loaded":
-                    asyncio.create_task(self.on_file_loaded(self))
+                    if not self._closing:
+                        self._spawn(self.on_file_loaded(self))
         except Exception:
             pass
+
+    def _spawn(self, coro):
+        task = asyncio.create_task(coro)
+        self._handler_tasks.add(task)
+        task.add_done_callback(self._handler_tasks.discard)
+        return task
 
     async def command(self, *args):
         if not self.writer:
@@ -132,6 +145,15 @@ class MpvDeck:
         self.track_id = None
 
     async def shutdown(self):
+        # Closing first: no new event handlers spawn, and any
+        # handler still in flight (e.g. an end-file advance racing
+        # the quit) is cancelled before it can touch the UI.
+        self._closing = True
+        handlers = list(self._handler_tasks)
+        for task in handlers:
+            task.cancel()
+        if handlers:
+            await asyncio.gather(*handlers, return_exceptions=True)
         try:
             await self.command("quit")
         except Exception:
@@ -161,6 +183,7 @@ class Engine:
         self.duration = 0.0
         self._radio_busy = False
         self._fading = False
+        self._closing = False
         self._ticker: asyncio.Task | None = None
         self._sleep_task: asyncio.Task | None = None
         self.sleep_deadline: float | None = None
@@ -191,8 +214,11 @@ class Engine:
         self._ticker = asyncio.create_task(self._tick_loop())
 
     async def shutdown(self):
+        self._closing = True
         if self._ticker:
             self._ticker.cancel()
+        if self._sleep_task:
+            self._sleep_task.cancel()
         await self.deck_a.shutdown()
         await self.deck_b.shutdown()
 
@@ -277,6 +303,8 @@ class Engine:
         await self._start_at(index, fade=False)
 
     async def _start_at(self, index: int, fade: bool):
+        if self._closing:
+            return
         track = self.queue[index]
         self.index = index
         self.current = track
@@ -369,13 +397,15 @@ class Engine:
 
     # -- mpv events ---------------------------------------------------
     async def _on_file_loaded(self, deck: MpvDeck):
+        if self._closing:
+            return
         if deck is self.active:
             dur = await deck.get("duration")
             if dur:
                 self.duration = float(dur)
 
     async def _on_end_file(self, deck: MpvDeck):
-        if deck is not self.active or self._fading:
+        if self._closing or deck is not self.active or self._fading:
             return
         fade_s = float(self.store.data["crossfade_s"])
         if fade_s > 0 and self.has_next():
