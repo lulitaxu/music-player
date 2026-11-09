@@ -332,7 +332,14 @@ object ArtworkLoader {
         // DOWNSCALING the caller's (high-resolution) URL — v5.1
         // passes the w1080 hero URL — never by upscaling a
         // thumbnail; a 256px decode keeps the gradients smooth.
-        decodeShared(url, 256, heroPool) { small ->
+        // 0.6.16: the decode runs on the shared pool, NOT the
+        // single hero thread — queued behind the hero's own
+        // full-size fetch/decode there, the backdrop landed
+        // seconds after a track change (and read as "it only
+        // updates when I touch the player"). The bytes are
+        // already cached by the hero fetch, so this is a small
+        // CPU decode that now proceeds in parallel.
+        decodeShared(url, 256, pool) { small ->
             val blurred = small?.let { blur(it) }
             if (blurred != null) cache.put(key, blurred)
             Handler(Looper.getMainLooper()).post {
@@ -357,7 +364,10 @@ object ArtworkLoader {
             onColor(null)
             return
         }
-        heroPool.execute {
+        // 0.6.16: shared pool, not the single hero thread (see
+        // loadBlurred) — the wash must land WITH the track
+        // change, not seconds behind the hero decode.
+        pool.execute {
             val bmp = decode(url, 256)
             val color = bmp?.let { dominantVibrant(it) }
             Handler(Looper.getMainLooper()).post { onColor(color) }
@@ -377,7 +387,7 @@ object ArtworkLoader {
             onPalette(null)
             return
         }
-        heroPool.execute {
+        pool.execute {
             val bmp = decode(url, 256)
             val palette = bmp?.let { paletteColors(it) }
             Handler(Looper.getMainLooper()).post { onPalette(palette) }
@@ -6100,7 +6110,12 @@ class MainActivity : Activity() {
         meta.layoutParams = metaLp
         val metaText = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         npTitle = label("", 21f, Color.WHITE, boldTf).apply {
-            maxLines = 1
+            // 0.6.16: two lines before the ellipsis — long titles
+            // ("Open Secret Bibek kothay", "snakelike (the stars
+            // collide)") were cut mid-word on one line in Arz's
+            // 0.6.15 recording while the mini player showed them
+            // in full.
+            maxLines = 2
             ellipsize = TextUtils.TruncateAt.END
         }
         npArtist = label("", 16.5f, white55).apply {
@@ -6530,6 +6545,10 @@ class MainActivity : Activity() {
 
     private fun hideNowPlaying() {
         if (!::nowPlaying.isInitialized) return
+        // 0.6.16: the lyrics overlay belongs to the player;
+        // closing the player always takes it down too, so it
+        // can never be left floating over the shell.
+        hideLyrics()
         // 0.6.9: the morph spring replaces the 230ms slide-down;
         // finishNpClose hides the panel at the spring's rest.
         settleNpMorph(0f)
@@ -6539,6 +6558,12 @@ class MainActivity : Activity() {
         when {
             ::menuOverlay.isInitialized && menuOverlay.visibility == View.VISIBLE -> hideMenu()
             ::queueOverlay.isInitialized && queueOverlay.visibility == View.VISIBLE -> hideQueue()
+            // 0.6.16: the lyrics overlay sits in the back chain
+            // ABOVE Now Playing (it was missing entirely, so Back
+            // from lyrics closed the player underneath and left
+            // the lyrics floating over the shell — the interleaved
+            // Home+lyrics frame in Arz's 0.6.15 recording).
+            ::lyricsOverlay.isInitialized && lyricsOverlay.visibility == View.VISIBLE -> hideLyrics()
             ::nowPlaying.isInitialized && nowPlaying.visibility == View.VISIBLE -> hideNowPlaying()
             // Content screens pop exactly one level (0.6.1
             // back-stack); at a tab root goBack() returns false
@@ -8096,6 +8121,18 @@ class MainActivity : Activity() {
                 // the ambient glow retargets to the new artwork.
                 fetchNpLyrics(t)
                 requestAmbient(t)
+            }
+            // 0.6.16 backdrop self-heal (Arz's main 0.6.15 report:
+            // the NP blur "stays another" until the player is
+            // touched): if the backdrop is sitting EMPTY on any
+            // playback refresh — an in-flight decode dropped, a
+            // cold open — re-request it for the CURRENT track.
+            // A cache hit applies instantly; an in-flight decode
+            // just gains a waiter via decodeShared's dedup, so
+            // this can never double-fetch or blank a good
+            // backdrop (it only fires while the view is empty).
+            if (::npBackdrop.isInitialized && npBackdrop.drawable == null) {
+                ArtworkLoader.loadBlurred(hero, npBackdrop)
             }
         }
         // Built-in EQ follows the player (0.6.8): re-attach the
@@ -10322,13 +10359,19 @@ class MainActivity : Activity() {
         lyricsOverlay.visibility = View.VISIBLE
         // 0.6.9: spring entrance (fade + rise from 24dp) instead
         // of the alpha-only 180ms fade.
+        // 0.6.16: the fade is GONE. The overlay's background is
+        // fully OPAQUE, so fading the whole surface in over the
+        // live player composited both UIs at partial alpha for
+        // the length of the spring — the doubled controls and
+        // ghost text in Arz's 0.6.15 recording. The entrance is
+        // now the rise only: the surface is opaque from the
+        // first frame, so what is underneath is never visible
+        // through it.
+        lyricsOverlay.alpha = 1f
         if (springsOff()) {
-            lyricsOverlay.alpha = 1f
             lyricsOverlay.translationY = 0f
         } else {
-            lyricsOverlay.alpha = 0f
             lyricsOverlay.translationY = dp(24).toFloat()
-            Springs.alpha(lyricsOverlay, 1f, 0.9f, 700f, instant = false)
             Springs.translationY(lyricsOverlay, 0f, 0.85f, 650f, instant = false)
         }
         handler.removeCallbacks(lyricsTicker)
@@ -10488,6 +10531,14 @@ class MainActivity : Activity() {
                 // into the ramp — passed lines recede, they don't
                 // just switch off.
                 it.text = it.text.toString()
+                // 0.6.16: release the activation height lock (see
+                // the activation block) so the line measures
+                // naturally again.
+                if (it.layoutParams.height != ViewGroup.LayoutParams.WRAP_CONTENT) {
+                    it.layoutParams = it.layoutParams.apply {
+                        height = ViewGroup.LayoutParams.WRAP_CONTENT
+                    }
+                }
                 Springs.translationY(it, -dp(4).toFloat(), 0.8f, 600f, instant = springsOff())
             }
             lyricsActiveLine = idx
@@ -10520,9 +10571,15 @@ class MainActivity : Activity() {
             // paints the sung part pure white on top of it.
             view.setTextColor(Color.argb(168, 255, 255, 255))
             view.typeface = boldTf
-            // Luminous halo around the live line (inspo board): soft
-            // shadowLayer, no bitmap work, set once per line change.
-            setLyricGlow(view, 18)
+            // 0.6.16: the luminous halo is REMOVED (was a radius-18
+            // shadowLayer). On the phone it did not read as a glow;
+            // it read as a blurred second copy of the line, with a
+            // bright blob running past the line's end (Arz's
+            // 0.6.15 recording, Kaaktaal lines). The sweep's pure
+            // white fill on the 168-alpha base carries the active
+            // read on its own now. Radius 0 also clears any shadow
+            // a pre-0.6.16 state could have left on this view.
+            setLyricGlow(view, 0)
             // 0.6.9: the live line grows a touch as it activates
             // (Apple Music's synced-lyrics read), anchored at the
             // left edge where the text starts; transform only, so
@@ -10530,6 +10587,23 @@ class MainActivity : Activity() {
             // and the line carries right padding now — the grown
             // text stays on screen (see renderLyrics).
             view.pivotX = 0f
+            // 0.6.16: pivotY at the TOP too, and the line's height
+            // is LOCKED to its laid-out height for its whole
+            // active life. The scale previously grew the line
+            // about its center, so a two-line active view swelled
+            // over its neighbours mid-animation — and a wrapped
+            // line re-measured mid-entrance could paint its
+            // second line outside its own bounds (the "girl"
+            // overlap in Arz's 0.6.15 recording). Growing from
+            // the top-left keeps the swell inside the line's own
+            // padding, and the locked height makes a mid-flight
+            // re-measure structurally unable to collapse the box
+            // under wrapped text. Released on deactivation.
+            view.pivotY = 0f
+            if (view.height > 0 && view.layoutParams.height != view.height) {
+                val locked = view.height
+                view.layoutParams = view.layoutParams.apply { height = locked }
+            }
             Springs.scale(view, 1.03f, 0.75f, 700f, instant = springsOff())
             // 0.6.14: the incoming line RISES IN — it starts a
             // few dp low and springs home as it activates, the
@@ -10607,8 +10681,19 @@ class MainActivity : Activity() {
         val to = if (full) n - 1 else minOf(n - 1, active + 8)
         for (i in from..to) {
             if (i == active) continue
+            val v = lyricsLineViews[i]
+            // 0.6.16: a non-active line must carry NO sweep spans.
+            // A ForegroundColorSpan outranks setTextColor, so any
+            // path that left a partial white span on a line (the
+            // stale lit "You" in Arz's 0.6.15 recording) would
+            // otherwise survive every ramp pass forever. Strip
+            // the spans here, where every non-active line in the
+            // window is re-styled on every line change.
+            if (v.text is android.text.Spanned) {
+                v.text = v.text.toString()
+            }
             val d = kotlin.math.abs(i - active)
-            lyricsLineViews[i].setTextColor(
+            v.setTextColor(
                 Color.argb(lyricDimAlpha(d, i < active), 255, 255, 255)
             )
         }
