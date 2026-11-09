@@ -26,6 +26,8 @@ fun trackToJson(t: Track): JSONObject = JSONObject().apply {
     put("artistId", t.artistId ?: JSONObject.NULL)
     put("artworkSmall", t.artworkSmall ?: JSONObject.NULL)
     put("artworkLarge", t.artworkLarge ?: JSONObject.NULL)
+    put("album", t.album ?: JSONObject.NULL)
+    put("albumId", t.albumId ?: JSONObject.NULL)
 }
 
 fun trackFromJson(o: JSONObject): Track? = try {
@@ -35,7 +37,9 @@ fun trackFromJson(o: JSONObject): Track? = try {
         o.optString("artworkSmall", null)?.takeIf { it.isNotEmpty() },
         o.optString("artworkLarge", null)?.takeIf { it.isNotEmpty() },
         o.optString("source", SOURCE_AUDIUS),
-        o.optString("artistId", null)?.takeIf { it.isNotEmpty() }
+        o.optString("artistId", null)?.takeIf { it.isNotEmpty() },
+        o.optString("album", null)?.takeIf { it.isNotEmpty() },
+        o.optString("albumId", null)?.takeIf { it.isNotEmpty() }
     )
 } catch (_: Exception) {
     null

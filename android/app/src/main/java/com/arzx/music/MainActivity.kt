@@ -89,7 +89,16 @@ data class Track(
     /** Catalog this track came from: [SOURCE_AUDIUS] or [SOURCE_YOUTUBE]. */
     val source: String = SOURCE_AUDIUS,
     /** YouTube Music channel id of the track's artist, when known. */
-    val artistId: String? = null
+    val artistId: String? = null,
+    /** Album this track belongs to, when the source metadata
+     *  carries it (0.6.15): YTM shelf rows name the album (and
+     *  link it), album-page tracks are stamped with their page,
+     *  local files carry their ID3 album tag. Null everywhere
+     *  else — older persisted tracks simply have no album, and
+     *  nothing invents one. [albumId] is the YTM browse id
+     *  ("MPRE…") that opens the album page, when known. */
+    val album: String? = null,
+    val albumId: String? = null
 )
 
 /**
@@ -869,6 +878,10 @@ class MainActivity : Activity() {
 
     private lateinit var content: LinearLayout
     private lateinit var bottomBar: LinearLayout
+    /** Mini player + its progress line, wrapped so the pair can
+     *  collapse as one (0.6.15): with no track loaded the whole
+     *  wrap is GONE — no empty slab, no dead transport buttons. */
+    private lateinit var miniWrap: LinearLayout
     private lateinit var mini: LinearLayout
     private lateinit var visualizerView: LinearLayout
     private lateinit var miniArtwork: ImageView
@@ -1239,6 +1252,8 @@ class MainActivity : Activity() {
     private lateinit var queueRecycler: RecyclerView
 
     private val tabViews = mutableMapOf<String, Triple<LinearLayout, ImageView, TextView>>()
+    /** Selected-tab dot indicators (0.6.15), keyed like [tabViews]. */
+    private val tabDots = mutableMapOf<String, View>()
     private val categoryArtViews = mutableListOf<ImageView>()
 
     // ---- v6 Spotify palette (replaces the Apple-Music red era) ----
@@ -1501,6 +1516,16 @@ class MainActivity : Activity() {
             bottomBar.viewTreeObserver.removeOnGlobalLayoutListener(shellLayoutListener)
         }
         val root = FrameLayout(this).apply { setBackgroundColor(bgColor) }
+        // System bars wear the theme too (0.6.15): onCreate set
+        // them once, but a live accent change rebuilds every
+        // surface EXCEPT the window's — the body went green
+        // while the status strip kept the previous theme's dark
+        // wine/purple. showShell is the one funnel every shell
+        // (re)build passes through, so the bars re-tint here,
+        // from the same bgColor the header sits on: the top of
+        // the screen is continuous with the app body.
+        window.statusBarColor = bgColor
+        window.navigationBarColor = bgColor
 
         val scroll = ScrollView(this)
         content = LinearLayout(this).apply {
@@ -1639,7 +1664,15 @@ class MainActivity : Activity() {
         // Thin progress line along the mini player's bottom edge
         // (inspo), plus the buffering state: while a track resolves
         // or buffers, the line goes indeterminate.
-        val miniWrap = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        miniWrap = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            // Born collapsed (0.6.15): no track is loaded at
+            // shell build, and the mini player only exists once
+            // one is. refreshPlaybackUi owns the visibility from
+            // here — it re-shows the wrap on the theme/glass
+            // rebuilds that land here mid-playback.
+            visibility = View.GONE
+        }
         val miniLp = LinearLayout.LayoutParams(-1, dp(58))
         miniWrap.addView(mini, miniLp)
         // Compact sizing is applied by the one helper the
@@ -1676,9 +1709,15 @@ class MainActivity : Activity() {
                     { Color.argb(48, 255, 255, 255) }
                 )
             } else {
-                setBackgroundColor(Color.BLACK)
+                // Theme-derived surface (0.6.15): the bar used to
+                // be flat black whatever the theme, a hard seam
+                // under the tinted body. It now sits on the same
+                // accent-mixed surface family as the cards.
+                setBackgroundColor(surface)
             }
-            setPadding(dp(4), dp(2), dp(4), dp(2))
+            // Breathing room (0.6.15): 2dp top/bottom read as
+            // cramped against the 52dp cells.
+            setPadding(dp(4), dp(6), dp(4), dp(6))
         }
         val tabs = listOf(
             Triple("Home", R.drawable.ic_home, Runnable { showHome() }),
@@ -1692,7 +1731,10 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER
                 contentDescription = name
-                setPadding(0, dp(7), 0, dp(5))
+                // 0.6.15: tightened from 7/5 — the selected-tab
+                // dot joined the cell, and glyph + label + dot
+                // must fit the 52dp cell without clipping.
+                setPadding(0, dp(4), 0, dp(2))
                 // Instant visible feedback the moment a finger
                 // lands (0.6.10): before this the cell gave no
                 // sign a tap had registered at all, so a swallowed
@@ -1734,10 +1776,28 @@ class MainActivity : Activity() {
             }
             box.addView(iv, LinearLayout.LayoutParams(dp(23), dp(23)))
             box.addView(tv)
+            // Selected-tab dot (0.6.15): a small accent bead
+            // under the label of the active tab — the third
+            // signal next to the accent glyph and label, so the
+            // selection reads at a glance. Invisible (not gone)
+            // on inactive tabs: the cells keep one geometry.
+            val dot = View(this).apply {
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(accent)
+                }
+                visibility = View.INVISIBLE
+                isClickable = false
+                isFocusable = false
+            }
+            val dotLp = LinearLayout.LayoutParams(dp(4), dp(4))
+            dotLp.topMargin = dp(3)
+            box.addView(dot, dotLp)
             nav.addView(box, LinearLayout.LayoutParams(0, dp(52), 1f))
             tabViews[name] = Triple(box, iv, tv)
+            tabDots[name] = dot
         }
-        val navLp = LinearLayout.LayoutParams(-1, dp(58))
+        val navLp = LinearLayout.LayoutParams(-1, dp(64))
         navLp.topMargin = dp(4)
         bottomBar.addView(nav, navLp)
         root.addView(bottomBar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
@@ -1889,6 +1949,11 @@ class MainActivity : Activity() {
             if (tabName == name) {
                 iv.setColorFilter(accent)
                 tv.setTextColor(accent)
+                // Refined selection (0.6.15): the active label
+                // steps up a weight and the dot bead appears —
+                // glyph, label and bead all carry the accent.
+                tv.typeface = semiboldTf
+                tabDots[tabName]?.visibility = View.VISIBLE
                 // Active-tab pop (0.6.10): the newly selected
                 // glyph springs from 0.78 to full size on the
                 // fast secondary press spring, so the tap gets a
@@ -1908,6 +1973,8 @@ class MainActivity : Activity() {
             } else {
                 iv.setColorFilter(white55)
                 tv.setTextColor(white55)
+                tv.typeface = mediumTf
+                tabDots[tabName]?.visibility = View.INVISIBLE
                 iv.scaleX = 1f
                 iv.scaleY = 1f
             }
@@ -2461,18 +2528,40 @@ class MainActivity : Activity() {
                 // stuff, local and instant), then card shelves.
                 // Greeting + avatar live in the header beginScreen
                 // already drew.
+                // Greeting subtitle (0.6.15): the quiet line
+                // directly under the header's big greeting,
+                // before any shelf. Both render paths (cold and
+                // warm swap) converge here, below beginScreen.
+                content.addView(
+                    label(greetingSubtitle(), 13.5f, white50).apply {
+                        val lp = LinearLayout.LayoutParams(-1, -2)
+                        lp.topMargin = dp(3)
+                        layoutParams = lp
+                    }
+                )
                 val picks = homeQuickPicks()
                 if (picks.isNotEmpty()) {
                     content.addView(quickPickGrid(picks))
                     any = true
                 }
-                if (recentTracks.isNotEmpty()) {
+                // Shelf dedupe (0.6.15): one track, one Home
+                // appearance. Quick picks claim their tracks
+                // first; every later LOCAL shelf (Jump back in,
+                // Made for tonight, the unified rail) filters
+                // against the claimed set and claims its own,
+                // so the same song can no longer stare at him
+                // from two shelves at once.
+                val shownTracks = HashSet<String>()
+                picks.forEach { pick ->
+                    pick.track?.let { shownTracks.add(trackKey(it)) }
+                }
+                val jumpList = recentTracks.filter {
+                    shownTracks.add(trackKey(it))
+                }
+                if (jumpList.isNotEmpty()) {
                     content.addView(sectionTitle("Jump back in"))
                     content.addView(
-                        trackCardRow(
-                            recentTracks.toList(), 148, recentTracks.toList(),
-                            showProgress = true
-                        )
+                        trackCardRow(jumpList, 148, jumpList, showProgress = true)
                     )
                     any = true
                 }
@@ -2490,17 +2579,34 @@ class MainActivity : Activity() {
                         val h = java.util.Calendar.getInstance().apply {
                             timeInMillis = ts
                         }.get(java.util.Calendar.HOUR_OF_DAY)
-                        if (h >= 22 || h < 5) {
+                        // Dedupe (0.6.15): a night track an
+                        // earlier shelf already showed is not a
+                        // candidate here either.
+                        if ((h >= 22 || h < 5) && trackKey(t) !in shownTracks) {
                             nightPicks.putIfAbsent(trackKey(t), t)
                         }
                         if (nightPicks.size >= 10) break
                     }
                     if (nightPicks.size >= 3) {
                         val nightList = nightPicks.values.toList()
+                        nightList.forEach { shownTracks.add(trackKey(it)) }
                         content.addView(sectionTitle("Made for tonight"))
                         content.addView(trackCardRow(nightList, 132, nightList))
                         any = true
                     }
+                }
+                // Everything in one (0.6.15): ONE rail mixing
+                // albums and songs from his real play history —
+                // album cards for albums with 2+ distinct tracks
+                // in history, song cards for the rest, interleaved
+                // by recency and deduped against every shelf
+                // above. Fewer than 3 real entries = no rail:
+                // thin history is shown honestly, never padded.
+                val railEntries = unifiedRailEntries(shownTracks)
+                if (railEntries.size >= 3) {
+                    content.addView(sectionTitle("Everything in one"))
+                    content.addView(unifiedRailRow(railEntries))
+                    any = true
                 }
                 if (charts != null && charts.songs.isNotEmpty()) {
                     content.addView(sectionTitle("Trending"))
@@ -2631,6 +2737,71 @@ class MainActivity : Activity() {
         return if (name != null) pick.format(name) else pick
     }
 
+    /** The greeting's quiet second line (0.6.15, Arz: "add
+     *  small text underneath of that greeting"): same system
+     *  as [greetingTitle] — a per-bucket pool, one pick per
+     *  day, the profile name slotted in when set — with a
+     *  different seed offset, so title and subtitle rotate on
+     *  their own schedules instead of in lockstep. Rendered
+     *  small and dim under the greeting; it supports the
+     *  headline, never competes with it. */
+    private fun greetingSubtitle(): String {
+        val cal = java.util.Calendar.getInstance()
+        val hour = cal.get(java.util.Calendar.HOUR_OF_DAY)
+        val name = Profile.displayName(this).trim()
+            .split(Regex("\\s+")).firstOrNull()?.takeIf { it.isNotEmpty() }
+        val named: List<String>
+        val plain: List<String>
+        when (hour) {
+            in 5..11 -> {
+                named = listOf(
+                    "Your morning rotation, %s", "Start the day loud, %s",
+                    "First songs of the day, %s"
+                )
+                plain = listOf(
+                    "Your morning rotation", "Start the day loud",
+                    "First songs of the day"
+                )
+            }
+            in 12..16 -> {
+                named = listOf(
+                    "Your afternoon soundtrack, %s", "The midday queue, %s",
+                    "Songs to carry the day, %s"
+                )
+                plain = listOf(
+                    "Your afternoon soundtrack", "The midday queue",
+                    "Songs to carry the day"
+                )
+            }
+            in 17..21 -> {
+                named = listOf(
+                    "Wind down with your favorites, %s",
+                    "Golden hour, your sound, %s", "The evening rotation, %s"
+                )
+                plain = listOf(
+                    "Wind down with your favorites",
+                    "Golden hour, your sound", "The evening rotation"
+                )
+            }
+            else -> {
+                named = listOf(
+                    "For the hours nobody sees, %s",
+                    "Your midnight rotation, %s",
+                    "Songs for the quiet hours, %s"
+                )
+                plain = listOf(
+                    "For the hours nobody sees", "Your midnight rotation",
+                    "Songs for the quiet hours"
+                )
+            }
+        }
+        val pool = if (name != null) named else plain
+        val seed = cal.get(java.util.Calendar.DAY_OF_YEAR) * 31 +
+            cal.get(java.util.Calendar.YEAR) + 101
+        val pick = pool[Math.floorMod(seed, pool.size)]
+        return if (name != null) pick.format(name) else pick
+    }
+
     /** One quick-pick slot: exactly one of [track] / [playlist]. */
     private data class HomePick(val track: Track?, val playlist: Playlist?)
 
@@ -2731,11 +2902,7 @@ class MainActivity : Activity() {
         }
         chip.addView(artSlot, LinearLayout.LayoutParams(dp(56), dp(56)))
         chip.addView(
-            label(
-                track?.title ?: playlist?.name ?: "", 13.5f, Color.WHITE, mediumTf
-            ).apply {
-                maxLines = 2
-                ellipsize = TextUtils.TruncateAt.END
+            cardTitle(track?.title ?: playlist?.name ?: "").apply {
                 setPadding(dp(10), 0, dp(8), 0)
             },
             LinearLayout.LayoutParams(0, -2, 1f)
@@ -2750,6 +2917,176 @@ class MainActivity : Activity() {
         }
         MotionPress.attach(chip, primary = false) { springsOff() }
         return chip
+    }
+
+    /** The one Home card title (0.6.15): quick-pick chips and
+     *  every shelf card clamp their titles through here — two
+     *  lines, end-ellipsis, one typeface and size — so a long
+     *  title is treated identically everywhere on Home instead
+     *  of each surface hand-rolling its own clamp (the drift
+     *  that left quick picks cutting titles the shelves showed
+     *  in full). */
+    private fun cardTitle(text: String): TextView =
+        label(text, 13.5f, Color.WHITE, mediumTf).apply {
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+        }
+
+    /** One entry in Home's unified rail (0.6.15): exactly one
+     *  of [song] / [albumTracks] is set. [ts] is the newest play
+     *  behind the entry — the rail sorts by it, so albums and
+     *  songs interleave in true recency order. [albumRep] is the
+     *  album group's newest track: it carries the album's name,
+     *  id, artist and artwork. */
+    private data class RailEntry(
+        val ts: Long,
+        val song: Track?,
+        val albumTracks: List<Track>?,
+        val albumRep: Track?
+    )
+
+    /** Builds the "Everything in one" rail from REAL play
+     *  history: an album card for every album with at least two
+     *  distinct tracks in history (grouped by the album id the
+     *  source metadata carried — YTM rows and album pages stamp
+     *  it since 0.6.15, so groups form from plays recorded from
+     *  this build on; nothing is reconstructed or invented for
+     *  older plays), plus song cards for distinct recent tracks.
+     *  [claimed] holds the keys earlier Home shelves already
+     *  showed: those tracks reappear neither as songs nor (via
+     *  their group's representative) as albums, and the rail
+     *  claims what it takes for any shelf rendered after it. */
+    private fun unifiedRailEntries(claimed: MutableSet<String>): List<RailEntry> {
+        val events = PlayHistory.events(this)
+        if (events.isEmpty()) return emptyList()
+        val groupTracks = LinkedHashMap<String, MutableList<Track>>()
+        val groupSeen = HashMap<String, HashSet<String>>()
+        val groupRep = HashMap<String, Track>()
+        val groupTs = HashMap<String, Long>()
+        for ((t, ts) in events) {
+            val aid = t.albumId ?: continue
+            if (t.album.isNullOrEmpty()) continue
+            if (groupSeen.getOrPut(aid) { HashSet() }.add(trackKey(t))) {
+                groupTracks.getOrPut(aid) { ArrayList() }.add(t)
+            }
+            if (!groupRep.containsKey(aid)) {
+                // Events are newest-first: the first sighting is
+                // the group's representative and its timestamp.
+                groupRep[aid] = t
+                groupTs[aid] = ts
+            }
+        }
+        val entries = ArrayList<RailEntry>()
+        val emittedAlbums = HashSet<String>()
+        for ((aid, tracksInGroup) in groupTracks) {
+            if (tracksInGroup.size < 2) continue
+            val rep = groupRep[aid] ?: continue
+            if (trackKey(rep) in claimed) continue
+            emittedAlbums.add(aid)
+            entries += RailEntry(groupTs[aid] ?: 0L, null, tracksInGroup, rep)
+        }
+        val seenSongs = HashSet<String>()
+        for ((t, ts) in events) {
+            if (!seenSongs.add(trackKey(t))) continue
+            if (trackKey(t) in claimed) continue
+            // A track whose album is on the rail rides behind
+            // its album card instead of duplicating as a song.
+            if (t.albumId != null && t.albumId in emittedAlbums) continue
+            entries += RailEntry(ts, t, null, null)
+        }
+        entries.sortByDescending { it.ts }
+        val out = entries.take(12)
+        for (e in out) {
+            e.song?.let { claimed.add(trackKey(it)) }
+            e.albumRep?.let { claimed.add(trackKey(it)) }
+        }
+        return out
+    }
+
+    /** The unified rail's card row (0.6.15): song cards play in
+     *  rail context; album cards open the album page. Geometry
+     *  matches [trackCardRow] exactly — uniform square
+     *  center-crop art, the shared [cardTitle] clamp — so the
+     *  mixed rail reads as one shelf, not a second design. */
+    private fun unifiedRailRow(entries: List<RailEntry>): HorizontalScrollView {
+        val scroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            clipToPadding = false
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(4), 0, dp(2))
+        }
+        // Queue context for the rail's songs: every track the
+        // rail represents, in rail order — album members ride
+        // along behind their card.
+        val queueContext = ArrayList<Track>()
+        entries.forEach { e ->
+            e.song?.let { queueContext.add(it) }
+            e.albumTracks?.let { queueContext.addAll(it) }
+        }
+        entries.forEach { e ->
+            val song = e.song
+            val rep = e.albumRep
+            val box = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+            }
+            val boxLp = LinearLayout.LayoutParams(dp(132), -2)
+            boxLp.marginEnd = dp(14)
+            box.layoutParams = boxLp
+            val img = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                roundedClip(this, 10)
+            }
+            val artTrack = song ?: rep
+            ArtworkLoader.load(artTrack?.artworkLarge ?: artTrack?.artworkSmall, img)
+            box.addView(img, LinearLayout.LayoutParams(dp(132), dp(132)))
+            if (song != null) {
+                box.addView(cardTitle(song.title).apply {
+                    val lp = LinearLayout.LayoutParams(-1, -2)
+                    lp.topMargin = dp(7)
+                    layoutParams = lp
+                })
+                box.addView(label(song.artist, 12.5f, white50).apply {
+                    maxLines = 1
+                    ellipsize = TextUtils.TruncateAt.END
+                })
+                box.setOnClickListener {
+                    setQueue(queueContext)
+                    play(song)
+                }
+            } else if (rep != null) {
+                box.addView(cardTitle(rep.album ?: rep.title).apply {
+                    val lp = LinearLayout.LayoutParams(-1, -2)
+                    lp.topMargin = dp(7)
+                    layoutParams = lp
+                })
+                box.addView(
+                    label(
+                        listOf("Album", rep.artist).filter { it.isNotEmpty() }
+                            .joinToString(" · "),
+                        12.5f, white50
+                    ).apply {
+                        maxLines = 1
+                        ellipsize = TextUtils.TruncateAt.END
+                    }
+                )
+                box.setOnClickListener {
+                    val aid = rep.albumId ?: return@setOnClickListener
+                    showAlbum(
+                        YtmAlbumRef(
+                            aid, rep.album ?: rep.title, rep.artist,
+                            rep.artistId, null,
+                            rep.artworkSmall, rep.artworkLarge
+                        )
+                    )
+                }
+            }
+            MotionPress.attach(box, primary = false) { springsOff() }
+            row.addView(box)
+        }
+        scroll.addView(row)
+        return scroll
     }
 
     /** Horizontal card shelf for tracks (Spotify-style home,
@@ -2806,9 +3143,7 @@ class MainActivity : Activity() {
             } else {
                 box.addView(img, LinearLayout.LayoutParams(dp(cardDp), dp(cardDp)))
             }
-            box.addView(label(item.title, 13.5f, Color.WHITE, mediumTf).apply {
-                maxLines = 2
-                ellipsize = TextUtils.TruncateAt.END
+            box.addView(cardTitle(item.title).apply {
                 val lp = LinearLayout.LayoutParams(-1, -2)
                 lp.topMargin = dp(7)
                 layoutParams = lp
@@ -2884,9 +3219,7 @@ class MainActivity : Activity() {
                 frame.addView(grid, FrameLayout.LayoutParams(-1, -1))
             }
             box.addView(frame, LinearLayout.LayoutParams(dp(132), dp(132)))
-            box.addView(label(p.name, 13.5f, Color.WHITE, mediumTf).apply {
-                maxLines = 2
-                ellipsize = TextUtils.TruncateAt.END
+            box.addView(cardTitle(p.name).apply {
                 val lp = LinearLayout.LayoutParams(-1, -2)
                 lp.topMargin = dp(7)
                 layoutParams = lp
@@ -7675,6 +8008,17 @@ class MainActivity : Activity() {
     private fun refreshPlaybackUi() {
         val t = current
         val playing = isPlayingSafe()
+        // Mini-player existence follows the track (0.6.15):
+        // no track loaded, no mini player at all — the wrap
+        // (bar + progress line) collapses and the tab bar sits
+        // directly under the content. A loaded track (playing,
+        // paused, or stopped-resumable) keeps the slim bar.
+        // fitContentPadding re-runs off the bar's layout pass,
+        // so the content inset tracks the collapse on its own.
+        if (::miniWrap.isInitialized) {
+            val want = if (t == null) View.GONE else View.VISIBLE
+            if (miniWrap.visibility != want) miniWrap.visibility = want
+        }
         miniPlayButton.setImageResource(if (playing) R.drawable.ic_pause else R.drawable.ic_play)
         miniPlayButton.contentDescription = if (playing) "Pause" else "Play"
         if (::npPlayButton.isInitialized) {
@@ -9039,6 +9383,11 @@ class MainActivity : Activity() {
                 ?.trim().orEmpty()
             var artist = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST)
                 ?.trim().orEmpty()
+            // The file's own album tag (0.6.15): local tracks
+            // group under it on Home's unified rail, same as
+            // streamed tracks under their YTM album.
+            val albumTag = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM)
+                ?.trim()?.takeIf { it.isNotEmpty() }
             val durMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 ?.toLongOrNull() ?: 0L
             if (title.isEmpty()) {
@@ -9062,7 +9411,7 @@ class MainActivity : Activity() {
             }
             Track(
                 uri.toString(), title, artist, (durMs / 1000).toInt(),
-                artPath, artPath, SOURCE_LOCAL, null
+                artPath, artPath, SOURCE_LOCAL, null, albumTag, null
             )
         } catch (_: Exception) {
             null
@@ -10644,7 +10993,9 @@ class MainActivity : Activity() {
                     o.optString("artworkSmall", null)?.takeIf { it.isNotEmpty() },
                     o.optString("artworkLarge", null)?.takeIf { it.isNotEmpty() },
                     o.optString("source", SOURCE_AUDIUS),
-                    o.optString("artistId", null)?.takeIf { it.isNotEmpty() }
+                    o.optString("artistId", null)?.takeIf { it.isNotEmpty() },
+                    o.optString("album", null)?.takeIf { it.isNotEmpty() },
+                    o.optString("albumId", null)?.takeIf { it.isNotEmpty() }
                 )
             }
         } catch (_: Exception) {
@@ -10673,6 +11024,8 @@ class MainActivity : Activity() {
                     put("artistId", t.artistId ?: JSONObject.NULL)
                     put("artworkSmall", t.artworkSmall ?: JSONObject.NULL)
                     put("artworkLarge", t.artworkLarge ?: JSONObject.NULL)
+                    put("album", t.album ?: JSONObject.NULL)
+                    put("albumId", t.albumId ?: JSONObject.NULL)
                 })
             }
             getPreferences(MODE_PRIVATE).edit()

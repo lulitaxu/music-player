@@ -424,6 +424,7 @@ object YtmApi {
         val artistName: String?,
         val artistId: String?,
         val albumName: String?,
+        val albumId: String?,
         val durationSec: Int,
         val year: String?,
         val metaTexts: List<String>,
@@ -440,7 +441,9 @@ object YtmApi {
                 artworkSmall = artworkSmall,
                 artworkLarge = artworkLarge,
                 source = SOURCE_YOUTUBE,
-                artistId = artistId ?: fallbackArtistId
+                artistId = artistId ?: fallbackArtistId,
+                album = albumName,
+                albumId = albumId
             )
         }
     }
@@ -475,6 +478,7 @@ object YtmApi {
         var artistName: String? = null
         var artistId: String? = null
         var albumName: String? = null
+        var albumId: String? = null
         var durationSec = 0
         var year: String? = null
         val metaTexts = ArrayList<String>()
@@ -490,7 +494,10 @@ object YtmApi {
                         artistName = text
                         artistId = bid
                     }
-                    bid != null && bid.startsWith("MPRE") -> albumName = text
+                    bid != null && bid.startsWith("MPRE") -> {
+                        albumName = text
+                        albumId = bid
+                    }
                     durationRe.matches(text.trim()) -> durationSec = parseDuration(text)
                     yearRe.matches(text.trim()) -> year = text.trim()
                     else -> metaTexts.add(text)
@@ -507,7 +514,7 @@ object YtmApi {
         val (small, large) = itemThumbs(item)
         return ListItemData(
             title, videoId, browseId, artistName, artistId, albumName,
-            durationSec, year, metaTexts, small, large
+            albumId, durationSec, year, metaTexts, small, large
         )
     }
 
@@ -784,7 +791,12 @@ object YtmApi {
         for (section in browseSections(resp)) {
             for (item in shelfItems(section)) {
                 parseListItem(item)?.toTrack(fallbackArtist = artist, fallbackArtistId = artistId)
-                    ?.let { tracks.add(it) }
+                    // Album-page rows rarely repeat the album in
+                    // their own metadata: stamp the page's album
+                    // onto its tracks (0.6.15), so history recorded
+                    // from album plays groups under the real album
+                    // on Home's unified rail.
+                    ?.let { tracks.add(it.copy(album = title, albumId = ref.id)) }
             }
         }
         return YtmAlbumPage(ref.id, title, artist, artistId, year, artworkLarge, tracks)

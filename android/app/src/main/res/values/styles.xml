@@ -2,8 +2,13 @@
     <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
         <item name="android:fontFamily">sans</item>
         <item name="android:colorAccent">#1DB954</item>
-        <item name="android:navigationBarColor">#121212</item>
-        <item name="android:statusBarColor">#121212</item>
+        <!-- Pre-onCreate frame only (the activity re-tints both
+             bars from the live theme the moment it builds): the
+             default-accent bgColor, so even the first frame is
+             continuous with the app body instead of a clashing
+             neutral strip (0.6.15). -->
+        <item name="android:navigationBarColor">#142D1D</item>
+        <item name="android:statusBarColor">#142D1D</item>
         <item name="android:windowLightStatusBar">false</item>
     </style>
 </resources>

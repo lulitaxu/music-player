@@ -344,7 +344,9 @@ object Downloads {
                         o.optString("artworkSmall", null)?.takeIf { it.isNotEmpty() },
                         o.optString("artworkLarge", null)?.takeIf { it.isNotEmpty() },
                         o.optString("source", SOURCE_AUDIUS),
-                        o.optString("artistId", null)?.takeIf { it.isNotEmpty() }
+                        o.optString("artistId", null)?.takeIf { it.isNotEmpty() },
+                        o.optString("album", null)?.takeIf { it.isNotEmpty() },
+                        o.optString("albumId", null)?.takeIf { it.isNotEmpty() }
                     ),
                     o.getString("fileName")
                 )
@@ -862,6 +864,8 @@ object Downloads {
                 put("artistId", e.track.artistId ?: JSONObject.NULL)
                 put("artworkSmall", e.track.artworkSmall ?: JSONObject.NULL)
                 put("artworkLarge", e.track.artworkLarge ?: JSONObject.NULL)
+                put("album", e.track.album ?: JSONObject.NULL)
+                put("albumId", e.track.albumId ?: JSONObject.NULL)
                 put("fileName", e.fileName)
             })
         }
