@@ -12,7 +12,10 @@ python3 -m venv .venv
 ```
 
 Endpoints: `/health` `/search` `/artist/{id}` `/album/{id}` `/charts`
-`/radio?video_id=` `/stream/{videoId}`
+`/radio?video_id=` `/stream/{videoId}` `/audio/{videoId}` (same-origin
+byte proxy for the Linux web app) `/lyrics/{videoId}`. The server also
+serves the Linux web frontend from `../linux/app` when present; see
+`../linux/README.md`.
 
 ## Environment quirks (dev sandbox only)
 

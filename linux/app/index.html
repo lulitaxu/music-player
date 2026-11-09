@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>arzxsh for Linux</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23fc3c44'/%3E%3Cpath d='M10 22V10l12 6z' fill='white'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="shell">
+  <aside id="sidebar">
+    <div class="wordmark">arzxsh</div>
+    <nav>
+      <button class="nav-item active" data-nav="home"><span class="nav-ico">⌂</span>Home</button>
+      <button class="nav-item" data-nav="search"><span class="nav-ico">⌕</span>Search</button>
+      <button class="nav-item" data-nav="library"><span class="nav-ico">▤</span>Library</button>
+    </nav>
+    <div class="side-label">Your library</div>
+    <button class="side-link" id="likedLink">♥&nbsp; Liked Songs <span class="side-count" id="likedCount"></span></button>
+    <div class="side-label">Recently played</div>
+    <div id="sideRecent"></div>
+    <div class="side-foot">Local web app · same catalog<br>and design as the phone app.</div>
+  </aside>
+
+  <main id="main">
+    <header id="topbar">
+      <div class="top-nav">
+        <button id="backBtn" class="round-btn" title="Back">‹</button>
+        <button id="fwdBtn" class="round-btn" title="Forward">›</button>
+      </div>
+      <div id="searchWrap">
+        <span class="search-ico">⌕</span>
+        <input id="searchInput" type="text" placeholder="Artists, Songs, Lyrics and More" autocomplete="off" spellcheck="false">
+        <button id="searchClear" class="hidden" title="Clear">✕</button>
+        <div id="suggestBox" class="hidden"></div>
+      </div>
+      <div class="top-spacer"></div>
+    </header>
+    <div id="view"></div>
+  </main>
+</div>
+
+<div id="player" class="hidden">
+  <div class="player-track" id="playerTrack">
+    <img id="pArt" alt="">
+    <div class="player-meta">
+      <div id="pTitle" class="p-title"></div>
+      <div id="pArtist" class="p-artist"></div>
+    </div>
+    <button id="pHeart" class="icon-btn" title="Like">♡</button>
+  </div>
+  <div class="player-center">
+    <div class="player-controls">
+      <button id="shuffleBtn" class="icon-btn small" title="Shuffle">⤨</button>
+      <button id="prevBtn" class="icon-btn" title="Previous">⏮</button>
+      <button id="playBtn" class="play-btn" title="Play or pause">▶</button>
+      <button id="nextBtn" class="icon-btn" title="Next">⏭</button>
+      <button id="repeatBtn" class="icon-btn small" title="Repeat">↻</button>
+    </div>
+    <div class="seek-row">
+      <span id="tElapsed">0:00</span>
+      <input id="seek" type="range" min="0" max="1000" value="0">
+      <span id="tTotal">0:00</span>
+    </div>
+  </div>
+  <div class="player-right">
+    <canvas id="vizMini" width="72" height="28" title="Visualizer"></canvas>
+    <button id="queueBtn" class="icon-btn" title="Queue">☰</button>
+    <span class="vol-ico">🔊</span>
+    <input id="volume" type="range" min="0" max="100" value="80">
+    <button id="expandBtn" class="icon-btn" title="Now Playing">⤢</button>
+  </div>
+</div>
+
+<div id="nowPlaying" class="hidden">
+  <div id="npBackdrop"></div>
+  <div class="np-inner">
+    <div class="np-head">
+      <button id="npClose" class="round-btn" title="Close">⌄</button>
+      <div class="np-context" id="npContext">Now Playing</div>
+      <div class="np-head-spacer"></div>
+    </div>
+    <div class="np-grid">
+      <div class="np-left">
+        <img id="npArt" alt="">
+        <div id="npTitle"></div>
+        <div id="npArtist"></div>
+        <canvas id="viz" width="520" height="64"></canvas>
+        <div class="seek-row np-seek">
+          <span id="npElapsed">0:00</span>
+          <input id="npSeek" type="range" min="0" max="1000" value="0">
+          <span id="npTotal">0:00</span>
+        </div>
+        <div class="player-controls np-controls">
+          <button id="npShuffle" class="icon-btn small" title="Shuffle">⤨</button>
+          <button id="npPrev" class="icon-btn" title="Previous">⏮</button>
+          <button id="npPlay" class="play-btn big" title="Play or pause">▶</button>
+          <button id="npNext" class="icon-btn" title="Next">⏭</button>
+          <button id="npRepeat" class="icon-btn small" title="Repeat">↻</button>
+        </div>
+        <div class="np-toggles">
+          <button id="lyricsBtn" class="chip-btn">Lyrics</button>
+          <button id="npQueueBtn" class="chip-btn">Queue</button>
+          <button id="npHeart" class="chip-btn">♡ Like</button>
+        </div>
+      </div>
+      <div class="np-right">
+        <div id="npPanel">
+          <section id="aboutCard" class="np-card hidden">
+            <div class="np-card-label">ABOUT THE ARTIST</div>
+            <div class="about-row">
+              <img id="aboutArt" alt="">
+              <div>
+                <div id="aboutName"></div>
+                <div id="aboutSubs"></div>
+              </div>
+            </div>
+            <p id="aboutBio"></p>
+          </section>
+          <section id="lyricsCard" class="np-card hidden">
+            <div class="np-card-label">LYRICS</div>
+            <pre id="lyricsText"></pre>
+            <div id="lyricsSource" class="muted small"></div>
+          </section>
+          <section id="queueCard" class="np-card hidden">
+            <div class="np-card-label">QUEUE</div>
+            <div id="queueList"></div>
+            <div class="muted small" id="queueNote"></div>
+          </section>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="hidden"></div>
+<script src="app.js"></script>
+</body>
+</html>

@@ -10,10 +10,13 @@ Run:  .venv/bin/uvicorn app:app --host 0.0.0.0 --port 8077
 
 import os
 import time
+from pathlib import Path
 from urllib.parse import quote
 
+import requests
 import yt_dlp
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from ytmusicapi import YTMusic
 
 # Optional UA override. ytmusicapi's stock user agent is an old Firefox 88
@@ -249,34 +252,132 @@ def radio(video_id: str):
         raise HTTPException(502, f"radio failed: {e.__class__.__name__}")
 
 
+def _resolve_stream(video_id: str) -> dict:
+    """yt-dlp resolution shared by /stream (URL hand-off) and /audio
+    (byte proxy). Signed googlevideo URLs expire, hence the short
+    cache TTL at the call sites."""
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "skip_download": True,
+    }
+    # Only for TLS-intercepted dev sandboxes (MITM proxy with a private
+    # CA that yt-dlp's bundled store rejects). Never set in production.
+    if os.environ.get("YTM_DL_NO_VERIFY") == "1":
+        opts["nocheckcertificate"] = True
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(
+            f"https://www.youtube.com/watch?v={quote(video_id)}",
+            download=False,
+        )
+    return {
+        "id": video_id,
+        "url": info.get("url"),
+        "format": info.get("format"),
+        "ext": info.get("ext"),
+        "abr": info.get("abr"),
+        "expires_in_s": 300,
+    }
+
+
 @app.get("/stream/{video_id}")
 def stream(video_id: str):
     """Resolve a playable audio URL server-side. Cached briefly; signed
     googlevideo URLs expire, so the TTL stays short."""
 
+    try:
+        return cached(f"stream:{video_id}", 300, lambda: _resolve_stream(video_id))
+    except Exception as e:
+        raise HTTPException(502, f"stream resolution failed: {e.__class__.__name__}")
+
+
+@app.get("/audio/{video_id}")
+def audio(video_id: str, request: Request):
+    """Stream a track's audio bytes through this server (Linux web app).
+
+    The web player needs same-origin media: a raw googlevideo URL is
+    cross-origin without CORS headers, which would taint the Web Audio
+    analyser and break the visualizer. Proxying keeps media same-origin
+    and lets the browser treat the player like any local file. The
+    client's Range header is forwarded so seeking works; the upstream
+    status and range headers pass back untouched. Only the audio for
+    the requested video id is ever fetched — this is not a general
+    relay, and the server binds to localhost in the shipped run
+    script."""
+    try:
+        resolved = cached(f"stream:{video_id}", 300, lambda: _resolve_stream(video_id))
+    except Exception as e:
+        raise HTTPException(502, f"stream resolution failed: {e.__class__.__name__}")
+    url = resolved.get("url")
+    if not url:
+        raise HTTPException(502, "stream resolution returned no URL")
+    headers = {}
+    range_header = request.headers.get("range")
+    if range_header:
+        headers["Range"] = range_header
+    try:
+        upstream = requests.get(url, headers=headers, stream=True, timeout=30)
+    except Exception as e:
+        raise HTTPException(502, f"audio fetch failed: {e.__class__.__name__}")
+    if upstream.status_code not in (200, 206):
+        upstream.close()
+        raise HTTPException(502, f"audio fetch returned {upstream.status_code}")
+    passthrough = {}
+    for name in ("content-type", "content-length", "content-range", "accept-ranges"):
+        value = upstream.headers.get(name)
+        if value:
+            passthrough[name] = value
+
+    def body():
+        try:
+            for chunk in upstream.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+
+    return StreamingResponse(
+        body(),
+        status_code=upstream.status_code,
+        headers=passthrough,
+        media_type=passthrough.get("content-type"),
+    )
+
+
+@app.get("/lyrics/{video_id}")
+def lyrics(video_id: str):
+    """Plain-text lyrics via the watch playlist's lyrics page
+    (ytmusicapi). Not every track has lyrics; an empty result is a
+    normal 200 with null lyrics, not an error."""
+
     def run():
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "format": "bestaudio[ext=m4a]/bestaudio/best",
-            "skip_download": True,
-        }
-        # Only for TLS-intercepted dev sandboxes (MITM proxy with a private
-        # CA that yt-dlp's bundled store rejects). Never set in production.
-        if os.environ.get("YTM_DL_NO_VERIFY") == "1":
-            opts["nocheckcertificate"] = True
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={quote(video_id)}", download=False)
+        watch = ytm.get_watch_playlist(videoId=video_id, limit=1)
+        browse_id = watch.get("lyrics")
+        if not browse_id:
+            return {"id": video_id, "lyrics": None, "source": None}
+        page = ytm.get_lyrics(browse_id, timestamps=False)
         return {
             "id": video_id,
-            "url": info.get("url"),
-            "format": info.get("format"),
-            "ext": info.get("ext"),
-            "abr": info.get("abr"),
-            "expires_in_s": 300,
+            "lyrics": page.get("lyrics"),
+            "source": page.get("source"),
         }
 
     try:
-        return cached(f"stream:{video_id}", 300, run)
+        return cached(f"lyrics:{video_id}", 3600, run)
     except Exception as e:
-        raise HTTPException(502, f"stream resolution failed: {e.__class__.__name__}")
+        raise HTTPException(502, f"lyrics lookup failed: {e.__class__.__name__}")
+
+
+# --- Linux web app (static frontend, same origin) ------------------------------
+# The web player ships as static files in ../linux/app and is served
+# by this process, so the page and the API share an origin and the
+# player needs no CORS configuration. Mounted last so every API
+# route above wins over the static catch-all. Absent files (a
+# backend-only checkout) simply skip the mount.
+_WEB_APP_DIR = Path(__file__).resolve().parent.parent / "linux" / "app"
+if _WEB_APP_DIR.is_dir():
+    from fastapi.staticfiles import StaticFiles
+
+    app.mount("/", StaticFiles(directory=_WEB_APP_DIR, html=True), name="webapp")
