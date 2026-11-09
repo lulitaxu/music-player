@@ -1508,6 +1508,27 @@ class MainActivity : Activity() {
      *  (0.6.13): pull-to-refresh on Search re-runs the visible
      *  search instead of rebuilding the screen and losing it. */
     private var searchRerun: (() -> Unit)? = null
+
+    /** 0.6.17: bridges from the search screen's local closures
+     *  to activity level. The screen assigns both when it builds;
+     *  suggestion and history rows (built inside those closures)
+     *  submit through [applySearchQuery] because a local function
+     *  cannot be called before its declaration point. */
+    private var searchRunSearch: ((String) -> Unit)? = null
+    private var searchInput: EditText? = null
+
+    /** Submit [q] as a search from a suggestion/history row:
+     *  fill the field, run the search, drop the keyboard. */
+    private fun applySearchQuery(q: String) {
+        val field = searchInput ?: return
+        field.setText(q)
+        field.setSelection(q.length)
+        searchRunSearch?.invoke(q)
+        val imm = getSystemService(INPUT_METHOD_SERVICE)
+            as? android.view.inputmethod.InputMethodManager
+        imm?.hideSoftInputFromWindow(field.windowToken, 0)
+        field.clearFocus()
+    }
     private var lastSearchQuery: String = ""
 
     /** Builds the four overlay trees on first need (0.6.3, S7):
@@ -3384,18 +3405,8 @@ class MainActivity : Activity() {
             suggestPending = null
         }
 
-        fun applyQuery(q: String) {
-            input.setText(q)
-            input.setSelection(q.length)
-            runSearch(q)
-            val imm = getSystemService(INPUT_METHOD_SERVICE)
-                as? android.view.inputmethod.InputMethodManager
-            imm?.hideSoftInputFromWindow(input.windowToken, 0)
-            input.clearFocus()
-        }
-
         fun renderSearchHistory() {
-            if (!::historyBox.isInitialized) return
+            
             historyBox.removeAllViews()
             val history = loadSearchHistory()
             if (history.isEmpty()) {
@@ -3449,7 +3460,7 @@ class MainActivity : Activity() {
                             renderSearchHistory()
                         }
                     }, LinearLayout.LayoutParams(-2, -2))
-                    setOnClickListener { applyQuery(q) }
+                    setOnClickListener { applySearchQuery(q) }
                 }
                 historyBox.addView(row)
             }
@@ -3457,8 +3468,8 @@ class MainActivity : Activity() {
 
         fun renderSuggestions(typed: String, fetched: List<String>) {
             val t = typed.trim()
-            if (t.isEmpty() || !::suggestBox.isInitialized) {
-                if (::suggestBox.isInitialized) suggestBox.visibility = View.GONE
+            if (t.isEmpty()) {
+                suggestBox.visibility = View.GONE
                 return
             }
             // The user's own matching searches pin to the top;
@@ -3491,7 +3502,7 @@ class MainActivity : Activity() {
                         maxLines = 1
                         ellipsize = android.text.TextUtils.TruncateAt.END
                     }, LinearLayout.LayoutParams(0, -2, 1f))
-                    setOnClickListener { applyQuery(q) }
+                    setOnClickListener { applySearchQuery(q) }
                 }
                 suggestBox.addView(row)
             }
@@ -3502,7 +3513,7 @@ class MainActivity : Activity() {
             val t = text.trim()
             cancelSuggestions()
             if (t.isEmpty()) {
-                if (::suggestBox.isInitialized) suggestBox.visibility = View.GONE
+                suggestBox.visibility = View.GONE
                 if (resultsBox.visibility != View.VISIBLE) {
                     browseBox.visibility = View.VISIBLE
                 }
@@ -3551,7 +3562,7 @@ class MainActivity : Activity() {
             // suggestions panel and kills any in-flight fetch.
             saveSearchQuery(q)
             cancelSuggestions()
-            if (::suggestBox.isInitialized) suggestBox.visibility = View.GONE
+            suggestBox.visibility = View.GONE
             renderSearchHistory()
             searchInFlight = true
             val myEpoch = searchEpoch
@@ -3789,7 +3800,7 @@ class MainActivity : Activity() {
                 input.text?.clear()
                 dropSearchSkeletons()
                 cancelSuggestions()
-                if (::suggestBox.isInitialized) suggestBox.visibility = View.GONE
+                suggestBox.visibility = View.GONE
                 resultsBox.removeAllViews()
                 resultsBox.visibility = View.GONE
                 browseBox.visibility = View.VISIBLE
@@ -3834,6 +3845,10 @@ class MainActivity : Activity() {
         // query on THIS live screen (the closure owns the real
         // results box), never a rebuild that would lose it.
         searchRerun = { runSearch(input.text?.toString().orEmpty()) }
+        // 0.6.17: activity-level bridges for the suggestion and
+        // history rows (see applySearchQuery).
+        searchRunSearch = { q -> runSearch(q) }
+        searchInput = input
 
         // Source selector: the same three states as Settings →
         // Music source, two-way synced through the one preference.
@@ -8516,7 +8531,7 @@ class MainActivity : Activity() {
         }
         // About-the-artist card (0.6.17): follows the same
         // current-track refresh; internally lazy and cached.
-        updateNpAbout(track)
+        updateNpAbout(currentTrack())
         // Built-in EQ follows the player (0.6.8): re-attach the
         // effects when the audio session changes. Owner-only,
         // like the bridge below — a stale instance must never
