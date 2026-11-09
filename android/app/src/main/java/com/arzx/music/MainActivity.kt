@@ -10692,6 +10692,15 @@ class MainActivity : Activity() {
             if (v.text is android.text.Spanned) {
                 v.text = v.text.toString()
             }
+            // 0.6.16: same for the activation height lock — a
+            // line that lost active status through a path that
+            // skips the prev-line cleanup (tap-to-seek resets the
+            // index first) must not keep its locked height.
+            if (v.layoutParams.height != ViewGroup.LayoutParams.WRAP_CONTENT) {
+                v.layoutParams = v.layoutParams.apply {
+                    height = ViewGroup.LayoutParams.WRAP_CONTENT
+                }
+            }
             val d = kotlin.math.abs(i - active)
             v.setTextColor(
                 Color.argb(lyricDimAlpha(d, i < active), 255, 255, 255)
