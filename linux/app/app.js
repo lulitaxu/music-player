@@ -42,6 +42,7 @@ const store = {
 let likes = store.get("arzxsh.likes", []);           // full track objects
 let recentPlays = store.get("arzxsh.recent", []);    // full track objects
 let searchHistory = store.get("arzxsh.searchHistory", []);
+let downloads = store.get("arzxsh.downloads", {}); // videoId -> local track id
 const isLiked = (id) => likes.some((t) => t.id === id);
 function toggleLike(track) {
   if (isLiked(track.id)) likes = likes.filter((t) => t.id !== track.id);
@@ -84,6 +85,7 @@ function renderRoute() {
   else if (r.type === "album") renderAlbum(r.id);
   else if (r.type === "library") renderLibrary();
   else if (r.type === "liked") renderLiked();
+  else if (r.type === "local") renderLocal();
 }
 $("#backBtn").onclick = () => { if (routeIdx > 0) { routeIdx--; renderRoute(); } };
 $("#fwdBtn").onclick = () => { if (routeIdx < routes.length - 1) { routeIdx++; renderRoute(); } };
@@ -95,6 +97,29 @@ document.querySelectorAll(".nav-item").forEach((b) =>
 $("#likedLink").onclick = () => navigate({ type: "liked" });
 
 /* ---------------- shared row builders ---------------- */
+function dlBtn(track) {
+  if (track.source === "local") return "";
+  const saved = downloads[track.id];
+  return `<button class="heart-btn ${saved ? "liked" : ""}" data-download="${esc(track.id)}" title="${saved ? "Saved for offline" : "Download for offline"}">${saved ? "✓" : "⬇"}</button>`;
+}
+async function doDownload(track) {
+  toast(`Downloading “${track.title}”…`);
+  try {
+    const r = await fetch(`/download/${encodeURIComponent(track.id)}?title=${encodeURIComponent(track.title)}&artist=${encodeURIComponent(track.artist)}`, { method: "POST" });
+    if (!r.ok) throw new Error();
+    const data = await r.json();
+    downloads[track.id] = data.track.id;
+    store.set("arzxsh.downloads", downloads);
+    register([data.track], null);
+    document.querySelectorAll(`[data-download="${CSS.escape(track.id)}"]`).forEach((b) => {
+      b.classList.add("liked"); b.textContent = "✓"; b.title = "Saved for offline";
+    });
+    syncNpDownload();
+    toast(data.already ? "Already saved for offline" : "Saved for offline");
+  } catch {
+    toast("Download failed. Check your connection and try again.");
+  }
+}
 function heartBtn(track) {
   return `<button class="heart-btn ${isLiked(track.id) ? "liked" : ""}" data-like="${esc(track.id)}" title="Like">${isLiked(track.id) ? "♥" : "♡"}</button>`;
 }
@@ -108,6 +133,7 @@ function rowHtml(track, i, opts = {}) {
       <span class="row-sub">${esc(track.artist)}${track.album ? " · " + esc(track.album) : ""}</span>
     </span>
     <span class="row-dur">${fmt(track.duration_s)}</span>
+    ${dlBtn(track)}
     ${heartBtn(track)}
   </div>`;
 }
@@ -129,6 +155,14 @@ function skeletons(n, h = 62) {
 }
 /* One delegated click handler for everything the views render. */
 view.addEventListener("click", (e) => {
+  const dl = e.target.closest("[data-download]");
+  if (dl) {
+    e.stopPropagation();
+    const t = findTrack(dl.dataset.download);
+    if (t && !downloads[t.id]) doDownload(t);
+    else if (t) toast("Already saved for offline");
+    return;
+  }
   const like = e.target.closest("[data-like]");
   if (like) {
     e.stopPropagation();
@@ -143,7 +177,7 @@ view.addEventListener("click", (e) => {
     const labels = {
       charts: "Trending now", searchSongs: "Search", artistSongs: "Artist",
       albumTracks: "Album", recent: "Jump back in", recentLib: "Recently played",
-      recentSide: "Recently played", likedList: "Liked Songs",
+      recentSide: "Recently played", likedList: "Liked Songs", localList: "On this device",
     };
     if (idx >= 0) playFromContext(list, idx, labels[play.dataset.ctx] || "Songs");
     return;
@@ -344,10 +378,47 @@ function renderLibrary() {
         <span><div class="qt-title">Liked Songs</div><div class="qt-sub">${likes.length} songs</div></span>
       </button>
     </div>
+    <div class="section-title">On this device</div>
+    <div class="quick-grid">
+      <button class="quick-tile" id="libLocal">
+        <img src="" alt="" style="background:var(--surface2)">
+        <span><div class="qt-title">Local files & downloads</div><div class="qt-sub" id="libLocalCount">From your music folder</div></span>
+      </button>
+    </div>
     <div class="section-title">Recently played</div>
     ${recentPlays.length ? recentPlays.map((t, i) => rowHtml(t, i, { ctx: "recentLib" })).join("") : `<div class="empty-note">Tracks you play will appear here.</div>`}`;
   register(recentPlays, "recentLib");
   $("#libLiked").onclick = () => navigate({ type: "liked" });
+  $("#libLocal").onclick = () => navigate({ type: "local" });
+  api("/local").then((d) => {
+    const el = $("#libLocalCount");
+    if (el) el.textContent = `${d.tracks.length} tracks · ${d.dir}`;
+  }).catch(() => {});
+}
+async function renderLocal(fresh = false) {
+  view.innerHTML = `<div class="section-title">On this device</div>${skeletons(5)}`;
+  try {
+    const data = await api(`/local${fresh ? "?fresh=1" : ""}`);
+    if (routes[routeIdx].type !== "local") return;
+    register(data.tracks, "localList");
+    view.innerHTML = `
+      <div class="page-head">
+        <img src="" alt="" style="background:var(--surface2);box-shadow:none">
+        <div>
+          <div class="page-kind">Local library</div>
+          <div class="page-name">On this device</div>
+          <div class="page-meta">${data.tracks.length} tracks · ${esc(data.dir)}</div>
+        </div>
+      </div>
+      <button class="chip-btn" id="rescanBtn" style="margin:6px 0 4px">↻ Rescan folder</button>
+      <div class="section-title">Songs</div>
+      ${data.tracks.length ? data.tracks.map((t, i) => rowHtml(t, i, { ctx: "localList" })).join("") : `<div class="empty-note">No audio files found in that folder yet. Downloads you save land in its arzxsh subfolder.</div>`}`;
+    $("#rescanBtn").onclick = () => renderLocal(true);
+  } catch {
+    if (routes[routeIdx].type !== "local") return;
+    view.innerHTML = `<div class="section-title">On this device</div>
+      <div class="error-note">Couldn't read the local library.<button data-retry>Retry</button></div>`;
+  }
 }
 function renderLiked() {
   register(likes, "likedList");
@@ -441,6 +512,11 @@ function rampDeck(deck, v, seconds) {
   }
 }
 
+function urlFor(track) {
+  return track.source === "local"
+    ? `/local/file/${encodeURIComponent(track.id)}`
+    : `/audio/${encodeURIComponent(track.id)}`;
+}
 function playFromContext(list, idx, ctxLabel) {
   if (!list || !list.length || idx < 0) return;
   player.queue = list.slice();
@@ -459,7 +535,7 @@ function startAt(idx, fade) {
   if (fade) { activeDeck = to; idleDeck = from; }
   const wasPreloaded = to.trackId === track.id && to.el.src;
   to.trackId = track.id;
-  if (!wasPreloaded) to.el.src = `/audio/${encodeURIComponent(track.id)}`;
+  if (!wasPreloaded) to.el.src = urlFor(track);
   to.el.currentTime = 0;
   if (webAudioOk) setDeckLevel(to, 1);
   to.el.play().catch(() => onTrackError(to));
@@ -566,7 +642,7 @@ decks.forEach((deck) => {
         const nt = player.queue[n];
         if (nt && idleDeck.trackId !== nt.id) {
           idleDeck.trackId = nt.id;
-          idleDeck.el.src = `/audio/${encodeURIComponent(nt.id)}`;
+          idleDeck.el.src = urlFor(nt);
           idleDeck.el.preload = "auto";
         }
       }
@@ -637,6 +713,15 @@ function markCurrentRows() {
     r.classList.toggle("current", r.dataset.qid === id);
   });
 }
+function syncNpDownload() {
+  const btn = $("#npDownload");
+  if (!btn || !player.current) return;
+  if (player.current.source === "local") { btn.classList.add("hidden"); return; }
+  btn.classList.remove("hidden");
+  const saved = downloads[player.current.id];
+  btn.textContent = saved ? "✓ Saved" : "⬇ Download";
+  btn.classList.toggle("liked", !!saved);
+}
 function onTrackChanged(track) {
   $("#player").classList.remove("hidden");
   document.body.classList.remove("no-player");
@@ -651,6 +736,7 @@ function onTrackChanged(track) {
   $("#npContext").textContent = player.contextName || "Now Playing";
   syncPlayButtons();
   syncHeartStates();
+  syncNpDownload();
   markCurrentRows();
   renderQueue();
   loadAbout(track);
@@ -776,7 +862,19 @@ function resetLyrics(track) {
   $("#lyricsCard").classList.add("hidden");
   $("#lyricsBtn").classList.remove("on");
 }
+$("#npDownload").onclick = () => {
+  if (player.current && player.current.source !== "local" && !downloads[player.current.id]) doDownload(player.current);
+  else if (player.current) toast("Already saved for offline");
+};
 $("#lyricsBtn").onclick = async () => {
+  if (player.current && player.current.source === "local") {
+    const card = $("#lyricsCard");
+    card.classList.remove("hidden");
+    $("#lyricsBtn").classList.add("on");
+    $("#lyricsText").textContent = "Lyrics are not available for local files.";
+    $("#lyricsSource").textContent = "";
+    return;
+  }
   const card = $("#lyricsCard");
   const show = card.classList.contains("hidden");
   card.classList.toggle("hidden", !show);
@@ -846,3 +944,11 @@ navigate({ type: "home" }, true);
 /* Debug/testing handle: lets a console (or an automated check)
    inspect playback state without scraping the DOM. */
 window.__arzxsh = { player, decks };
+api("/local").then((d) => {
+  const present = new Set(d.tracks.map((t) => t.id));
+  let changed = false;
+  Object.keys(downloads).forEach((k) => {
+    if (!present.has(downloads[k])) { delete downloads[k]; changed = true; }
+  });
+  if (changed) store.set("arzxsh.downloads", downloads);
+}).catch(() => {});

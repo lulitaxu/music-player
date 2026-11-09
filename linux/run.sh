@@ -12,7 +12,7 @@ PORT="${ARZXSH_PORT:-8077}"
 if [ ! -x "$BACKEND/.venv/bin/uvicorn" ]; then
   echo "First run: creating the backend environment (one time)…"
   python3 -m venv "$BACKEND/.venv"
-  "$BACKEND/.venv/bin/pip" install -q fastapi "uvicorn[standard]" ytmusicapi yt-dlp requests
+  "$BACKEND/.venv/bin/pip" install -q fastapi "uvicorn[standard]" ytmusicapi yt-dlp requests mutagen mutagen
 fi
 
 URL="http://127.0.0.1:$PORT"

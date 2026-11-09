@@ -370,6 +370,280 @@ def lyrics(video_id: str):
         raise HTTPException(502, f"lyrics lookup failed: {e.__class__.__name__}")
 
 
+# --- local library + offline downloads (Linux web app) ------------------------
+# The web player also plays the user's own audio files. The server
+# scans a music folder (ARZXSH_MUSIC_DIR, default ~/Music) and
+# serves tracks by opaque ids from its own registry: a request can
+# only ever reach a file the scan itself found under that root,
+# never an arbitrary path supplied by a client. Downloads land in
+# <music>/arzxsh/ and become local tracks.
+import hashlib
+import mimetypes
+import re
+
+try:
+    import mutagen
+except ImportError:  # backend still serves the catalog without it
+    mutagen = None
+
+_AUDIO_EXTS = {".mp3", ".m4a", ".flac", ".ogg", ".opus", ".wav", ".aac"}
+_MUSIC_DIR = Path(
+    os.environ.get("ARZXSH_MUSIC_DIR", str(Path.home() / "Music"))
+).expanduser()
+_DOWNLOADS_DIR = _MUSIC_DIR / "arzxsh"
+_local_registry: dict[str, Path] = {}
+
+
+def _local_id(path: Path) -> str:
+    return "loc_" + hashlib.sha1(str(path).encode()).hexdigest()[:14]
+
+
+def _tag_first(tags, *keys):
+    if not tags:
+        return None
+    for key in keys:
+        try:
+            value = tags.get(key)
+        except Exception:
+            value = None
+        if value:
+            return str(value[0]) if isinstance(value, (list, tuple)) else str(value)
+    return None
+
+
+def _extract_art(raw):
+    """Embedded cover art across formats: ID3 APIC frames (mp3),
+    the covr atom (m4a), picture blocks (flac/ogg). Returns
+    (bytes, mime) or None."""
+    try:
+        for key in list(raw.keys()):
+            frame = raw[key]
+            if key.startswith("APIC"):
+                return bytes(frame.data), frame.mime or "image/jpeg"
+            if key == "covr" and frame:
+                mime = "image/png" if int(frame[0].imageformat) == 14 else "image/jpeg"
+                return bytes(frame[0]), mime
+        pics = getattr(raw, "pictures", None)
+        if pics:
+            return bytes(pics[0].data), pics[0].mime or "image/jpeg"
+    except Exception:
+        return None
+    return None
+
+
+def _local_track(path: Path) -> dict:
+    tid = _local_id(path)
+    title, artist, album = path.stem, "Local file", path.parent.name
+    duration, has_art = None, False
+    if mutagen is not None:
+        raw = None
+        try:
+            raw = mutagen.File(path)
+        except Exception:
+            raw = None
+        if raw is not None:
+            # Duration comes from the raw parse: some easy wrappers
+            # (EasyMP4) report no length for untagged files.
+            if raw.info and raw.info.length:
+                duration = int(raw.info.length) or None
+            has_art = _extract_art(raw) is not None
+        try:
+            easy = mutagen.File(path, easy=True)
+            if easy:
+                title = _tag_first(easy, "title") or title
+                artist = _tag_first(easy, "artist") or artist
+                album = _tag_first(easy, "album") or album
+                if duration is None and easy.info and easy.info.length:
+                    duration = int(easy.info.length) or None
+        except Exception:
+            pass
+        if duration is None and path.suffix.lower() == ".wav":
+            # mutagen reports no length for plain WAV; the stdlib
+            # wave module reads it from the header directly.
+            try:
+                import wave
+
+                with wave.open(str(path)) as w:
+                    duration = int(w.getnframes() / w.getframerate()) or None
+            except Exception:
+                pass
+    return {
+        "id": tid,
+        "source": "local",
+        "title": title,
+        "artist": artist,
+        "artist_id": None,
+        "album": album,
+        "duration_s": duration,
+        "artwork": f"/local/art/{tid}" if has_art else None,
+        "is_explicit": False,
+    }
+
+
+def _scan_local() -> list[dict]:
+    global _local_registry
+    registry: dict[str, Path] = {}
+    if _MUSIC_DIR.is_dir():
+        for p in sorted(_MUSIC_DIR.rglob("*")):
+            if p.is_file() and p.suffix.lower() in _AUDIO_EXTS:
+                registry[_local_id(p)] = p
+    _local_registry = registry
+    return [_local_track(p) for p in registry.values()]
+
+
+def _registry_lookup(track_id: str):
+    path = _local_registry.get(track_id)
+    if path is None:
+        _scan_local()
+        path = _local_registry.get(track_id)
+    return path
+
+
+@app.get("/local")
+def local_library(fresh: int = 0):
+    if fresh:
+        _cache.pop("local:scan", None)
+    return cached(
+        "local:scan", 20,
+        lambda: {"dir": str(_MUSIC_DIR), "tracks": _scan_local()},
+    )
+
+
+def _range_stream(path: Path, request: Request):
+    """Byte-range file streaming for local tracks (seek support),
+    same contract as the /audio proxy."""
+    size = path.stat().st_size
+    start, end, status = 0, size - 1, 200
+    range_header = request.headers.get("range", "")
+    if range_header.startswith("bytes="):
+        a, _, b = range_header[6:].partition("-")
+        try:
+            if a:
+                start = int(a)
+                end = int(b) if b else size - 1
+            elif b:
+                start = max(0, size - int(b))
+        except ValueError:
+            start, end = 0, size - 1
+        end = min(end, size - 1)
+        if 0 <= start <= end:
+            status = 206
+        else:
+            start, end, status = 0, size - 1, 200
+    length = end - start + 1
+    headers = {"accept-ranges": "bytes", "content-length": str(length)}
+    if status == 206:
+        headers["content-range"] = f"bytes {start}-{end}/{size}"
+
+    def body():
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = fh.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return StreamingResponse(body(), status_code=status, headers=headers, media_type=mime)
+
+
+@app.get("/local/file/{track_id}")
+def local_file(track_id: str, request: Request):
+    path = _registry_lookup(track_id)
+    if path is None or not path.is_file():
+        raise HTTPException(404, "local track not found")
+    return _range_stream(path, request)
+
+
+@app.get("/local/art/{track_id}")
+def local_art(track_id: str):
+    from fastapi.responses import Response
+
+    path = _registry_lookup(track_id)
+    if path is None:
+        raise HTTPException(404, "local track not found")
+    art = None
+    if mutagen is not None:
+        try:
+            raw = mutagen.File(path)
+            art = _extract_art(raw) if raw else None
+        except Exception:
+            art = None
+    if not art:
+        raise HTTPException(404, "no embedded artwork")
+    data, mime = art
+    return Response(content=data, media_type=mime,
+                    headers={"cache-control": "max-age=3600"})
+
+
+@app.post("/download/{video_id}")
+def download(video_id: str, title: str = "", artist: str = ""):
+    """Save a track's audio into <music>/arzxsh/ (offline). The
+    download runs through yt-dlp itself, which retries fragments
+    and resumes partial files — a plain streamed copy dies whole
+    on any connection hiccup. The filename is sanitized, the write
+    never leaves the downloads dir, and a repeat call for an
+    existing file returns the existing local track."""
+    def clean(s: str) -> str:
+        s = re.sub(r"[^\w\s.-]+", "", s or "", flags=re.UNICODE).strip()
+        return re.sub(r"\s+", " ", s)[:80]
+
+    name = clean(f"{artist} - {title}") if (artist or title) else ""
+    if not name or name == "-":
+        name = video_id
+    _DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    for existing in _DOWNLOADS_DIR.iterdir():
+        if existing.is_file() and existing.stem == name and existing.suffix.lower() in _AUDIO_EXTS:
+            _cache.pop("local:scan", None)
+            _scan_local()
+            return {"ok": True, "already": True, "track": _local_track(existing)}
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl": str(_DOWNLOADS_DIR / f"{name}.%(ext)s"),
+        "retries": 3,
+        "fragment_retries": 3,
+        "continuedl": True,
+    }
+    if os.environ.get("YTM_DL_NO_VERIFY") == "1":
+        opts["nocheckcertificate"] = True
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(
+                f"https://www.youtube.com/watch?v={quote(video_id)}",
+                download=True,
+            )
+            dest = Path(ydl.prepare_filename(info))
+    except Exception as e:
+        for part in _DOWNLOADS_DIR.glob(f"{name}.*.part"):
+            part.unlink(missing_ok=True)
+        raise HTTPException(502, f"download failed: {e.__class__.__name__}")
+    if not dest.is_file():
+        raise HTTPException(502, "download produced no file")
+    # YTM audio arrives untagged; write the known title/artist into
+    # the file so every later scan shows real metadata, not the
+    # filename. Best-effort: an untaggable format keeps the
+    # filename fallback.
+    if mutagen is not None and (title or artist):
+        try:
+            f = mutagen.File(dest, easy=True)
+            if f is not None:
+                if title:
+                    f["title"] = title
+                if artist:
+                    f["artist"] = artist
+                f.save()
+        except Exception:
+            pass
+    _cache.pop("local:scan", None)
+    _scan_local()
+    return {"ok": True, "already": False, "track": _local_track(dest)}
+
+
 # --- Linux web app (static frontend, same origin) ------------------------------
 # The web player ships as static files in ../linux/app and is served
 # by this process, so the page and the API share an origin and the

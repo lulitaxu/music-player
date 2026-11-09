@@ -33,6 +33,20 @@ default browser. Set `ARZXSH_PORT` to use a different port.
 - The server binds to 127.0.0.1 on purpose: it has no auth, so it
   must not be reachable from the local network.
 
+## Offline and local music
+
+- **Local files:** the backend scans your music folder
+  (`ARZXSH_MUSIC_DIR`, default `~/Music`) recursively and lists
+  every audio file under Library → On this device, with metadata
+  and cover art read from the files' own tags (mutagen). Files are
+  streamed from disk with range support; nothing is uploaded.
+- **Downloads:** the ⬇ button on any streaming track (or in Now
+  Playing) saves its audio into `<music folder>/arzxsh/` through
+  yt-dlp (fragment retries and resume included) and writes the
+  title/artist into the file's tags. From then on it is a local
+  file and plays with no network at all. A ✓ marks saved tracks;
+  deleting the file from disk clears the mark on next launch.
+
 ## Features (parity with the phone app)
 
 Home with time-aware greeting, trending songs and top artists ·

@@ -13,7 +13,10 @@ python3 -m venv .venv
 
 Endpoints: `/health` `/search` `/artist/{id}` `/album/{id}` `/charts`
 `/radio?video_id=` `/stream/{videoId}` `/audio/{videoId}` (same-origin
-byte proxy for the Linux web app) `/lyrics/{videoId}`. The server also
+byte proxy for the Linux web app) `/lyrics/{videoId}` `/local`
+`/local/file/{id}` `/local/art/{id}` `/download/{videoId}` (offline
+library: scans ARZXSH_MUSIC_DIR or ~/Music; downloads land in its
+arzxsh subfolder). The server also
 serves the Linux web frontend from `../linux/app` when present; see
 `../linux/README.md`.
 
