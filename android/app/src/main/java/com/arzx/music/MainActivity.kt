@@ -8528,10 +8528,10 @@ class MainActivity : Activity() {
             if (::npBackdrop.isInitialized && npBackdrop.drawable == null) {
                 ArtworkLoader.loadBlurred(hero, npBackdrop)
             }
+            // About-the-artist card (0.6.17): follows the same
+            // current-track refresh; internally lazy and cached.
+            updateNpAbout(t)
         }
-        // About-the-artist card (0.6.17): follows the same
-        // current-track refresh; internally lazy and cached.
-        updateNpAbout(currentTrack())
         // Built-in EQ follows the player (0.6.8): re-attach the
         // effects when the audio session changes. Owner-only,
         // like the bridge below — a stale instance must never
