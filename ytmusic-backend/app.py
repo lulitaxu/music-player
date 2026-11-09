@@ -240,6 +240,26 @@ def charts(country: str = "GLOBAL"):
         raise HTTPException(502, f"charts failed: {e.__class__.__name__}")
 
 
+@app.get("/playlist/{playlist_id}")
+def playlist(playlist_id: str):
+    """A YouTube Music playlist's tracks (used by the CLI's
+    playlist import). Accepts the bare playlist id."""
+
+    def run():
+        p = ytm.get_playlist(playlist_id, limit=200)
+        return {
+            "id": playlist_id,
+            "title": p.get("title"),
+            "author": (p.get("author") or {}).get("name") if isinstance(p.get("author"), dict) else p.get("author"),
+            "tracks": tracks(p.get("tracks")),
+        }
+
+    try:
+        return cached(f"playlist:{playlist_id}", 600, run)
+    except Exception as e:
+        raise HTTPException(502, f"playlist lookup failed: {e.__class__.__name__}")
+
+
 @app.get("/radio")
 def radio(video_id: str):
     def run():

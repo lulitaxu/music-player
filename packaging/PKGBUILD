@@ -1,0 +1,45 @@
+# Maintainer: arafat arzu <contact@arafatarzu.me>
+# arzxsh — terminal music player (TUI) + local web player, backed
+# by a small FastAPI catalog server. Sources: the music-player repo.
+#
+# Install:  makepkg -si
+# Then:     arzxsh            (TUI)
+#           arzxsh play <q>   (instant play), arzxsh search, arzxsh download
+#
+# The Python libraries (textual, httpx, Pillow for the CLI;
+# fastapi, ytmusicapi, yt-dlp for the backend) are NOT official-repo
+# packages as a set, so they install into per-user venvs under
+# ~/.local/share/arzxsh on first run instead of being pacman deps.
+pkgname=arzxsh
+pkgver=0.6.17
+pkgrel=1
+pkgdesc="Terminal music player with crossfade, synced lyrics, EQ, offline downloads and a local web player"
+arch=('any')
+url="https://github.com/lulitaxu/music-player"
+license=('MIT')
+depends=('python' 'mpv')
+makedepends=('git')
+optdepends=(
+  'cava: live frequency visualizer bars in the TUI'
+  'mpv-mpris: media keys and playerctl integration'
+  'xdg-utils: open the web player in the default browser'
+)
+source=("git+https://github.com/lulitaxu/music-player.git")
+sha256sums=('SKIP')
+
+package() {
+  cd "$srcdir/music-player"
+  local share="$pkgdir/usr/share/arzxsh"
+  install -dm755 "$share/cli" "$share/ytmusic-backend" "$share/linux"
+
+  cp -r cli/arzxsh_cli "$share/cli/"
+  install -m644 cli/requirements.txt "$share/cli/requirements.txt"
+
+  install -m644 ytmusic-backend/app.py "$share/ytmusic-backend/app.py"
+  install -m644 ytmusic-backend/README.md "$share/ytmusic-backend/README.md"
+
+  cp -r linux/app "$share/linux/app"
+  install -m644 linux/README.md "$share/linux/README.md"
+
+  install -Dm755 "$startdir/arzxsh.sh" "$pkgdir/usr/bin/arzxsh"
+}
