@@ -39,6 +39,7 @@ data class YtmArtistPage(
     val id: String,
     val name: String,
     val subscribers: String? = null,
+    val description: String? = null,
     val artworkSmall: String? = null,
     val artworkLarge: String? = null,
     val topSongs: List<Track> = emptyList(),
@@ -577,6 +578,37 @@ object YtmApi {
         return emptyList()
     }
 
+    /**
+     * As-you-type search suggestions (0.6.17): the same list the
+     * YouTube Music search box offers. Best-effort by contract —
+     * any response-shape surprise yields what was parsed so far
+     * (usually an empty list), never a fabricated entry.
+     */
+    fun suggestions(input: String): List<String> {
+        val resp = post(
+            "music/get_search_suggestions",
+            JSONObject().put("input", input)
+        )
+        val sections = resp.arr("contents") ?: return emptyList()
+        val out = ArrayList<String>()
+        for (i in 0 until sections.length()) {
+            val shelf = sections.optJSONObject(i)
+                ?.obj("searchSuggestionsSectionRenderer") ?: continue
+            val items = shelf.arr("contents") ?: continue
+            for (j in 0 until items.length()) {
+                val s = items.optJSONObject(j)
+                    ?.obj("searchSuggestionRenderer") ?: continue
+                val q = dig(s, "navigationEndpoint", "searchEndpoint")
+                    ?.optString("query")?.takeIf { it.isNotBlank() }
+                    ?: textOf(s.obj("suggestion"))
+                        .takeIf { it.isNotBlank() }
+                    ?: continue
+                if (q !in out) out.add(q)
+            }
+        }
+        return out
+    }
+
     fun searchArtists(query: String, limit: Int = 10): List<YtmArtistRef> {
         val out = ArrayList<YtmArtistRef>()
         for (item in searchItems(query, PARAMS_ARTISTS)) {
@@ -696,6 +728,11 @@ object YtmApi {
         val (hSmall, hLarge) = if (header != null) itemThumbs(header) else (null to null)
         val subscribers = dig(header, "subscriptionButton", "subscribeButtonRenderer", "subscriberCountText")
             ?.let { textOf(it).takeIf { t -> t.isNotEmpty() } }
+        // About text (0.6.17): artist pages carry a description
+        // shelf; not every artist has one, so this stays null and
+        // the UI hides the About block instead of showing a hole.
+        val description = findByKey(resp, "musicDescriptionShelfRenderer")
+            ?.obj("description")?.let { textOf(it).takeIf { t -> t.isNotBlank() } }
 
         var topSongs: List<Track> = emptyList()
         val albums = ArrayList<YtmAlbumRef>()
@@ -748,6 +785,7 @@ object YtmApi {
             id = channelId,
             name = name,
             subscribers = subscribers,
+            description = description,
             artworkSmall = hSmall,
             artworkLarge = hLarge,
             topSongs = topSongs,

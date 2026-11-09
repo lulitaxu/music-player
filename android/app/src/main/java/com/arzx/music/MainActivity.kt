@@ -1111,6 +1111,14 @@ class MainActivity : Activity() {
     private lateinit var npLyricsCard: LinearLayout
     private lateinit var npLyricsCardCur: TextView
     private lateinit var npLyricsCardNext: TextView
+
+    // ---- 0.6.17: About-the-artist card on Now Playing ----
+    private lateinit var npAboutCard: LinearLayout
+    /** Artist id the About card shows or is fetching right now. */
+    private var npAboutKey: String? = null
+    /** Session cache of artist pages for the About card, so
+     *  skipping back to a recent artist is instant and free. */
+    private val npAboutCache = HashMap<String, YtmArtistPage>()
     private var npLyrics: LyricsData? = null
     /** Downloads.key() of the track [npLyrics] belongs to. */
     private var npLyricsKey: String? = null
@@ -3299,6 +3307,41 @@ class MainActivity : Activity() {
 
     // ---------------------------------------------------------------- search
 
+    // ------------------------------------------------------------ search history (0.6.17)
+
+    /** The last 10 submitted search queries, newest first, in the
+     *  activity preferences. On-device only: the list is never
+     *  transmitted anywhere. (The suggestions fetch sends the
+     *  CURRENT partial query to YouTube Music, which is how
+     *  autocomplete works; the stored history never leaves.) */
+    private fun loadSearchHistory(): List<String> {
+        val raw = getPreferences(MODE_PRIVATE)
+            .getString("search_history_v1", "") ?: ""
+        return raw.split('\n').map { it.trim() }
+            .filter { it.isNotEmpty() }
+    }
+
+    private fun storeSearchHistory(list: List<String>) {
+        getPreferences(MODE_PRIVATE).edit()
+            .putString("search_history_v1", list.joinToString("\n"))
+            .apply()
+    }
+
+    private fun saveSearchQuery(q: String) {
+        val query = q.trim()
+        if (query.isEmpty()) return
+        val next = (listOf(query) + loadSearchHistory()
+            .filter { !it.equals(query, ignoreCase = true) }).take(10)
+        storeSearchHistory(next)
+    }
+
+    private fun removeSearchQuery(q: String) {
+        storeSearchHistory(
+            loadSearchHistory()
+                .filter { !it.equals(q, ignoreCase = true) }
+        )
+    }
+
     private fun showSearch() {
         navRoot("tab:search") { showSearch() }
         // Retention (0.6.1): query text + results survive the tab
@@ -3312,6 +3355,8 @@ class MainActivity : Activity() {
 
         lateinit var resultsBox: LinearLayout
         lateinit var browseBox: LinearLayout
+        lateinit var suggestBox: LinearLayout
+        lateinit var historyBox: LinearLayout
         lateinit var input: EditText
 
         // This search's skeleton blocks, tracked SEPARATELY
@@ -3328,10 +3373,186 @@ class MainActivity : Activity() {
             }
         }
 
+        // ---- Suggestions + history wiring (0.6.17) ----
+        val suggestHandler = android.os.Handler(android.os.Looper.getMainLooper())
+        var suggestGen = 0
+        var suggestPending: Runnable? = null
+
+        fun cancelSuggestions() {
+            suggestGen++
+            suggestPending?.let { suggestHandler.removeCallbacks(it) }
+            suggestPending = null
+        }
+
+        fun applyQuery(q: String) {
+            input.setText(q)
+            input.setSelection(q.length)
+            runSearch(q)
+            val imm = getSystemService(INPUT_METHOD_SERVICE)
+                as? android.view.inputmethod.InputMethodManager
+            imm?.hideSoftInputFromWindow(input.windowToken, 0)
+            input.clearFocus()
+        }
+
+        fun renderSearchHistory() {
+            if (!::historyBox.isInitialized) return
+            historyBox.removeAllViews()
+            val history = loadSearchHistory()
+            if (history.isEmpty()) {
+                historyBox.visibility = View.GONE
+                return
+            }
+            historyBox.visibility = View.VISIBLE
+            val header = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.BOTTOM
+                val lp = LinearLayout.LayoutParams(-1, -2)
+                lp.topMargin = dp(24)
+                lp.bottomMargin = dp(6)
+                layoutParams = lp
+                addView(
+                    label("Recent Searches", 21f, Color.WHITE, boldTf),
+                    LinearLayout.LayoutParams(0, -2, 1f)
+                )
+                addView(label("Clear all", 13.5f, white55, mediumTf).apply {
+                    isClickable = true
+                    setPadding(dp(8), dp(4), dp(0), dp(4))
+                    setOnClickListener {
+                        storeSearchHistory(emptyList())
+                        renderSearchHistory()
+                    }
+                })
+            }
+            historyBox.addView(header)
+            history.forEach { q ->
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    isClickable = true
+                    setPadding(dp(4), dp(10), dp(0), dp(10))
+                    addView(
+                        icon(R.drawable.ic_search, white50),
+                        LinearLayout.LayoutParams(dp(16), dp(16))
+                    )
+                    addView(label(q, 15.5f, Color.WHITE).apply {
+                        setPadding(dp(12), 0, 0, 0)
+                        maxLines = 1
+                        ellipsize = android.text.TextUtils.TruncateAt.END
+                    }, LinearLayout.LayoutParams(0, -2, 1f))
+                    addView(label("✕", 14f, white50).apply {
+                        gravity = Gravity.CENTER
+                        isClickable = true
+                        contentDescription = "Remove from search history"
+                        setPadding(dp(10), dp(6), dp(10), dp(6))
+                        setOnClickListener {
+                            removeSearchQuery(q)
+                            renderSearchHistory()
+                        }
+                    }, LinearLayout.LayoutParams(-2, -2))
+                    setOnClickListener { applyQuery(q) }
+                }
+                historyBox.addView(row)
+            }
+        }
+
+        fun renderSuggestions(typed: String, fetched: List<String>) {
+            val t = typed.trim()
+            if (t.isEmpty() || !::suggestBox.isInitialized) {
+                if (::suggestBox.isInitialized) suggestBox.visibility = View.GONE
+                return
+            }
+            // The user's own matching searches pin to the top;
+            // fetched suggestions follow, deduped against them.
+            val historyMatches = loadSearchHistory().filter {
+                it.contains(t, ignoreCase = true) &&
+                    !it.equals(t, ignoreCase = true)
+            }
+            val rows = (historyMatches + fetched.filter { f ->
+                historyMatches.none { it.equals(f, ignoreCase = true) } &&
+                    !f.equals(t, ignoreCase = true)
+            }).take(8)
+            suggestBox.removeAllViews()
+            if (rows.isEmpty()) {
+                suggestBox.visibility = View.GONE
+                return
+            }
+            rows.forEach { q ->
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    isClickable = true
+                    setPadding(dp(4), dp(11), dp(4), dp(11))
+                    addView(
+                        icon(R.drawable.ic_search, white50),
+                        LinearLayout.LayoutParams(dp(16), dp(16))
+                    )
+                    addView(label(q, 15.5f, Color.WHITE).apply {
+                        setPadding(dp(12), 0, 0, 0)
+                        maxLines = 1
+                        ellipsize = android.text.TextUtils.TruncateAt.END
+                    }, LinearLayout.LayoutParams(0, -2, 1f))
+                    setOnClickListener { applyQuery(q) }
+                }
+                suggestBox.addView(row)
+            }
+            suggestBox.visibility = View.VISIBLE
+        }
+
+        fun onQueryTyped(text: String) {
+            val t = text.trim()
+            cancelSuggestions()
+            if (t.isEmpty()) {
+                if (::suggestBox.isInitialized) suggestBox.visibility = View.GONE
+                if (resultsBox.visibility != View.VISIBLE) {
+                    browseBox.visibility = View.VISIBLE
+                }
+                return
+            }
+            // Typing takes the screen: browse and any previous
+            // results step aside (their trees are retained, nothing
+            // is lost) and the suggestion list owns the space.
+            browseBox.visibility = View.GONE
+            resultsBox.visibility = View.GONE
+            // History matches render instantly; the network list
+            // merges in when it lands, if the field still holds
+            // the same text. Any failure just leaves the history
+            // list standing — no error state for a keystroke aid.
+            renderSuggestions(t, emptyList())
+            if (sourceMode() == "audius") return
+            val gen = suggestGen
+            val r = Runnable {
+                executor.execute {
+                    val fetched = try {
+                        YtmApi.suggestions(t)
+                    } catch (_: Throwable) {
+                        emptyList()
+                    }
+                    runOnUiThread {
+                        if (gen != suggestGen || isFinishing || isDestroyed) {
+                            return@runOnUiThread
+                        }
+                        if (input.text?.toString()?.trim() != t) {
+                            return@runOnUiThread
+                        }
+                        renderSuggestions(t, fetched)
+                    }
+                }
+            }
+            suggestPending = r
+            suggestHandler.postDelayed(r, 250)
+        }
+
         fun runSearch(query: String) {
             val q = query.trim()
             if (q.isEmpty()) return
             lastSearchQuery = q
+            // 0.6.17: a submitted query joins the on-device
+            // history, and submitting always closes the
+            // suggestions panel and kills any in-flight fetch.
+            saveSearchQuery(q)
+            cancelSuggestions()
+            if (::suggestBox.isInitialized) suggestBox.visibility = View.GONE
+            renderSearchHistory()
             searchInFlight = true
             val myEpoch = searchEpoch
             browseBox.visibility = View.GONE
@@ -3567,6 +3788,8 @@ class MainActivity : Activity() {
             setOnClickListener {
                 input.text?.clear()
                 dropSearchSkeletons()
+                cancelSuggestions()
+                if (::suggestBox.isInitialized) suggestBox.visibility = View.GONE
                 resultsBox.removeAllViews()
                 resultsBox.visibility = View.GONE
                 browseBox.visibility = View.VISIBLE
@@ -3587,6 +3810,8 @@ class MainActivity : Activity() {
                 override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
                 override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {
                     clearBtn.visibility = if (s.isNullOrEmpty()) View.GONE else View.VISIBLE
+                    // 0.6.17: typing drives the suggestions panel.
+                    onQueryTyped(s?.toString().orEmpty())
                 }
                 override fun afterTextChanged(s: android.text.Editable?) {}
             })
@@ -3660,6 +3885,16 @@ class MainActivity : Activity() {
         content.addView(field)
         content.addView(segRow)
 
+        // Suggestions panel (0.6.17): lives between the source
+        // selector and the results; hidden unless typing produced
+        // rows for it.
+        suggestBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(0, dp(6), 0, 0)
+        }
+        content.addView(suggestBox)
+
         resultsBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
@@ -3668,7 +3903,15 @@ class MainActivity : Activity() {
         content.addView(resultsBox)
 
         browseBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        browseBox.addView(sectionTitle("Recent Searches"))
+        // Query history (0.6.17) heads the browse state; the
+        // block hides itself when the history is empty. The track
+        // block below it is play history, and is now labeled as
+        // what it is (it wore the "Recent Searches" title before
+        // real search history existed).
+        historyBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        browseBox.addView(historyBox)
+        renderSearchHistory()
+        browseBox.addView(sectionTitle("Recently Played"))
         if (recentTracks.isEmpty()) {
             browseBox.addView(label("Tracks you play will appear here.", 14.5f, white50))
         } else {
@@ -5519,6 +5762,16 @@ class MainActivity : Activity() {
                 }
                 banner.addView(labels, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
                 content.addView(banner)
+                // About block (0.6.17): the artist's own
+                // description, when YouTube Music carries one.
+                // Absent data hides the block entirely.
+                val aboutText = p.description
+                if (!aboutText.isNullOrBlank()) {
+                    content.addView(sectionTitle("About"))
+                    content.addView(label(aboutText, 14f, white75).apply {
+                        setLineSpacing(0f, 1.2f)
+                    })
+                }
                 if (p.topSongs.isNotEmpty()) {
                     // Play / Shuffle pill pair with Top Songs (spec §11.1).
                     val actions = LinearLayout(this).apply {
@@ -6405,6 +6658,23 @@ class MainActivity : Activity() {
         npLyricsCard.addView(npLyricsCardCur)
         npLyricsCard.addView(npLyricsCardNext)
         inner.addView(npLyricsCard)
+
+        // ---- About the artist card (0.6.17) ----
+        // Spotify places this under the song; here it sits under
+        // the lyrics preview inside the same scroll column and is
+        // populated lazily by updateNpAbout — empty and hidden
+        // until the current track's artist page has landed.
+        npAboutCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = if (glassOn()) npGlass(14f) else solidBg(14f, surface2)
+            setPadding(dp(16), dp(12), dp(16), dp(14))
+            visibility = View.GONE
+            isClickable = true
+        }
+        val aboutLp = LinearLayout.LayoutParams(-1, -2)
+        aboutLp.topMargin = dp(14)
+        npAboutCard.layoutParams = aboutLp
+        inner.addView(npAboutCard)
 
         // Pinned chevron-down (0.6.1): a child of the PANEL, not of
         // the scroll content, so it sits at the same spot as the
@@ -8030,6 +8300,115 @@ class MainActivity : Activity() {
 
     private fun isPlayingSafe(): Boolean = player?.isPlaying == true
 
+    /** About-the-artist card upkeep (0.6.17). Driven from
+     *  refreshPlaybackUi, which showNowPlaying also calls, so
+     *  opening the player and changing track both land here.
+     *  Fetches lazily — only while the player is open — once per
+     *  artist, then serves from the session cache. A track with
+     *  no YouTube artist id (the Audius catalog) simply has no
+     *  card; an artist is never guessed from the name string. */
+    private fun updateNpAbout(track: Track?) {
+        if (!::npAboutCard.isInitialized) return
+        val artistId = track?.artistId?.takeIf { it.isNotBlank() }
+        if (artistId == null) {
+            npAboutKey = null
+            npAboutCard.visibility = View.GONE
+            return
+        }
+        // Closed player: keep the key and the rendered card, so
+        // reopening on the same track reuses them untouched.
+        if (!::nowPlaying.isInitialized ||
+            nowPlaying.visibility != View.VISIBLE
+        ) return
+        if (artistId == npAboutKey) return
+        npAboutKey = artistId
+        val cached = synchronized(npAboutCache) { npAboutCache[artistId] }
+        if (cached != null) {
+            renderNpAbout(cached)
+            return
+        }
+        npAboutCard.visibility = View.GONE
+        executor.execute {
+            val page = try {
+                YtmApi.artistPage(artistId)
+            } catch (_: Throwable) {
+                null
+            }
+            if (page != null) {
+                synchronized(npAboutCache) {
+                    if (npAboutCache.size > 24) npAboutCache.clear()
+                    npAboutCache[artistId] = page
+                }
+            }
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                // The user may have skipped on while this flew.
+                if (npAboutKey != artistId) return@runOnUiThread
+                if (page != null) renderNpAbout(page)
+            }
+        }
+    }
+
+    private fun renderNpAbout(page: YtmArtistPage) {
+        npAboutCard.removeAllViews()
+        npAboutCard.addView(
+            label("ABOUT THE ARTIST", 11f, white55, semiboldTf).apply {
+                letterSpacing = 0.12f
+            }
+        )
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10), 0, 0)
+        }
+        val art = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            clipToOutline = true
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(surface2)
+            }
+        }
+        row.addView(art, LinearLayout.LayoutParams(dp(54), dp(54)))
+        ArtworkLoader.load(page.artworkSmall ?: page.artworkLarge, art)
+        val texts = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), 0, 0, 0)
+        }
+        texts.addView(label(page.name, 16f, Color.WHITE, semiboldTf).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        val subs = page.subscribers
+        if (!subs.isNullOrEmpty()) {
+            texts.addView(
+                label(
+                    if (subs.contains("subscriber", ignoreCase = true)) {
+                        subs
+                    } else {
+                        "$subs subscribers"
+                    },
+                    13f, white50
+                )
+            )
+        }
+        row.addView(texts, LinearLayout.LayoutParams(0, -2, 1f))
+        npAboutCard.addView(row)
+        val bio = page.description
+        if (!bio.isNullOrBlank()) {
+            npAboutCard.addView(label(bio, 13.5f, white75).apply {
+                maxLines = 3
+                ellipsize = TextUtils.TruncateAt.END
+                setPadding(0, dp(10), 0, 0)
+                setLineSpacing(0f, 1.15f)
+            })
+        }
+        npAboutCard.setOnClickListener {
+            showArtist(page.id, page.name, page.artworkSmall)
+        }
+        npAboutCard.visibility = View.VISIBLE
+    }
+
     private fun refreshPlaybackUi() {
         val t = current
         val playing = isPlayingSafe()
@@ -8135,6 +8514,9 @@ class MainActivity : Activity() {
                 ArtworkLoader.loadBlurred(hero, npBackdrop)
             }
         }
+        // About-the-artist card (0.6.17): follows the same
+        // current-track refresh; internally lazy and cached.
+        updateNpAbout(track)
         // Built-in EQ follows the player (0.6.8): re-attach the
         // effects when the audio session changes. Owner-only,
         // like the bridge below — a stale instance must never
