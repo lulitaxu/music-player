@@ -11016,7 +11016,7 @@ class MainActivity : Activity() {
         var analyzeBtn: TextView? = null
         val hasAnalysis = AnalysisStore.get(this, track) != null
         if (!hasAnalysis && analysisSourceFor(this, track) != null) {
-            analyzeBtn = label(
+            val btn = label(
                 if (TrackAnalyzer.isAnalyzing(track)) "Working…" else "Analyze",
                 12.5f, accent, semiboldTf
             ).apply {
@@ -11024,14 +11024,15 @@ class MainActivity : Activity() {
                 isSingleLine = true
                 setPadding(dp(6), dp(4), 0, 0)
                 isEnabled = !TrackAnalyzer.isAnalyzing(track)
-                setOnClickListener {
-                    if (TrackAnalyzer.enqueue(this@MainActivity, track)) {
-                        meta.text = "Analyzing…"
-                        text = "Working…"
-                        isEnabled = false
-                    }
+            }
+            btn.setOnClickListener {
+                if (TrackAnalyzer.enqueue(this@MainActivity, track)) {
+                    meta.text = "Analyzing…"
+                    btn.text = "Working…"
+                    btn.isEnabled = false
                 }
             }
+            analyzeBtn = btn
             metaCol.addView(analyzeBtn)
         }
         row.addView(metaCol)
