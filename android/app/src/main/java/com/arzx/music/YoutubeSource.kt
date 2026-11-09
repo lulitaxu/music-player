@@ -151,8 +151,8 @@ object YoutubeSource {
             }
             if (videoId.isNullOrEmpty()) continue
             val thumbs = item.thumbnails
-            val large = thumbs.maxByOrNull { it.height * it.width }
-            val small = thumbs.filter { it.height >= 100 }.minByOrNull { it.height * it.width } ?: large
+            val small = thumbs.filter { it.height >= 100 }.minByOrNull { it.height * it.width }
+                ?: thumbs.maxByOrNull { it.height * it.width }
             val artistId = item.uploaderUrl?.let { u ->
                 Regex("channel/(UC[0-9A-Za-z_-]+)").find(u)?.groupValues?.getOrNull(1)
             }
@@ -163,7 +163,14 @@ object YoutubeSource {
                     artist = item.uploaderName,
                     duration = item.duration.toInt().coerceAtLeast(0),
                     artworkSmall = small?.url,
-                    artworkLarge = large?.url,
+                    // NewPipe's biggest thumb for a video is the
+                    // 480x360 hqdefault still: letterboxed and soft
+                    // on any large surface. The maxres rendition
+                    // (1280x720) exists for most music content, so
+                    // it becomes the large art; every loader call
+                    // that uses it passes artworkSmall as fallback,
+                    // so a 404 lands on hq instead of a blank.
+                    artworkLarge = "https://i.ytimg.com/vi/$videoId/maxresdefault.jpg",
                     source = SOURCE_YOUTUBE,
                     artistId = artistId
                 )

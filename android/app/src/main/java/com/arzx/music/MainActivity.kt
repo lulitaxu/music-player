@@ -3078,7 +3078,10 @@ class MainActivity : Activity() {
                 roundedClip(this, 10)
             }
             val artTrack = song ?: rep
-            ArtworkLoader.load(artTrack?.artworkLarge ?: artTrack?.artworkSmall, img)
+            ArtworkLoader.load(
+                sizedArtwork(artTrack?.artworkLarge ?: artTrack?.artworkSmall, 540), img,
+                artTrack?.artworkSmall, dp(132)
+            )
             box.addView(img, LinearLayout.LayoutParams(dp(132), dp(132)))
             if (song != null) {
                 box.addView(cardTitle(song.title).apply {
@@ -5622,7 +5625,10 @@ class MainActivity : Activity() {
                 scaleType = ImageView.ScaleType.CENTER_CROP
                 roundedClip(this, 10)
             }
-            ArtworkLoader.load(album.artworkLarge ?: album.artworkSmall, img)
+            ArtworkLoader.load(
+                sizedArtwork(album.artworkLarge ?: album.artworkSmall, 540), img,
+                album.artworkSmall, dp(132)
+            )
             box.addView(img, LinearLayout.LayoutParams(dp(132), dp(132)))
             box.addView(label(album.title, 13.5f, Color.WHITE, mediumTf).apply {
                 maxLines = 2
@@ -5661,7 +5667,10 @@ class MainActivity : Activity() {
                 scaleType = ImageView.ScaleType.CENTER_CROP
                 circularClip(this)
             }
-            ArtworkLoader.load(artist.artworkLarge ?: artist.artworkSmall, img)
+            ArtworkLoader.load(
+                sizedArtwork(artist.artworkLarge ?: artist.artworkSmall, 340), img,
+                artist.artworkSmall, dp(92)
+            )
             box.addView(img, LinearLayout.LayoutParams(dp(92), dp(92)))
             box.addView(label(artist.name, 13f, Color.WHITE, mediumTf).apply {
                 gravity = Gravity.CENTER
@@ -5749,7 +5758,10 @@ class MainActivity : Activity() {
                 bannerLp.topMargin = dp(10)
                 banner.layoutParams = bannerLp
                 val img = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
-                ArtworkLoader.load(p.artworkLarge ?: fallbackArt ?: p.artworkSmall, img)
+                ArtworkLoader.load(
+                    headerArtUrl(p.artworkLarge ?: fallbackArt, p.artworkSmall), img,
+                    p.artworkSmall ?: fallbackArt, resources.displayMetrics.widthPixels
+                )
                 banner.addView(img, FrameLayout.LayoutParams(-1, -1))
                 val shade = View(this).apply {
                     background = GradientDrawable(
@@ -5875,7 +5887,10 @@ class MainActivity : Activity() {
                     roundedClip(this, 12)
                     elevation = dp(18).toFloat()
                 }
-                ArtworkLoader.load(p.artworkLarge ?: ref.artworkSmall, art)
+                ArtworkLoader.load(
+                    headerArtUrl(p.artworkLarge ?: ref.artworkLarge, ref.artworkSmall), art,
+                    ref.artworkSmall, dp(200)
+                )
                 val artLp = LinearLayout.LayoutParams(dp(200), dp(200))
                 artLp.topMargin = dp(14)
                 head.addView(art, artLp)
@@ -6168,7 +6183,10 @@ class MainActivity : Activity() {
                     roundedClip(this, 12)
                     elevation = dp(18).toFloat()
                 }
-                ArtworkLoader.load(ref.artworkLarge ?: ref.artworkSmall, art)
+                ArtworkLoader.load(
+                    headerArtUrl(ref.artworkLarge, ref.artworkSmall), art,
+                    ref.artworkSmall, dp(200)
+                )
                 val artLp = LinearLayout.LayoutParams(dp(200), dp(200))
                 artLp.topMargin = dp(14)
                 head.addView(art, artLp)
@@ -9135,6 +9153,19 @@ class MainActivity : Activity() {
     private fun heroArt(t: Track): String? =
         if (dataSaverOn()) t.artworkSmall ?: t.artworkLarge
         else sizedArtwork(t.artworkLarge ?: t.artworkSmall, 1080)
+
+    /** Artwork URL for page headers and banners (album, artist,
+     *  playlist pages): the w1080 rendition, same as Now Playing.
+     *  These surfaces used to load the RAW catalog URL — often
+     *  w226 — and, because their loads run before layout params
+     *  exist, also decoded at the loader's 512px default on a
+     *  1080px-wide screen: the "album art is not HD" Arz flagged
+     *  again 2026-11-09. Callers must also pass an explicit
+     *  target size so the decode bucket matches the surface.
+     *  Data saver keeps the small rendition. */
+    private fun headerArtUrl(large: String?, small: String?): String? =
+        if (dataSaverOn()) small ?: large
+        else sizedArtwork(large ?: small, 1080)
 
     // ---------------------------------------------------------------- menus, queue screen, sleep timer, downloads
 
