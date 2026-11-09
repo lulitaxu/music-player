@@ -99,6 +99,48 @@ class EqController(context: Context) {
         return (if (db > 0) "+" else "") + "%.1f".format(db) + " dB"
     }
 
+    // ------------------------------------------------- Mix transition override (0.6.19)
+
+    /** Live-only band fractions while a Mix "Rise" transition is
+     *  sweeping the incoming player's EQ open. NEVER written to
+     *  prefs: the user's stored bands are the restore point, and
+     *  [endOverride] reapplies them. While non-null it wins over
+     *  the stored fractions in [levelForBand]; the transition
+     *  tick rewrites it ~10x per second, and every path that ends
+     *  a transition (finish, stop, pause, skip, new play) ends
+     *  the override with it, so a sweep can never leak into normal
+     *  playback or onto another player's session. */
+    private var overrideFractions: FloatArray? = null
+
+    /** The fraction a band should sound at right now: the live
+     *  override while one runs, else the user's stored value. */
+    private fun effectiveFraction(band: Int): Float =
+        overrideFractions?.getOrNull(band) ?: bandFraction(band)
+
+    fun beginOverride() {
+        if (overrideFractions == null) {
+            overrideFractions = FloatArray(uiBandCount()) { bandFraction(it) }
+        }
+    }
+
+    /** Pushes sweep fractions to the LIVE effect only. */
+    fun applyOverride(fractions: FloatArray) {
+        if (overrideFractions == null) return
+        overrideFractions = fractions.copyOf()
+        applyBands()
+    }
+
+    /** Ends the sweep: the user's stored bands go back on the
+     *  live effect exactly as they were. Safe to call when no
+     *  override is running. */
+    fun endOverride() {
+        if (overrideFractions == null) return
+        overrideFractions = null
+        applyBands()
+    }
+
+    val overrideActive: Boolean get() = overrideFractions != null
+
     /** Half-range in millibels: the symmetric scale fractions map
      *  onto (min of the two range ends, so a fraction can never
      *  push a level outside the device's real range). */
@@ -113,7 +155,7 @@ class EqController(context: Context) {
         val range = try { equalizer?.bandLevelRange } catch (_: Exception) { null }
         val min = range?.getOrNull(0)?.toInt() ?: prefs.getInt(KEY_PROFILE_MIN, -1500)
         val max = range?.getOrNull(1)?.toInt() ?: prefs.getInt(KEY_PROFILE_MAX, 1500)
-        return (bandFraction(band) * scaleMb()).roundToInt()
+        return (effectiveFraction(band) * scaleMb()).roundToInt()
             .coerceIn(min, max).toShort()
     }
 

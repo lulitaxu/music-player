@@ -71,6 +71,9 @@ import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.net.URL
 import java.util.concurrent.Executors
+import kotlin.math.cos
+import kotlin.math.pow
+import kotlin.math.sin
 
 const val SOURCE_AUDIUS = "audius"
 const val SOURCE_YOUTUBE = "youtube"
@@ -700,6 +703,12 @@ private class EnginePlayer(val exo: ExoPlayer) {
     val isPlaying: Boolean
         get() = try { exo.isPlaying } catch (_: Exception) { false }
 
+    /** Whether the player WANTS to play (0.6.19): at STATE_READY
+     *  isPlaying can lag a frame behind playWhenReady, and the
+     *  Mix solo-entrance decision reads both. */
+    val playWhenReady: Boolean
+        get() = try { exo.playWhenReady } catch (_: Exception) { false }
+
     val isEnded: Boolean
         get() = try { exo.playbackState == Player.STATE_ENDED } catch (_: Exception) { false }
 
@@ -1004,12 +1013,37 @@ class MainActivity : Activity() {
         override fun run() {
             val out = outPlayer
             val cur = player
-            if (out == null || cur == null) return
+            val style = fadeStyle
+            if (style == null) {
+                // Legacy global-crossfade fade: EXACTLY the math
+                // every release up to 0.6.18 shipped (linear swap).
+                if (out == null || cur == null) return
+                fadeStep++
+                try {
+                    val t = (fadeStep.toFloat() / fadeTotalSteps).coerceIn(0f, 1f)
+                    out.setVolume(1f - t)
+                    cur.setVolume(t)
+                    if (fadeStep < fadeTotalSteps) {
+                        handler.postDelayed(this, 100)
+                    } else {
+                        finishCrossfadeNow()
+                    }
+                } catch (_: Exception) {
+                    finishCrossfadeNow()
+                }
+                return
+            }
+            // Styled Mix transition (0.6.19): the curves below are
+            // what make Fade / Rise / Blend different sounds, not
+            // different names — see beginStyledTransition.
+            if (cur == null) {
+                finishCrossfadeNow()
+                return
+            }
             fadeStep++
             try {
                 val t = (fadeStep.toFloat() / fadeTotalSteps).coerceIn(0f, 1f)
-                out.setVolume(1f - t)
-                cur.setVolume(t)
+                applyStyledCurve(style, t, out, cur)
                 if (fadeStep < fadeTotalSteps) {
                     handler.postDelayed(this, 100)
                 } else {
@@ -1017,6 +1051,58 @@ class MainActivity : Activity() {
                 }
             } catch (_: Exception) {
                 finishCrossfadeNow()
+            }
+        }
+    }
+
+    /**
+     * One step of a styled Mix transition at progress [t] (0..1).
+     *
+     *  - FADE: the textbook equal-power crossfade — outgoing
+     *    cos(πt/2), incoming sin(πt/2); total power stays flat.
+     *  - BLEND: the tracks genuinely play TOGETHER in the
+     *    middle: the incoming completes its rise by 65% while
+     *    the outgoing does not begin falling until 35% — both
+     *    sit near full volume across the centre of the window.
+     *  - RISE: equal-power out, a slower swelling in
+     *    (sin^1.5), and the incoming's EQ sweeps open — its
+     *    high bands start cut (a muffled, distant entrance)
+     *    and open to the user's own EQ by the end, driven
+     *    through [EqController]'s live override so nothing is
+     *    persisted and the restore is the user's real settings.
+     *
+     * [out] is null on the solo path (a missed overlap window):
+     * only the incoming side of the curve runs.
+     */
+    private fun applyStyledCurve(style: MixStyle, t: Float, out: EnginePlayer?, cur: EnginePlayer) {
+        val halfPi = (Math.PI / 2).toFloat()
+        when (style) {
+            MixStyle.FADE -> {
+                out?.setVolume(cos(t * halfPi))
+                cur.setVolume(sin(t * halfPi))
+            }
+            MixStyle.BLEND -> {
+                val inT = (t / 0.65f).coerceIn(0f, 1f)
+                val outT = ((t - 0.35f) / 0.65f).coerceIn(0f, 1f)
+                out?.setVolume(cos(outT * halfPi))
+                cur.setVolume(sin(inT * halfPi))
+            }
+            MixStyle.RISE -> {
+                out?.setVolume(cos(t * halfPi))
+                cur.setVolume(sin(t * halfPi).pow(1.5f))
+                if (::eqController.isInitialized && eqController.overrideActive) {
+                    // Smoothstep openness: slow at both ends of
+                    // the sweep, like a filter knob turned by hand.
+                    val open = t * t * (3f - 2f * t)
+                    val bands = eqController.uiBandCount()
+                    val closed = floatArrayOf(0.25f, 0f, -0.45f, -0.8f, -1f)
+                    val fractions = FloatArray(bands) { band ->
+                        val user = eqController.bandFraction(band)
+                        val off = closed.getOrElse(band) { -0.6f }
+                        (user + off * (1f - open)).coerceIn(-1f, 1f)
+                    }
+                    eqController.applyOverride(fractions)
+                }
             }
         }
     }
@@ -1072,6 +1158,10 @@ class MainActivity : Activity() {
      *  stale instance's onDestroy never unregisters a newer
      *  instance's listener (same rule as myControls). */
     private var myDlListener: ((String, String) -> Unit)? = null
+
+    /** This instance's Mix analysis listener (0.6.19),
+     *  identity-kept like [myDlListener]. */
+    private var myAnalysisListener: ((String) -> Unit)? = null
 
     // ---- v5: listening stats accumulation ----
     private var sessionListenedMs = 0L
@@ -1266,6 +1356,58 @@ class MainActivity : Activity() {
     /** One-shot boundary timer; fires the swap at duration − position. */
     private var gaplessFire: Runnable? = null
 
+    // ---- 0.6.19: Mix (per-pair playlist transitions) ----
+    /** The local playlist the current queue was started from, or
+     *  null when playback has any other context. Set by the
+     *  playlist page's play paths AFTER [setQueue] (which clears
+     *  it — a fresh queue is a fresh context until its owner
+     *  claims it). Mix transitions resolve against this playlist
+     *  only, so a stored pair can never leak into an album, a
+     *  search result or another playlist that happens to contain
+     *  the same two tracks. */
+    private var mixPlaylistId: String? = null
+
+    /** A prepared incoming player for a custom Mix transition,
+     *  built ahead of the overlap window like [GaplessPrep] but
+     *  fired at the window's START (the outgoing keeps playing
+     *  underneath as the crossfade's outgoing deck). */
+    private class MixPrep(
+        val pairKey: String,
+        val track: Track,
+        val holder: EnginePlayer,
+        val resolved: StreamResolver.Resolved?
+    ) {
+        @Volatile var ready = false
+        @Volatile var activated = false
+    }
+    private var mixPrep: MixPrep? = null
+    /** Pair key the in-flight Mix preload belongs to. */
+    private var mixArmingFor: String? = null
+
+    /** The custom style the RUNNING fade belongs to (0.6.19), or
+     *  null for a legacy global-crossfade fade (whose tick math
+     *  is unchanged). A styled run with no outgoing deck
+     *  (outPlayer == null) is a solo fade-in: the degraded path
+     *  when a custom pair's overlap window was missed (slow
+     *  resolve) and the boundary play() started the incoming
+     *  alone — the style still shapes its entrance instead of a
+     *  hard cut. */
+    private var fadeStyle: MixStyle? = null
+    /** Style chosen for the start currently being built by
+     *  [startPlaybackInternal]; consumed by [onPlayerReady].
+     *  Recomputed per ladder attempt, like the fade itself. */
+    private var pendingFadeStyle: MixStyle? = null
+
+    /** Playlist page state (0.6.19): which playlist is showing
+     *  its Mix editor (null = Mix mode off), the pre-reorder
+     *  track order kept for one-tap Undo, and the live BPM/key
+     *  labels of the visible Mix rows by track key, so an
+     *  analysis completing updates its row in place instead of
+     *  rebuilding the screen. */
+    private var mixModePlaylistId: String? = null
+    private var mixUndo: Pair<String, List<Track>>? = null
+    private val mixRowMeta = HashMap<String, Pair<TextView, TextView?>>()
+
     private lateinit var queueOverlay: FrameLayout
     private lateinit var queueRecycler: RecyclerView
 
@@ -1357,6 +1499,7 @@ class MainActivity : Activity() {
             accumulateListening()
             updateProgress()
             updateLyricsHighlight()
+            maybeArmMix()
             maybeArmGapless()
             maybeWarmAfterNext()
             handler.postDelayed(this, 500)
@@ -1422,6 +1565,12 @@ class MainActivity : Activity() {
         myDlListener = dlListener
         Downloads.uiListener = dlListener
         Downloads.resumeInterruptedAsync(this, effectiveDownloadQuality())
+        // Mix analysis completions (0.6.19): the analyzer is a
+        // process-level object like Downloads; this instance
+        // lends it its UI ears the same way.
+        val analysisListener: (String) -> Unit = { key -> onAnalysisDone(key) }
+        myAnalysisListener = analysisListener
+        TrackAnalyzer.listener = analysisListener
         backfillFavorites()
         loadAccentPref()
         window.statusBarColor = bgColor
@@ -5154,7 +5303,8 @@ class MainActivity : Activity() {
         contextLabel: Pair<String, String>? = null,
         menuOverrideFor: ((Int) -> (() -> Unit))? = null,
         alive: () -> Boolean,
-        onDone: ((Boolean) -> Unit)? = null
+        onDone: ((Boolean) -> Unit)? = null,
+        playHook: (() -> Unit)? = null
     ) {
         if (list.isEmpty()) {
             onDone?.invoke(true)
@@ -5180,7 +5330,8 @@ class MainActivity : Activity() {
                     track, target, queueContext,
                     contextLabel = contextLabel,
                     menuOverride = menuOverrideFor?.invoke(idx),
-                    dlKeys = dlKeys
+                    dlKeys = dlKeys,
+                    playHook = playHook
                 )
                 idx++
             }
@@ -5208,7 +5359,8 @@ class MainActivity : Activity() {
         queueContext: List<Track>? = null,
         contextLabel: Pair<String, String>? = null,
         menuOverride: (() -> Unit)? = null,
-        dlKeys: Set<String>? = null
+        dlKeys: Set<String>? = null,
+        playHook: (() -> Unit)? = null
     ) {
         val openMenu = { if (menuOverride != null) menuOverride() else showTrackMenu(track) }
         val row = LinearLayout(this).apply {
@@ -5219,6 +5371,11 @@ class MainActivity : Activity() {
             setOnClickListener {
                 if (queueContext != null) setQueue(queueContext)
                 if (contextLabel != null) setPlayContext(contextLabel.first, contextLabel.second)
+                // Runs after setQueue (which clears the Mix
+                // context) and before play(): the queue's owner
+                // claiming it — the playlist page uses it to arm
+                // Mix for this playback (0.6.19).
+                playHook?.invoke()
                 play(track)
             }
             setOnLongClickListener {
@@ -6994,6 +7151,12 @@ class MainActivity : Activity() {
         // recorded against an EARLIER resolution (0.6.3, WS-C)
         // must not leak into this one and mute it.
         suppressAutoPlay = false
+        // 0.6.19: a new play settles a running styled Mix
+        // transition first (same rule as a transport tap): the
+        // outgoing is released, the EQ override ends, and the
+        // player this play retires starts from full volume, so
+        // no sweep state can bleed into the next track.
+        if (fadeStyle != null) finishCrossfadeNow()
         // 0.6.14: bank the OUTGOING track's reached position
         // before it is replaced — the resume rings on Home read
         // exactly this. Runs before the player is retired, so
@@ -7009,6 +7172,7 @@ class MainActivity : Activity() {
         // track's boundary (manual skip, row tap, error advance):
         // the prepared next is stale the moment this runs.
         discardGaplessPrep()
+        discardMixPrep()
         val idx = queue.indexOfFirst { it.id == track.id && it.source == track.source }
         if (idx >= 0) {
             queueIndex = idx
@@ -7085,6 +7249,7 @@ class MainActivity : Activity() {
         if (fadeSource === p) fadeSource = null
         // A torn-down player has no boundary: drop any gapless prep.
         discardGaplessPrep()
+        discardMixPrep()
         p.release()
         player = null
     }
@@ -7337,10 +7502,21 @@ class MainActivity : Activity() {
         val old = player
         val forTrack = current
         val sessionToken = playToken
-        val fadeMs = crossfadeSec() * 1000
         val fade = fadeSource
         val sameTrack = forTrack != null && activePlayerTrack != null &&
             forTrack.id == activePlayerTrack?.id && forTrack.source == activePlayerTrack?.source
+        // 0.6.19: a custom Mix transition for the pair
+        // (outgoing → this track) overrides the global crossfade
+        // for this start — its length, and its style (consumed
+        // by onPlayerReady). Repeat-one restarts never count
+        // (sameTrack), and the sleep fade keeps sole ownership
+        // of volume while it runs.
+        val prevTrack = activePlayerTrack
+        val mixT = if (!sameTrack && forTrack != null && prevTrack != null) {
+            mixTransitionFor(prevTrack, forTrack)
+        } else null
+        val fadeMs = if (mixT != null) mixT.lengthSec * 1000 else crossfadeSec() * 1000
+        pendingFadeStyle = if (mixT != null && !sleepFadeRunning) mixT.style else null
         val canFade = fadeMs > 0 && fade != null && !sameTrack && fade.isPlaying && !sleepFadeRunning
         val httpFactory = DefaultHttpDataSource.Factory()
             .setUserAgent(userAgent ?: "arzxsh (Android)")
@@ -7427,7 +7603,11 @@ class MainActivity : Activity() {
         }
         holder.listener = listener
         exo.addListener(listener)
-        if (canFade) holder.setVolume(0f)
+        // A styled Mix entrance also starts silent (0.6.19): if
+        // the styled run turns out not to start (a paused
+        // landing), onPlayerReady's not-faded path restores the
+        // volume, so the track can never sit silent.
+        if (canFade || pendingFadeStyle != null) holder.setVolume(0f)
         try {
             exo.setMediaItem(item)
             exo.prepare()
@@ -7476,7 +7656,34 @@ class MainActivity : Activity() {
             old.release()
         }
         var faded = false
-        if (canFade && partner != null && partner !== holder) {
+        // 0.6.19: a custom Mix pair takes this start over. With
+        // an audible partner it is a real styled crossfade; with
+        // none (the outgoing already ended — the overlap window
+        // was missed) the style shapes a solo fade-in instead of
+        // a hard cut. Either way the global path below is skipped.
+        val style = pendingFadeStyle
+        pendingFadeStyle = null
+        if (style != null && canFade && partner != null && partner !== holder) {
+            try {
+                if (style == MixStyle.RISE) eqController.sync(holder.audioSessionId)
+                beginStyledTransition(partner, fadeMs, style)
+                faded = true
+            } catch (_: Exception) {
+                faded = false
+            }
+        } else if (style != null && partner == null &&
+            (holder.isPlaying || holder.playWhenReady) && !sleepFadeRunning
+        ) {
+            try {
+                if (style == MixStyle.RISE) eqController.sync(holder.audioSessionId)
+                holder.setVolume(0f)
+                beginStyledTransition(null, fadeMs, style)
+                faded = true
+            } catch (_: Exception) {
+                faded = false
+            }
+        }
+        if (!faded && style == null && canFade && partner != null && partner !== holder) {
             try {
                 beginCrossfade(partner, fadeMs)
                 faded = true
@@ -7514,6 +7721,7 @@ class MainActivity : Activity() {
         // with another client (still resolving); terminal failures
         // clear it via showPlaybackError.
         if (player === holder) player = null
+        pendingFadeStyle = null
         holder.release()
         if (resolved != null && forTrack != null && sessionToken == playToken &&
             ytTrack?.id == forTrack.id && ytTrack?.source == forTrack.source
@@ -7550,12 +7758,56 @@ class MainActivity : Activity() {
         // bars), which already points at the INCOMING player.
     }
 
+    /**
+     * Starts a styled Mix transition (0.6.19): [out] is the
+     * outgoing deck (null on the solo fade-in path), the incoming
+     * deck is [player], already playing at volume 0. The shared
+     * [crossfadeTick] drives the curve; [finishCrossfadeNow] is
+     * the single teardown every end/interruption path funnels
+     * through, exactly like the legacy fade.
+     *
+     * RISE LIMITATION, stated plainly: the EQ sweep rides ONE
+     * [android.media.audiofx.Equalizer] on the INCOMING player's
+     * audio session through [EqController]'s override — the app
+     * has no per-deck filter/DSP chain in its playback path, so
+     * this is an automated band-gain sweep (lows stay, highs open
+     * up), not a true resonant low-pass filter sweep. It sounds
+     * like a filter opening because the top three bands travel
+     * ~15 dB across the window; it is not one, and the report
+     * says so.
+     */
+    private fun beginStyledTransition(out: EnginePlayer?, fadeMs: Int, style: MixStyle) {
+        outPlayer?.let { prev ->
+            if (prev !== out) prev.release()
+        }
+        handler.removeCallbacks(crossfadeTick)
+        outPlayer = out
+        fadeStep = 0
+        fadeTotalSteps = (fadeMs / 100).coerceAtLeast(1)
+        fadeStyle = style
+        if (style == MixStyle.RISE && ::eqController.isInitialized) {
+            // The override lands on whichever session the
+            // controller is attached to — the incoming player's,
+            // synced by the caller before this runs.
+            eqController.beginOverride()
+            player?.let { applyStyledCurve(style, 0f, out, it) }
+        }
+        handler.postDelayed(crossfadeTick, 100)
+    }
+
     /** Ends a running crossfade immediately: outgoing player
-     *  released, active player restored to full volume. */
+     *  released, active player restored to full volume. For a
+     *  styled Mix transition it also ends the EQ override, so the
+     *  user's own EQ is what the incoming player keeps — a Rise
+     *  sweep can never leak past its transition. */
     private fun finishCrossfadeNow() {
         handler.removeCallbacks(crossfadeTick)
         outPlayer?.release()
         outPlayer = null
+        if (fadeStyle != null) {
+            fadeStyle = null
+            if (::eqController.isInitialized) eqController.endOverride()
+        }
         player?.setVolume(1f)
     }
 
@@ -7673,6 +7925,14 @@ class MainActivity : Activity() {
      * runs instead: the transition is never worse than today's cut.
      */
     private fun maybeArmGapless() {
+        // 0.6.19: a custom Mix transition for the current pair
+        // owns this boundary outright — the gapless swap (a hard
+        // cut at the end) must never pre-empt the overlap. The
+        // Mix scheduler's own fallback covers a failed prep.
+        if (currentMixPair() != null) {
+            if (gaplessPrep != null || gaplessArmingFor != null) discardGaplessPrep()
+            return
+        }
         if (!gaplessOn() || crossfadeSec() > 0 || sleepAfterTrack || sleepFadeRunning) {
             if (gaplessPrep != null || gaplessArmingFor != null) discardGaplessPrep()
             return
@@ -7927,6 +8187,301 @@ class MainActivity : Activity() {
         refreshPlaybackUi()
     }
 
+    // ------------------------------------------------- 0.6.19: Mix playback
+
+    /** The custom transition stored for (out → in) in the
+     *  playlist the current playback claims, or null (Auto).
+     *  Also consulted by [startPlaybackInternal] for starts the
+     *  scheduler did not fire (manual skips, missed windows). */
+    private fun mixTransitionFor(out: Track, incoming: Track): MixTransition? {
+        val pid = mixPlaylistId ?: return null
+        return MixStore.get(this, pid, out, incoming)
+    }
+
+    /** The (transition, next track, next queue index) governing
+     *  the boundary the CURRENT track is approaching, or null
+     *  when that boundary is Auto / has no definite next. Pure
+     *  state reads — the ticker and the gapless guard call it. */
+    private fun currentMixPair(): Triple<MixTransition, Track, Int>? {
+        val pid = mixPlaylistId ?: return null
+        val cur = current ?: return null
+        val nextIdx = expectedNextIndex() ?: return null
+        val next = queue.getOrNull(nextIdx) ?: return null
+        val t = MixStore.get(this, pid, cur, next) ?: return null
+        return Triple(t, next, nextIdx)
+    }
+
+    /** Drops any prepared Mix incoming player. An ACTIVATED prep
+     *  is the live player and is never dropped here (activation
+     *  clears [mixPrep] first, same contract as gapless). */
+    private fun discardMixPrep() {
+        mixArmingFor = null
+        val prep = mixPrep
+        mixPrep = null
+        if (prep != null && !prep.activated) prep.holder.release()
+    }
+
+    /** Effective (lengthMs, outSkipMs) for [t] against an
+     *  outgoing duration: the window (outSkip + length) may not
+     *  exceed half the outgoing track, so a long custom on a
+     *  short song shrinks instead of swallowing it. Null when
+     *  not even a 1s window fits — the boundary then degrades
+     *  to the styled fade-in on the normal play path. */
+    private fun mixWindow(t: MixTransition, durMs: Long): Pair<Long, Long>? {
+        var lenMs = t.lengthSec * 1000L
+        val outMs = t.outSkipSec * 1000L
+        if (durMs > 0) {
+            val maxWindow = durMs / 2
+            if (outMs + lenMs > maxWindow) lenMs = maxWindow - outMs
+            if (lenMs < 1000) return null
+        }
+        return lenMs to outMs
+    }
+
+    /**
+     * The Mix scheduler, on the same 500ms ticker as
+     * [maybeArmGapless]. When a custom transition governs the
+     * current pair, the incoming track is resolved + PREPARED
+     * ahead of the overlap window (runway: the window plus 25s,
+     * at least 45s; short tracks arm immediately, like gapless)
+     * and STARTED at the window's first moment, so the two
+     * tracks genuinely overlap for the transition's length —
+     * with the outgoing's tail trimmed by the pair's outSkip.
+     * If the prep is not ready when the window arrives, nothing
+     * breaks: the outgoing ends, the normal play() path starts
+     * the incoming, and the stored style still shapes its
+     * entrance as a solo fade-in (see [onPlayerReady]).
+     */
+    private fun maybeArmMix() {
+        val pair = currentMixPair()
+        if (pair == null) {
+            if (mixPrep != null || mixArmingFor != null) discardMixPrep()
+            return
+        }
+        if (sleepAfterTrack || sleepAfterQueue || sleepFadeRunning || outPlayer != null) {
+            // Sleep and already-running transitions own the
+            // player; a Mix prep must never fight them.
+            if (mixPrep != null || mixArmingFor != null) discardMixPrep()
+            return
+        }
+        val (transition, next, _) = pair
+        val p = player ?: return
+        if (!p.isPlaying) return // a pause keeps the prep; the fire revalidates
+        val dur = p.durationMs
+        if (dur <= 0) return
+        val window = mixWindow(transition, dur) ?: run {
+            if (mixPrep != null || mixArmingFor != null) discardMixPrep()
+            return
+        }
+        val (lenMs, outSkipMs) = window
+        val remaining = dur - p.positionMs
+        val cur = current ?: return
+        val pairKey = MixStore.pairKey(cur, next)
+        val prep = mixPrep
+        if (prep != null) {
+            if (prep.pairKey == pairKey) {
+                maybeFireMix(prep, remaining, lenMs, outSkipMs)
+                return
+            }
+            discardMixPrep()
+        }
+        if (mixArmingFor == pairKey) return // resolution in flight
+        val prepRunway = maxOf(45_000L, lenMs + outSkipMs + 25_000L)
+        val armWindow = if (dur <= 90_000) Long.MAX_VALUE else prepRunway
+        if (remaining > armWindow) return
+        mixArmingFor = pairKey
+        val localFile = Downloads.localFile(this, next)
+        when {
+            next.source == SOURCE_LOCAL ->
+                prepareMix(pairKey, next, next.id, null)
+            localFile != null ->
+                prepareMix(pairKey, next, localFile.absolutePath, null)
+            next.source == SOURCE_YOUTUBE -> {
+                val quality = effectiveQuality()
+                gaplessExecutor.execute {
+                    val resolved = try {
+                        StreamResolver.resolveYoutube(next.id, quality)
+                    } catch (e: Exception) {
+                        null
+                    }
+                    runOnUiThread {
+                        if (mixArmingFor != pairKey) return@runOnUiThread
+                        val url = resolved?.url
+                        if (resolved == null || url == null) {
+                            // No pre-resolution: the boundary
+                            // takes the normal path, never worse.
+                            mixArmingFor = null
+                            return@runOnUiThread
+                        }
+                        prepareMix(pairKey, next, url, resolved)
+                    }
+                }
+            }
+            else ->
+                prepareMix(
+                    pairKey, next,
+                    "https://api.audius.co/v1/tracks/" +
+                        java.net.URLEncoder.encode(next.id, "UTF-8").replace("+", "%20") +
+                        "/stream?app_name=arzxsh",
+                    null
+                )
+        }
+    }
+
+    /** Builds the incoming player for a Mix transition and
+     *  prepares it paused — construction mirrors [prepareGapless]
+     *  exactly (matched-UA factory, audio attributes, wake mode,
+     *  registry), because a prep built any other way would be
+     *  rejected by the stream host or leak on teardown. */
+    private fun prepareMix(
+        pairKey: String,
+        next: Track,
+        uriString: String,
+        resolved: StreamResolver.Resolved?
+    ) {
+        if (!PlayerRegistry.isOwner(instanceId)) return
+        val httpFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent(resolved?.userAgent ?: "arzxsh (Android)")
+            .setConnectTimeoutMs(15_000)
+            .setReadTimeoutMs(30_000)
+            .setAllowCrossProtocolRedirects(true)
+        val exo = ExoPlayer.Builder(this)
+            .setMediaSourceFactory(
+                DefaultMediaSourceFactory(DefaultDataSource.Factory(this, httpFactory))
+            )
+            .build()
+        exo.setAudioAttributes(
+            Media3AudioAttributes.Builder()
+                .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                .setUsage(C.USAGE_MEDIA)
+                .build(),
+            true
+        )
+        exo.setWakeMode(C.WAKE_MODE_NETWORK)
+        val holder = EnginePlayer(exo)
+        PlayerRegistry.register(instanceId) { holder.release() }
+        val prep = MixPrep(pairKey, next, holder, resolved)
+        mixPrep = prep
+        val listener = object : Player.Listener {
+            override fun onPlaybackStateChanged(state: Int) {
+                if (holder.retired) return
+                if (!prep.activated) {
+                    if (state == Player.STATE_READY) prep.ready = true
+                    return
+                }
+                if (holder !== player) return
+                if (state == Player.STATE_ENDED) handleCompletion()
+                else if (state == Player.STATE_READY) buffering = false
+                refreshPlaybackUi()
+            }
+
+            override fun onIsPlayingChanged(playing: Boolean) {
+                if (holder.retired) return
+                if (prep.activated && holder === player) refreshPlaybackUi()
+            }
+
+            override fun onPlayerError(error: PlaybackException) {
+                if (holder.retired) return
+                if (!prep.activated) {
+                    // A failed prep is silent: drop it and let
+                    // the boundary take the normal path.
+                    if (mixPrep === prep) discardMixPrep()
+                } else if (holder === player) {
+                    onPlayerFailed(holder, next, resolved, playToken, error)
+                }
+            }
+        }
+        holder.listener = listener
+        exo.addListener(listener)
+        try {
+            val item = if (uriString.startsWith("/")) {
+                MediaItem.fromUri(android.net.Uri.fromFile(java.io.File(uriString)))
+            } else {
+                MediaItem.fromUri(uriString)
+            }
+            exo.setMediaItem(item)
+            // playWhenReady stays false: prepared and buffered,
+            // silent until the window fires it.
+            exo.prepare()
+        } catch (e: Exception) {
+            if (mixPrep === prep) discardMixPrep()
+        }
+    }
+
+    /** Window reached: fire if the prep is ready and everything
+     *  still lines up. A boundary already passed (remaining ≤ 0)
+     *  belongs to the normal completion path, not to us. */
+    private fun maybeFireMix(prep: MixPrep, remainingMs: Long, lenMs: Long, outSkipMs: Long) {
+        if (!prep.ready || prep.activated) return
+        if (remainingMs > lenMs + outSkipMs) return
+        if (remainingMs <= 0) return
+        fireMixTransition(prep, lenMs)
+    }
+
+    /** The overlap itself: the incoming player is installed as
+     *  [player] and started at its in-point, silent; the outgoing
+     *  becomes the crossfade's source deck, retired so its late
+     *  STATE_ENDED can never advance the queue a second time;
+     *  the styled tick then runs the pair's curve across the
+     *  window. Bookkeeping matches a foreground play exactly
+     *  (history, recents, ladder state), via the same lines
+     *  [activateGapless] uses. */
+    private fun fireMixTransition(prep: MixPrep, lenMs: Long) {
+        val pair = currentMixPair()
+        val p = player
+        val cur = current
+        if (pair == null || p == null || cur == null || !p.isPlaying || !prep.ready ||
+            sleepAfterTrack || sleepAfterQueue || sleepFadeRunning || outPlayer != null
+        ) {
+            discardMixPrep()
+            return
+        }
+        val (transition, next, nextIdx) = pair
+        if (Downloads.key(next) != Downloads.key(prep.track) ||
+            MixStore.pairKey(cur, next) != prep.pairKey
+        ) {
+            discardMixPrep()
+            return
+        }
+        flushListened()
+        saveRecent(next)
+        PlayHistory.record(this, next)
+        ytTrack = next
+        ytQuality = effectiveQuality()
+        playToken++
+        queueIndex = nextIdx
+        prep.activated = true
+        mixPrep = null
+        mixArmingFor = null
+        if (prep.resolved != null) {
+            StreamResolver.rememberGood(next.id, effectiveQuality(), prep.resolved)
+        }
+        val old = p
+        current = next
+        player = prep.holder
+        activePlayerTrack = next
+        buffering = false
+        old.retired = true
+        if (fadeSource === old) fadeSource = null
+        val inSkipMs = transition.inSkipSec * 1000L
+        if (inSkipMs > 0) prep.holder.seekTo(inSkipMs)
+        prep.holder.setVolume(0f)
+        prep.holder.play()
+        npLyrics = null
+        npLyricsKey = null
+        if (::lyricsOverlay.isInitialized && lyricsOverlay.visibility == View.VISIBLE) {
+            hideLyrics()
+            showLyrics()
+        }
+        npLyricIdx = -2
+        lastNpLyricText = null
+        refreshPlaybackUi()
+        // refreshPlaybackUi synced the EQ onto the incoming
+        // session, so a Rise override started now lands on the
+        // incoming deck, not the outgoing one.
+        beginStyledTransition(old, lenMs.toInt(), transition.style)
+    }
+
     // ------------------------------------------------------------ queue order, shuffle, repeat
 
     /** Replaces the queue and rebuilds the play order around it. */
@@ -7935,6 +8490,11 @@ class MainActivity : Activity() {
         // old one and is discarded (the fire-time revalidation is
         // the backstop, this is the prompt cleanup).
         discardGaplessPrep()
+        // 0.6.19: same for a Mix prep, and the Mix context dies
+        // with the queue — the playlist page's play paths claim
+        // the new queue as theirs right after this returns.
+        discardMixPrep()
+        mixPlaylistId = null
         queue = newQueue
         manualIndices.clear()
         if (startIndex in newQueue.indices) {
@@ -8205,7 +8765,7 @@ class MainActivity : Activity() {
     private fun togglePlayback() {
         // A tap mid-crossfade settles the fade instantly, so pause /
         // resume always acts on ONE player at full volume.
-        if (outPlayer != null) finishCrossfadeNow()
+        if (outPlayer != null || fadeStyle != null) finishCrossfadeNow()
         val active = player
         if (active == null) {
             // 0.6.3 (WS-C): a pause/stop intent while a tap-to-play
@@ -8284,13 +8844,14 @@ class MainActivity : Activity() {
      * together, never one without the other.
      */
     private fun stopPlayback() {
-        if (outPlayer != null) finishCrossfadeNow()
+        if (outPlayer != null || fadeStyle != null) finishCrossfadeNow()
         // The conclusive stop ends the timed sleep timer too
         // (0.6.8): no deadline, no fade, volume whole — nothing
         // timed may outlive the stop.
         cancelTimedSleep()
         // Disarm the boundary: prep released, fire timer removed.
         discardGaplessPrep()
+        discardMixPrep()
         gaplessFire?.let { handler.removeCallbacks(it) }
         gaplessFire = null
         // A stop while a NEW track is still resolving: the retired
@@ -10099,6 +10660,7 @@ class MainActivity : Activity() {
                     shuffleOn = true
                     setPlayContext("Playlist", p.name)
                     setQueue(p.tracks)
+                    mixPlaylistId = p.id
                     refreshTransportStates()
                     play(p.tracks[playOrder.firstOrNull() ?: 0])
                 }
@@ -10121,6 +10683,7 @@ class MainActivity : Activity() {
                 setOnClickListener {
                     setPlayContext("Playlist", p.name)
                     setQueue(p.tracks)
+                    mixPlaylistId = p.id
                     play(p.tracks.first())
                 }
             }
@@ -10154,19 +10717,66 @@ class MainActivity : Activity() {
             }
             actions.addView(menuBtn, LinearLayout.LayoutParams(dp(44), dp(44)))
             content.addView(actions)
-            // Rows with playlist-specific menus: reorder happens
-            // through explicit Move Up / Move Down items (the list
-            // UI has no drag framework; numbered moves are exact).
-            // Chunked (0.6.3, S1): a 200-track playlist no longer
-            // builds in one main-thread pass.
-            val gen = generation
-            addRowsChunked(
-                p.tracks, content,
-                queueContext = p.tracks,
-                contextLabel = "Playlist" to p.name,
-                menuOverrideFor = { i -> { showPlaylistTrackMenu(p.id, p.tracks[i], i) } },
-                alive = { gen == generation }
-            )
+            // Mix bar (0.6.19): the toggle that turns this page
+            // into the transition editor. Accent-filled while on.
+            val mixOn = mixModePlaylistId == p.id
+            val mixBar = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+            }
+            val mixLp = LinearLayout.LayoutParams(-1, -2)
+            mixLp.bottomMargin = dp(6)
+            mixBar.layoutParams = mixLp
+            val mixToggle = label(
+                if (mixOn) "Mix · On" else "Mix", 14f,
+                if (mixOn) Color.BLACK else Color.WHITE, semiboldTf
+            ).apply {
+                gravity = Gravity.CENTER
+                isSingleLine = true
+                setPadding(dp(18), dp(9), dp(18), dp(9))
+                background = if (mixOn) {
+                    GradientDrawable().apply {
+                        setColor(accent)
+                        cornerRadius = dp(999).toFloat()
+                    }
+                } else {
+                    solidBg(999f, surface2)
+                }
+                setOnClickListener {
+                    mixModePlaylistId = if (mixOn) null else p.id
+                    if (!mixOn) {
+                        // Entering Mix: queue honest analysis for
+                        // every track whose audio is on the device
+                        // and whose numbers we don't have yet.
+                        queueMixAnalysis(p)
+                    } else {
+                        TrackAnalyzer.cancelRunning()
+                    }
+                    showPlaylist(p.id)
+                }
+            }
+            mixBar.addView(mixToggle)
+            content.addView(mixBar)
+            if (mixOn) {
+                addMixHeader(p)
+                val gen = generation
+                addMixRowsChunked(p, content, alive = { gen == generation })
+            } else {
+                // Rows with playlist-specific menus: reorder happens
+                // through explicit Move Up / Move Down items (the list
+                // UI has no drag framework; numbered moves are exact).
+                // Chunked (0.6.3, S1): a 200-track playlist no longer
+                // builds in one main-thread pass.
+                val gen = generation
+                addRowsChunked(
+                    p.tracks, content,
+                    queueContext = p.tracks,
+                    contextLabel = "Playlist" to p.name,
+                    menuOverrideFor = { i -> { showPlaylistTrackMenu(p.id, p.tracks[i], i) } },
+                    alive = { gen == generation },
+                    playHook = { mixPlaylistId = p.id }
+                )
+            }
         } else {
             content.addView(label("This playlist is empty.", 15f, white50).apply {
                 setPadding(0, dp(18), 0, 0)
@@ -10209,6 +10819,404 @@ class MainActivity : Activity() {
         items += "Share" to { shareTrack(track) }
         val header = if (track.artist.isNotEmpty()) "${track.title}\n${track.artist}" else track.title
         showMenu(header, items)
+    }
+
+    // ------------------------------------------------------------ Mix UI (0.6.19)
+
+    /** Entering Mix mode: queue analysis for every track whose
+     *  audio is on the device and whose numbers are missing.
+     *  The analyzer runs them one at a time in the background;
+     *  rows update in place as each lands ([onAnalysisDone]). */
+    private fun queueMixAnalysis(p: Playlist) {
+        for (t in p.tracks) {
+            if (AnalysisStore.get(this, t) == null) {
+                TrackAnalyzer.enqueue(this, t)
+            }
+        }
+    }
+
+    /** An analysis finished (or failed): update its visible Mix
+     *  row in place. Failure restores the Analyze affordance —
+     *  the numbers are never faked, so a failed read simply
+     *  leaves the row at "--" with the button back. */
+    private fun onAnalysisDone(key: String) {
+        if (isFinishing || isDestroyed) return
+        val (meta, analyzeBtn) = mixRowMeta[key] ?: return
+        val a = AnalysisStore.all(this)[key]
+        if (a != null) {
+            meta.text = a.summary()
+            analyzeBtn?.visibility = View.GONE
+        } else {
+            meta.text = "-- BPM · --"
+            analyzeBtn?.let {
+                it.text = "Analyze"
+                it.isEnabled = true
+                it.visibility = View.VISIBLE
+            }
+        }
+    }
+
+    private fun mixMetaText(track: Track): String {
+        val a = AnalysisStore.get(this, track)
+        if (a != null) return a.summary()
+        if (TrackAnalyzer.isAnalyzing(track)) return "Analyzing…"
+        return "-- BPM · --"
+    }
+
+    /** Mix mode header: reorder controls + the honest explainer
+     *  of where the numbers come from. */
+    private fun addMixHeader(p: Playlist) {
+        val known = p.tracks.count { AnalysisStore.get(this, it) != null }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(2), 0, dp(2))
+        }
+        val reorderBtn = label("Smart Reorder", 13.5f, Color.WHITE, mediumTf).apply {
+            gravity = Gravity.CENTER
+            isSingleLine = true
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            background = solidBg(999f, surface2)
+            setOnClickListener { applySmartReorder(p) }
+        }
+        row.addView(reorderBtn)
+        val undo = mixUndo
+        if (undo != null && undo.first == p.id) {
+            val undoBtn = label("Undo Reorder", 13.5f, accent, mediumTf).apply {
+                gravity = Gravity.CENTER
+                isSingleLine = true
+                setPadding(dp(14), dp(8), dp(14), dp(8))
+                setOnClickListener {
+                    Playlists.setTracks(this@MainActivity, p.id, undo.second)
+                    mixUndo = null
+                    Toast.makeText(this@MainActivity, "Original order restored", Toast.LENGTH_SHORT).show()
+                    showPlaylist(p.id)
+                }
+            }
+            val uLp = LinearLayout.LayoutParams(-2, -2)
+            uLp.marginStart = dp(10)
+            row.addView(undoBtn, uLp)
+        }
+        row.addView(
+            label("$known of ${p.tracks.size} analyzed", 12.5f, white50),
+            LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(12) }
+        )
+        content.addView(row)
+        content.addView(
+            label(
+                "BPM and key are read from each song's audio, on this phone. " +
+                    "Songs that are not downloaded yet show -- and join in once downloaded.",
+                12.5f, white50
+            ).apply { setPadding(0, dp(2), 0, dp(8)) }
+        )
+    }
+
+    private fun applySmartReorder(p: Playlist) {
+        val knownCount = p.tracks.count { AnalysisStore.get(this, it) != null }
+        if (knownCount < 2) {
+            Toast.makeText(
+                this,
+                "Not enough analyzed songs yet. Download songs and Mix will read their BPM and key.",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        val newOrder = SmartReorder.reorder(p.tracks, AnalysisStore.all(this))
+        if (newOrder == p.tracks) {
+            Toast.makeText(this, "This order already flows smoothly.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        // The old order is kept for one-tap Undo — a reorder
+        // must never silently destroy the user's arrangement.
+        mixUndo = p.id to p.tracks
+        Playlists.setTracks(this, p.id, newOrder)
+        retainedRoots.remove("Library")
+        Toast.makeText(this, "Reordered for smoother transitions", Toast.LENGTH_SHORT).show()
+        showPlaylist(p.id)
+    }
+
+    /** Chunked Mix row builder: track rows and the transition
+     *  chips between them, built in slices like [addRowsChunked]
+     *  so a 200-track playlist never janks the page open. */
+    private fun addMixRowsChunked(p: Playlist, target: LinearLayout, alive: () -> Boolean) {
+        val tracks = p.tracks
+        if (tracks.isEmpty()) return
+        mixRowMeta.clear()
+        chunkBuildsInFlight++
+        var idx = 0
+        fun step() {
+            if (isFinishing || isDestroyed || !alive()) {
+                chunkBuildsInFlight--
+                return
+            }
+            val end = minOf(idx + 20, tracks.size)
+            while (idx < end) {
+                addMixTrackRow(p, tracks[idx], idx, target)
+                if (idx < tracks.lastIndex) {
+                    addTransitionChip(p, tracks[idx], tracks[idx + 1], target)
+                }
+                idx++
+            }
+            if (idx < tracks.size) {
+                handler.post { step() }
+            } else {
+                chunkBuildsInFlight--
+            }
+        }
+        step()
+    }
+
+    private fun addMixTrackRow(p: Playlist, track: Track, index: Int, target: LinearLayout) {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+            rippleRect()
+            setOnClickListener {
+                setQueue(p.tracks)
+                setPlayContext("Playlist", p.name)
+                mixPlaylistId = p.id
+                play(track)
+            }
+            setOnLongClickListener {
+                showPlaylistTrackMenu(p.id, track, index)
+                true
+            }
+        }
+        val img = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            roundedClip(this, 9)
+        }
+        ArtworkLoader.load(track.artworkSmall ?: track.artworkLarge, img, null, dp(52))
+        row.addView(img, LinearLayout.LayoutParams(dp(52), dp(52)))
+        val text = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(13), 0, dp(8), 0)
+        }
+        text.addView(label(track.title, 16f, Color.WHITE, mediumTf).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        text.addView(label(track.artist, 14.5f, white50).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        row.addView(text, LinearLayout.LayoutParams(0, -2, 1f))
+        // The Mix column: real numbers or an honest placeholder,
+        // plus the Analyze affordance when the audio is here.
+        val metaCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.END
+        }
+        val meta = label(mixMetaText(track), 12.5f, white55, mediumTf).apply {
+            gravity = Gravity.END
+            isSingleLine = true
+        }
+        metaCol.addView(meta)
+        var analyzeBtn: TextView? = null
+        val hasAnalysis = AnalysisStore.get(this, track) != null
+        if (!hasAnalysis && analysisSourceFor(this, track) != null) {
+            analyzeBtn = label(
+                if (TrackAnalyzer.isAnalyzing(track)) "Working…" else "Analyze",
+                12.5f, accent, semiboldTf
+            ).apply {
+                gravity = Gravity.END
+                isSingleLine = true
+                setPadding(dp(6), dp(4), 0, 0)
+                isEnabled = !TrackAnalyzer.isAnalyzing(track)
+                setOnClickListener {
+                    if (TrackAnalyzer.enqueue(this@MainActivity, track)) {
+                        meta.text = "Analyzing…"
+                        text = "Working…"
+                        isEnabled = false
+                    }
+                }
+            }
+            metaCol.addView(analyzeBtn)
+        }
+        row.addView(metaCol)
+        mixRowMeta[trackKey(track)] = meta to analyzeBtn
+        val moreIcon = icon(R.drawable.ic_more, Color.argb(115, 255, 255, 255)).apply {
+            setOnClickListener { showPlaylistTrackMenu(p.id, track, index) }
+        }
+        val mLp = LinearLayout.LayoutParams(dp(28), dp(28))
+        mLp.marginStart = dp(6)
+        row.addView(moreIcon, mLp)
+        target.addView(row)
+    }
+
+    /** The tappable transition chip between two tracks: "Auto"
+     *  in dim type, or the custom's summary in the accent. */
+    private fun addTransitionChip(p: Playlist, out: Track, incoming: Track, target: LinearLayout) {
+        val t = MixStore.get(this, p.id, out, incoming)
+        val wrap = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, dp(1), 0, dp(1))
+        }
+        val chip = label(
+            if (t == null) "· · ·  Auto transition  · · ·" else "— ${t.summary()} —",
+            12.5f, if (t == null) white50 else accent, semiboldTf
+        ).apply {
+            gravity = Gravity.CENTER
+            isSingleLine = true
+            setPadding(dp(14), dp(6), dp(14), dp(6))
+            if (t != null) background = solidBg(999f, surface2)
+            setOnClickListener { showMixTransitionEditor(p, out, incoming) }
+        }
+        wrap.addView(chip)
+        target.addView(wrap)
+    }
+
+    /** The per-pair editor sheet (the app's AlertDialog idiom,
+     *  like Crossfade): style chips + three sliders. Saving Auto
+     *  deletes the custom entry; the pair falls back to the
+     *  global crossfade, and the sheet says so. */
+    private fun showMixTransitionEditor(p: Playlist, out: Track, incoming: Track) {
+        val existing = MixStore.get(this, p.id, out, incoming)
+        var style: MixStyle? = existing?.style
+        var length = existing?.lengthSec ?: crossfadeSec().takeIf { it > 0 } ?: 8
+        var outSkip = existing?.outSkipSec ?: 0
+        var inSkip = existing?.inSkipSec ?: 0
+
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(8), dp(24), 0)
+        }
+        box.addView(label(out.title, 14.5f, Color.WHITE, mediumTf).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        box.addView(label("into  ${incoming.title}", 14.5f, white55).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(0, dp(2), 0, dp(6))
+        })
+
+        // Style chips (single-line, horizontally scrollable —
+        // the EQ sheet's anti-crush pattern).
+        val chips = HashMap<String, TextView>()
+        var slidersEnabled: (Boolean) -> Unit = {}
+        fun refreshChips() {
+            for ((name, chip) in chips) {
+                val selected = (name == "Auto" && style == null) ||
+                    (style != null && name == style!!.label)
+                chip.setTextColor(if (selected) Color.BLACK else white55)
+                chip.background = if (selected) {
+                    GradientDrawable().apply {
+                        setColor(accent)
+                        cornerRadius = dp(999).toFloat()
+                    }
+                } else {
+                    solidBg(999f, surface2)
+                }
+            }
+            slidersEnabled(style != null)
+        }
+        val chipRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(8), 0, dp(4))
+        }
+        for (name in listOf("Auto", "Fade", "Rise", "Blend")) {
+            val chip = label(name, 13.5f, white55, mediumTf).apply {
+                gravity = Gravity.CENTER
+                isSingleLine = true
+                setPadding(dp(13), dp(7), dp(13), dp(7))
+                setOnClickListener {
+                    style = if (name == "Auto") null else MixStyle.valueOf(name.uppercase())
+                    refreshChips()
+                }
+            }
+            val lp = LinearLayout.LayoutParams(-2, -2)
+            lp.marginEnd = dp(8)
+            chipRow.addView(chip, lp)
+            chips[name] = chip
+        }
+        val chipScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(chipRow)
+        }
+        box.addView(chipScroll)
+
+        // Sliders.
+        val seekBars = ArrayList<SeekBar>()
+        fun sliderRow(
+            title: String,
+            maxV: Int,
+            initial: Int,
+            format: (Int) -> String,
+            onChange: (Int) -> Unit
+        ): LinearLayout {
+            val wrap = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(0, dp(10), 0, 0)
+            }
+            val head = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+            }
+            head.addView(label(title, 13.5f, white55, mediumTf), LinearLayout.LayoutParams(0, -2, 1f))
+            val value = label(format(initial), 13.5f, Color.WHITE, mediumTf)
+            head.addView(value)
+            wrap.addView(head)
+            val seek = SeekBar(this).apply {
+                max = maxV
+                progress = initial
+                progressTintList = ColorStateList.valueOf(accent)
+                thumbTintList = ColorStateList.valueOf(accent)
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                        value.text = format(progress)
+                        onChange(progress)
+                    }
+
+                    override fun onStartTrackingTouch(sb: SeekBar?) {}
+                    override fun onStopTrackingTouch(sb: SeekBar?) {}
+                })
+            }
+            seekBars += seek
+            wrap.addView(seek)
+            return wrap
+        }
+        box.addView(sliderRow("Transition length", 15, length - 1, { "${it + 1}s" }, { length = it + 1 }))
+        box.addView(
+            sliderRow(
+                "End this song early", 15, outSkip,
+                { if (it == 0) "Plays to the end" else "${it}s before the end" },
+                { outSkip = it }
+            )
+        )
+        box.addView(
+            sliderRow(
+                "Start the next song", 15, inSkip,
+                { if (it == 0) "From the start" else "${it}s in" },
+                { inSkip = it }
+            )
+        )
+        box.addView(
+            label(
+                "Auto uses your global crossfade (${crossfadeSec()}s). " +
+                    "A custom transition overlaps the two songs for real when this playlist plays.",
+                12.5f, white50
+            ).apply { setPadding(0, dp(12), 0, 0) }
+        )
+        slidersEnabled = { on ->
+            seekBars.forEach {
+                it.isEnabled = on
+                it.alpha = if (on) 1f else 0.35f
+            }
+        }
+        refreshChips()
+
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Transition")
+            .setView(box)
+            .setPositiveButton("Done") { _, _ ->
+                val t = style?.let { MixTransition(it, length, outSkip, inSkip) }
+                MixStore.set(this, p.id, out, incoming, t)
+                showPlaylist(p.id)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun showLiked() {
@@ -12259,6 +13267,10 @@ class MainActivity : Activity() {
         handler.removeCallbacks(sleepFadeTick)
         if (::eqController.isInitialized) eqController.release()
         discardGaplessPrep()
+        discardMixPrep()
+        if (myAnalysisListener != null && TrackAnalyzer.listener === myAnalysisListener) {
+            TrackAnalyzer.listener = null
+        }
         // Release EVERY player this instance created — the main
         // player, the crossfade partner, the ARMED GAPLESS PREP
         // and the fade-out source — through the process registry.

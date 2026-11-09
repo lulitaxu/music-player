@@ -179,6 +179,14 @@ object Playlists {
         }
     }
 
+    /** Replaces the whole track list (0.6.19, Mix Smart
+     *  Reorder + its Undo): the caller computes the new order;
+     *  this is the only write. */
+    @Synchronized
+    fun setTracks(ctx: Context, id: String, tracks: List<Track>) {
+        update(ctx, id) { it.copy(tracks = tracks) }
+    }
+
     /** Moves the track at [from] to [to] (explicit reorder control). */
     @Synchronized
     fun moveTrack(ctx: Context, id: String, from: Int, to: Int) {
