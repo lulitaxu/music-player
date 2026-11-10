@@ -165,6 +165,7 @@ class ArzxshApp(App):
         self._view = ("home", {})
         self._lyrics_track_id: str | None = None
         self._lyrics_data: dict | None = None
+        self._bulk_dl = False
         self._viz_bars = ""
         self._cava_proc: subprocess.Popen | None = None
 
@@ -442,6 +443,7 @@ class ArzxshApp(App):
         likes = self.store.data["likes"]
         widgets = [Static(f"[bold]Liked Songs[/bold]"), Static(f"{len(likes)} songs · stored on this machine only", classes="dim")]
         if likes:
+            widgets.append(Horizontal(Button("⬇ Download all", id="btn-liked-download-all")))
             widgets.append(self._track_list(likes, "Liked Songs"))
         else:
             widgets.append(Static("Press l on any song and it lands here.", classes="dim"))
@@ -500,6 +502,7 @@ class ArzxshApp(App):
             Static(f"{len(pl['tracks'])} songs", classes="dim"),
             Horizontal(
                 Button("▶ Play all", id="btn-pl-playall"),
+                Button("⬇ Download all", id="btn-pl-download-all"),
                 Button("Export (.m3u + .txt)", id="btn-pl-export"),
                 Button("Delete playlist", id="btn-pl-delete"),
             ),
@@ -781,6 +784,13 @@ class ArzxshApp(App):
             _, kw = self._view
             self.store.delete_playlist(kw.get("index", -1))
             await self.show_playlists()
+        elif bid == "btn-pl-download-all":
+            _, kw = self._view
+            pls = self.store.data["playlists"]
+            if 0 <= kw.get("index", -1) < len(pls):
+                self._start_bulk_download(pls[kw["index"]]["tracks"], pls[kw["index"]]["name"])
+        elif bid == "btn-liked-download-all":
+            self._start_bulk_download(list(self.store.data["likes"]), "Liked Songs")
         elif bid == "btn-eq-reset":
             self.store.data["eq"] = [0] * 10
             if self.engine:
@@ -912,6 +922,45 @@ class ArzxshApp(App):
             self.notify("Saved for offline" if not data.get("already") else "Already saved for offline")
         except Exception:
             self.notify("Download failed. Check your connection.", severity="error")
+
+    def _start_bulk_download(self, tracks: list[dict], name: str):
+        if self._bulk_dl:
+            self.notify("A bulk download is already running. Let it finish first.", severity="warning")
+            return
+        self.run_worker(self._download_all_tracks(tracks, name), name="bulk-download")
+
+    async def _download_all_tracks(self, tracks: list[dict], name: str):
+        # One at a time on purpose: the backend resolves and downloads
+        # server-side, and a 90-song playlist fired off in parallel
+        # would hammer both YouTube and the disk. Already-local and
+        # already-saved tracks are skipped; a failure never stops the
+        # rest of the batch.
+        self._bulk_dl = True
+        try:
+            pending = [t for t in tracks
+                       if t.get("source") != "local"
+                       and t.get("id") not in self.store.data["downloads"]]
+            skipped = len(tracks) - len(pending)
+            if not pending:
+                self.notify(f"Everything in “{name}” is already saved for offline.")
+                return
+            self.notify(f"Downloading {len(pending)} songs from “{name}”… one at a time, this can take a while.")
+            saved = failed = 0
+            for i, track in enumerate(pending, 1):
+                try:
+                    data = await self.backend.download(track)
+                    self.store.mark_downloaded(track["id"], data["track"]["id"])
+                    saved += 1
+                except Exception:
+                    failed += 1
+                if i % 10 == 0 and i < len(pending):
+                    self.notify(f"“{name}”: {i} of {len(pending)} done · {saved} saved"
+                                + (f" · {failed} failed" if failed else ""))
+            self.notify(f"“{name}” finished: {saved} saved"
+                        + (f" · {skipped} already had" if skipped else "")
+                        + (f" · {failed} failed" if failed else ""))
+        finally:
+            self._bulk_dl = False
 
     def action_download_focused(self):
         self.run_worker(self._download_current_or_focused())
