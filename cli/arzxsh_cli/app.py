@@ -601,12 +601,13 @@ class ArzxshApp(App):
             Horizontal(
                 Button("▶ Play all", id="btn-pl-playall"),
                 Button("⬇ Download all", id="btn-pl-download-all"),
+                Button("Remove song", id="btn-pl-remove"),
                 Button("Export (.m3u + .txt)", id="btn-pl-export"),
                 Button("Delete playlist", id="btn-pl-delete"),
             ),
         ]
         if pl["tracks"]:
-            widgets.append(Static("Highlight a song and press x to remove it from this playlist.", classes="dim"))
+            widgets.append(Static("Highlight a song, then press the Remove song button (or x) to take it out of this playlist.", classes="dim"))
             widgets.append(self._track_list(pl["tracks"], pl["name"]))
         else:
             widgets.append(Static("Empty. Press a on any track to add it here.", classes="dim"))
@@ -928,6 +929,17 @@ class ArzxshApp(App):
             _, kw = self._view
             self.store.delete_playlist(kw.get("index", -1))
             await self.show_playlists()
+        elif bid == "btn-pl-remove":
+            _, kw = self._view
+            index = kw.get("index", -1)
+            track = self._focused_track()
+            pls = self.store.data["playlists"]
+            if track and 0 <= index < len(pls):
+                self.store.playlist_remove(index, track["id"])
+                self.notify(f"Removed from “{esc(pls[index]['name'])}”")
+                await self.show_playlist_detail(index)
+            else:
+                self.notify("Highlight a song in the list first, then press Remove song.", severity="warning")
         elif bid == "btn-pl-download-all":
             _, kw = self._view
             pls = self.store.data["playlists"]
