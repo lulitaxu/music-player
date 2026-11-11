@@ -1341,11 +1341,23 @@ class MainActivity : Activity() {
      *  flips when the boundary swap installs it as [player]; the
      *  prep listener behaves accordingly. [resolved] is kept so a
      *  player rejection after activation can still advance the
-     *  YouTube ladder. */
+     *  YouTube ladder.
+     *
+     *  0.6.20: the prep now carries its own ladder state —
+     *  [quality] and [pendingStages] are the YouTube stages not
+     *  yet tried for this prep, [fromCache] marks a stream that
+     *  came from the session's known-good cache. A player
+     *  rejection BEFORE activation walks [pendingStages] and
+     *  re-prepares instead of killing the prep outright (the
+     *  0.6.19 behavior, which silently lost gapless whenever the
+     *  one-shot resolution produced a stream the player refused). */
     private class GaplessPrep(
         val track: Track,
         val holder: EnginePlayer,
-        val resolved: StreamResolver.Resolved?
+        val resolved: StreamResolver.Resolved?,
+        val quality: String? = null,
+        val pendingStages: List<String> = emptyList(),
+        val fromCache: Boolean = false
     ) {
         @Volatile var ready = false
         @Volatile var activated = false
@@ -1370,12 +1382,16 @@ class MainActivity : Activity() {
     /** A prepared incoming player for a custom Mix transition,
      *  built ahead of the overlap window like [GaplessPrep] but
      *  fired at the window's START (the outgoing keeps playing
-     *  underneath as the crossfade's outgoing deck). */
+     *  underneath as the crossfade's outgoing deck). Carries the
+     *  same 0.6.20 ladder state as [GaplessPrep] — see its doc. */
     private class MixPrep(
         val pairKey: String,
         val track: Track,
         val holder: EnginePlayer,
-        val resolved: StreamResolver.Resolved?
+        val resolved: StreamResolver.Resolved?,
+        val quality: String? = null,
+        val pendingStages: List<String> = emptyList(),
+        val fromCache: Boolean = false
     ) {
         @Volatile var ready = false
         @Volatile var activated = false
@@ -4703,6 +4719,17 @@ class MainActivity : Activity() {
                 12.5f, white50
             ).apply { setPadding(dp(38), 0, 0, dp(10)) }
         )
+        // 0.6.20: the last transition's outcome, recorded by the
+        // player (see recordTransition) — makes the next phone
+        // test conclusive about which path a boundary took.
+        content.addView(
+            label(
+                "Last transition: " +
+                    (getPreferences(MODE_PRIVATE).getString("last_transition", null)
+                        ?: "none recorded yet"),
+                12.5f, white50
+            ).apply { setPadding(dp(38), 0, 0, dp(10)) }
+        )
         content.addView(
             settingsRow(
                 "Lyrics sync offset",
@@ -7813,6 +7840,23 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------- v6.1: gapless playback
 
+    /** 0.6.20 diagnostics: the most recent transition outcome as
+     *  ONE plain string in prefs ("gapless fired", "mix fired",
+     *  "fallback: prep resolve failed", "fallback: prep stream
+     *  rejected", plus the incoming track's title), surfaced in
+     *  Settings under the Gapless row so a phone test can prove
+     *  which path a boundary took. Plain words and stage labels
+     *  only — never exception text, never a stream URL. */
+    private fun recordTransition(outcome: String, track: Track?) {
+        val title = track?.title?.takeIf { it.isNotBlank() }
+        val text = if (title != null) "$outcome — $title" else outcome
+        try {
+            getPreferences(MODE_PRIVATE).edit()
+                .putString("last_transition", text).apply()
+        } catch (_: Exception) {
+        }
+    }
+
     private fun gaplessOn(): Boolean =
         getPreferences(MODE_PRIVATE).getBoolean("setting_Gapless playback", true)
 
@@ -7905,11 +7949,12 @@ class MainActivity : Activity() {
 
     /**
      * Runs on the 500ms ticker. With ~30s left on a definite next
-     * track (crossfade off, gapless on, no sleep-after-track), the
-     * next stream is pre-resolved on the player executor (YouTube:
-     * the one-shot resolver — session cache + context walk +
-     * NewPipe, same machinery the foreground ladder walks stage by
-     * stage) and a second player is built and PREPARED — ExoPlayer
+     * track (crossfade off, gapless on, no sleep-after-track; 45s
+     * for a streamed next track since 0.6.20), the next stream is
+     * pre-resolved on the player executor (YouTube: the session
+     * cache first, then the same ladder stages foreground
+     * playback walks) and a second player is built and PREPARED —
+     * ExoPlayer
      * buffers the stream's head, not merely resolves its URL: a
      * resolved-but-unprepared stream could still stall the seam.
      * When the
@@ -7958,14 +8003,22 @@ class MainActivity : Activity() {
             discardGaplessPrep()
         }
         if (gaplessArmingFor == nextKey) return // resolution in flight
+        val localFile = Downloads.localFile(this, next)
         // Arm window: ~30s out normally; for SHORT tracks (under
         // ~90s total) arming starts at track start — waiting for
         // the last 30s of a 60-second song would leave the
-        // resolution + prepare no runway at all.
-        val armWindow = if (dur <= 90_000) Long.MAX_VALUE else 32_000L
+        // resolution + prepare no runway at all. 0.6.20: a
+        // STREAMED next track (YouTube, nothing on disk) arms at
+        // 45s — its ladder resolution + prepare needs the extra
+        // runway, and a late prep is a silent fallback.
+        val streamedNext = localFile == null && next.source == SOURCE_YOUTUBE
+        val armWindow = when {
+            dur <= 90_000 -> Long.MAX_VALUE
+            streamedNext -> 45_000L
+            else -> 32_000L
+        }
         if (remaining > armWindow) return
         gaplessArmingFor = nextKey
-        val localFile = Downloads.localFile(this, next)
         when {
             next.source == SOURCE_LOCAL ->
                 // Local tracks ARE their content URI (same source
@@ -7975,25 +8028,60 @@ class MainActivity : Activity() {
                 prepareGapless(next, localFile.absolutePath, null)
             next.source == SOURCE_YOUTUBE -> {
                 val quality = effectiveQuality()
-                gaplessExecutor.execute {
-                    val resolved = try {
-                        StreamResolver.resolveYoutube(next.id, quality)
-                    } catch (e: Exception) {
-                        null
-                    }
-                    runOnUiThread {
-                        // Superseded while resolving (skip, queue
-                        // change, toggle off): drop the result.
-                        if (gaplessArmingFor != nextKey) return@runOnUiThread
-                        val url = resolved?.url
-                        if (resolved == null || url == null) {
-                            // No pre-resolution: the boundary uses
-                            // the normal foreground ladder — today's
-                            // behavior, never worse.
-                            gaplessArmingFor = null
-                            return@runOnUiThread
+                // 0.6.20: the session's known-good cache first —
+                // the exact stream foreground playback succeeded
+                // with, zero network. Foreground checks it in
+                // beginYtResolution; the prep used to skip it and
+                // pay a full one-shot resolve every boundary.
+                val cached = StreamResolver.cachedGood(next.id, quality)
+                val cachedUrl = cached?.url
+                if (cached != null && cachedUrl != null) {
+                    prepareGapless(
+                        next, cachedUrl, cached, quality,
+                        StreamResolver.youtubeStageLabels(), fromCache = true
+                    )
+                } else {
+                    // No cache: walk the SAME ladder foreground
+                    // playback walks, first stage with a URL wins.
+                    // The stages after it ride along in the prep —
+                    // if the player rejects this stream, the prep
+                    // advances instead of dying (see
+                    // advanceGaplessPrep).
+                    val labels = StreamResolver.youtubeStageLabels()
+                    gaplessExecutor.execute {
+                        var found: StreamResolver.Resolved? = null
+                        var foundIdx = -1
+                        for ((i, label) in labels.withIndex()) {
+                            val r = try {
+                                StreamResolver.resolveYoutubeStage(next.id, quality, label)
+                            } catch (e: Exception) {
+                                null
+                            }
+                            if (r?.url != null) {
+                                found = r
+                                foundIdx = i
+                                break
+                            }
                         }
-                        prepareGapless(next, url, resolved)
+                        runOnUiThread {
+                            // Superseded while resolving (skip,
+                            // queue change, toggle off): drop it.
+                            if (gaplessArmingFor != nextKey) return@runOnUiThread
+                            val r = found
+                            val url = r?.url
+                            if (r == null || url == null) {
+                                // No stage resolved: the boundary
+                                // uses the normal foreground
+                                // ladder — never worse than before.
+                                recordTransition("fallback: prep resolve failed", next)
+                                gaplessArmingFor = null
+                                return@runOnUiThread
+                            }
+                            prepareGapless(
+                                next, url, r, quality,
+                                labels.drop(foundIdx + 1)
+                            )
+                        }
                     }
                 }
             }
@@ -8012,8 +8100,17 @@ class MainActivity : Activity() {
 
     /** Builds the second player for [next] and prepares it paused.
      *  Its listener only marks readiness until activation; after
-     *  activation it behaves like a normal player listener. */
-    private fun prepareGapless(next: Track, uriString: String, resolved: StreamResolver.Resolved?) {
+     *  activation it behaves like a normal player listener.
+     *  [quality] / [pendingStages] / [fromCache] carry the prep's
+     *  ladder state for a YouTube stream (see [GaplessPrep]). */
+    private fun prepareGapless(
+        next: Track,
+        uriString: String,
+        resolved: StreamResolver.Resolved?,
+        quality: String? = null,
+        pendingStages: List<String> = emptyList(),
+        fromCache: Boolean = false
+    ) {
         // 0.6.3 (WS-D): a dead instance arms nothing — an armed
         // prep in a ghost instance is a player waiting to fire.
         if (!PlayerRegistry.isOwner(instanceId)) return
@@ -8050,7 +8147,16 @@ class MainActivity : Activity() {
         // teardown releases an armed prep instead of leaving a
         // prepared player behind in a dead instance.
         PlayerRegistry.register(instanceId) { holder.release() }
-        val prep = GaplessPrep(next, holder, resolved)
+        val prep = GaplessPrep(next, holder, resolved, quality, pendingStages, fromCache)
+        // Defensive (0.6.20): never overwrite a live prep without
+        // releasing it — every legitimate caller reaches here
+        // with gaplessPrep already null (activation and discard
+        // both clear it first), so a non-null value here is a
+        // superseded resolve that landed after a re-arm for the
+        // same track; orphaning its prepared player until
+        // teardown would leak the stream it is buffering.
+        val staleGapless = gaplessPrep
+        if (staleGapless != null) staleGapless.holder.release()
         gaplessPrep = prep
         val listener = object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
@@ -8073,9 +8179,12 @@ class MainActivity : Activity() {
             override fun onPlayerError(error: PlaybackException) {
                 if (holder.retired) return
                 if (!prep.activated) {
-                    // A failed prep is silent: drop it and let the
-                    // boundary take the normal path.
-                    if (gaplessPrep === prep) discardGaplessPrep()
+                    // 0.6.20: a rejected prep stream ADVANCES the
+                    // ladder and re-prepares (bounded by the stage
+                    // list) instead of dying on first refusal.
+                    // Still silent — the boundary just takes the
+                    // normal path if every stage is spent.
+                    if (gaplessPrep === prep) advanceGaplessPrep(prep)
                 } else if (holder === player) {
                     onPlayerFailed(holder, next, resolved, playToken, error)
                 }
@@ -8095,6 +8204,71 @@ class MainActivity : Activity() {
             exo.prepare()
         } catch (e: Exception) {
             if (gaplessPrep === prep) discardGaplessPrep()
+        }
+    }
+
+    /** 0.6.20: a gapless prep whose stream the player REJECTED
+     *  before activation walks its remaining ladder stages and
+     *  re-prepares with the next stage's URL/UA — the same
+     *  advance-on-rejection the foreground ladder has had since
+     *  v5.1. Bounded by the stage list: each re-prepare consumes
+     *  at least one stage. A cache-sourced rejection evicts the
+     *  cache entry, mirroring [onPlayerFailed]. The arming key is
+     *  KEPT while stages walk, so the ticker cannot start a
+     *  competing resolve; it is released only when a stage lands
+     *  (the new prep owns the boundary) or every stage is spent.
+     *  Silent throughout — worst case is today's fallback. */
+    private fun advanceGaplessPrep(prep: GaplessPrep) {
+        val next = prep.track
+        val nextKey = Downloads.key(next)
+        val quality = prep.quality
+        val stages = prep.pendingStages
+        if (prep.fromCache && quality != null) {
+            StreamResolver.forgetGood(next.id, quality)
+        }
+        // Detach the dead prep (its holder's release retires it,
+        // so no late callback can touch the successor) but keep
+        // gaplessArmingFor: the stage walk below owns it now. A
+        // boundary timer armed for THIS prep dies with it — the
+        // ticker re-arms for the successor if time remains.
+        gaplessFire?.let { handler.removeCallbacks(it) }
+        gaplessFire = null
+        if (gaplessPrep === prep) gaplessPrep = null
+        prep.holder.release()
+        if (quality == null || stages.isEmpty()) {
+            recordTransition("fallback: prep stream rejected", next)
+            if (gaplessArmingFor == nextKey) gaplessArmingFor = null
+            return
+        }
+        gaplessExecutor.execute {
+            var found: StreamResolver.Resolved? = null
+            var foundIdx = -1
+            for ((i, label) in stages.withIndex()) {
+                val r = try {
+                    StreamResolver.resolveYoutubeStage(next.id, quality, label)
+                } catch (e: Exception) {
+                    null
+                }
+                if (r?.url != null) {
+                    found = r
+                    foundIdx = i
+                    break
+                }
+            }
+            runOnUiThread {
+                // Superseded while walking (skip, queue change,
+                // toggle off — each clears or replaces the arming
+                // key): drop the result and touch nothing.
+                if (gaplessArmingFor != nextKey) return@runOnUiThread
+                val r = found
+                val url = r?.url
+                if (r == null || url == null) {
+                    recordTransition("fallback: prep stream rejected", next)
+                    gaplessArmingFor = null
+                    return@runOnUiThread
+                }
+                prepareGapless(next, url, r, quality, stages.drop(foundIdx + 1))
+            }
         }
     }
 
@@ -8140,6 +8314,7 @@ class MainActivity : Activity() {
      *  from double-advancing the queue. */
     private fun activateGapless(prep: GaplessPrep, nextIdx: Int) {
         val next = prep.track
+        recordTransition("gapless fired", next)
         flushListened()
         saveRecent(next)
         com.arzx.music.PlayHistory.record(this, next)
@@ -8298,22 +8473,51 @@ class MainActivity : Activity() {
                 prepareMix(pairKey, next, localFile.absolutePath, null)
             next.source == SOURCE_YOUTUBE -> {
                 val quality = effectiveQuality()
-                gaplessExecutor.execute {
-                    val resolved = try {
-                        StreamResolver.resolveYoutube(next.id, quality)
-                    } catch (e: Exception) {
-                        null
-                    }
-                    runOnUiThread {
-                        if (mixArmingFor != pairKey) return@runOnUiThread
-                        val url = resolved?.url
-                        if (resolved == null || url == null) {
-                            // No pre-resolution: the boundary
-                            // takes the normal path, never worse.
-                            mixArmingFor = null
-                            return@runOnUiThread
+                // 0.6.20: same fix as the gapless prep — the
+                // session's known-good cache first, then the
+                // foreground ladder stages, with the untried
+                // stages riding in the prep so a player rejection
+                // advances instead of killing the overlap.
+                val cached = StreamResolver.cachedGood(next.id, quality)
+                val cachedUrl = cached?.url
+                if (cached != null && cachedUrl != null) {
+                    prepareMix(
+                        pairKey, next, cachedUrl, cached, quality,
+                        StreamResolver.youtubeStageLabels(), fromCache = true
+                    )
+                } else {
+                    val labels = StreamResolver.youtubeStageLabels()
+                    gaplessExecutor.execute {
+                        var found: StreamResolver.Resolved? = null
+                        var foundIdx = -1
+                        for ((i, label) in labels.withIndex()) {
+                            val r = try {
+                                StreamResolver.resolveYoutubeStage(next.id, quality, label)
+                            } catch (e: Exception) {
+                                null
+                            }
+                            if (r?.url != null) {
+                                found = r
+                                foundIdx = i
+                                break
+                            }
                         }
-                        prepareMix(pairKey, next, url, resolved)
+                        runOnUiThread {
+                            if (mixArmingFor != pairKey) return@runOnUiThread
+                            val r = found
+                            val url = r?.url
+                            if (r == null || url == null) {
+                                // No stage resolved: the boundary
+                                // takes the normal path, never worse.
+                                recordTransition("fallback: prep resolve failed", next)
+                                mixArmingFor = null
+                                return@runOnUiThread
+                            }
+                            prepareMix(
+                                pairKey, next, url, r, quality,
+                                labels.drop(foundIdx + 1)
+                            )
+                        }
                     }
                 }
             }
@@ -8337,7 +8541,10 @@ class MainActivity : Activity() {
         pairKey: String,
         next: Track,
         uriString: String,
-        resolved: StreamResolver.Resolved?
+        resolved: StreamResolver.Resolved?,
+        quality: String? = null,
+        pendingStages: List<String> = emptyList(),
+        fromCache: Boolean = false
     ) {
         if (!PlayerRegistry.isOwner(instanceId)) return
         val httpFactory = DefaultHttpDataSource.Factory()
@@ -8360,7 +8567,12 @@ class MainActivity : Activity() {
         exo.setWakeMode(C.WAKE_MODE_NETWORK)
         val holder = EnginePlayer(exo)
         PlayerRegistry.register(instanceId) { holder.release() }
-        val prep = MixPrep(pairKey, next, holder, resolved)
+        val prep = MixPrep(pairKey, next, holder, resolved, quality, pendingStages, fromCache)
+        // Defensive (0.6.20): same overwrite guard as
+        // prepareGapless — a non-null mixPrep here is always a
+        // superseded prep; release it rather than orphan it.
+        val staleMix = mixPrep
+        if (staleMix != null) staleMix.holder.release()
         mixPrep = prep
         val listener = object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
@@ -8383,9 +8595,10 @@ class MainActivity : Activity() {
             override fun onPlayerError(error: PlaybackException) {
                 if (holder.retired) return
                 if (!prep.activated) {
-                    // A failed prep is silent: drop it and let
-                    // the boundary take the normal path.
-                    if (mixPrep === prep) discardMixPrep()
+                    // 0.6.20: advance the ladder and re-prepare,
+                    // exactly like the gapless prep — a single
+                    // rejected stream no longer costs the overlap.
+                    if (mixPrep === prep) advanceMixPrep(prep)
                 } else if (holder === player) {
                     onPlayerFailed(holder, next, resolved, playToken, error)
                 }
@@ -8405,6 +8618,63 @@ class MainActivity : Activity() {
             exo.prepare()
         } catch (e: Exception) {
             if (mixPrep === prep) discardMixPrep()
+        }
+    }
+
+    /** 0.6.20: the Mix twin of [advanceGaplessPrep] — a rejected
+     *  incoming stream walks the prep's remaining ladder stages
+     *  and re-prepares, bounded by the stage list. The pair's
+     *  arming key is kept during the walk so the ticker cannot
+     *  start a competing resolve; a cache-sourced rejection
+     *  evicts the cache entry. Silent throughout — worst case
+     *  the boundary takes the normal path and the stored style
+     *  still shapes the entrance as a solo fade-in. */
+    private fun advanceMixPrep(prep: MixPrep) {
+        val pairKey = prep.pairKey
+        val next = prep.track
+        val quality = prep.quality
+        val stages = prep.pendingStages
+        if (prep.fromCache && quality != null) {
+            StreamResolver.forgetGood(next.id, quality)
+        }
+        // Detach the dead prep but keep mixArmingFor: the stage
+        // walk below owns it now.
+        if (mixPrep === prep) mixPrep = null
+        prep.holder.release()
+        if (quality == null || stages.isEmpty()) {
+            recordTransition("fallback: prep stream rejected", next)
+            if (mixArmingFor == pairKey) mixArmingFor = null
+            return
+        }
+        gaplessExecutor.execute {
+            var found: StreamResolver.Resolved? = null
+            var foundIdx = -1
+            for ((i, label) in stages.withIndex()) {
+                val r = try {
+                    StreamResolver.resolveYoutubeStage(next.id, quality, label)
+                } catch (e: Exception) {
+                    null
+                }
+                if (r?.url != null) {
+                    found = r
+                    foundIdx = i
+                    break
+                }
+            }
+            runOnUiThread {
+                // Superseded while walking (queue change, pair
+                // gone — each clears or replaces the arming key):
+                // drop the result and touch nothing.
+                if (mixArmingFor != pairKey) return@runOnUiThread
+                val r = found
+                val url = r?.url
+                if (r == null || url == null) {
+                    recordTransition("fallback: prep stream rejected", next)
+                    mixArmingFor = null
+                    return@runOnUiThread
+                }
+                prepareMix(pairKey, next, url, r, quality, stages.drop(foundIdx + 1))
+            }
         }
     }
 
@@ -8443,6 +8713,7 @@ class MainActivity : Activity() {
             discardMixPrep()
             return
         }
+        recordTransition("mix fired", next)
         flushListened()
         saveRecent(next)
         PlayHistory.record(this, next)

@@ -720,6 +720,9 @@ object Downloads {
         // the user just deleted. (Also covers a track with no
         // index entry yet, which the old body silently skipped.)
         removePending(ctx, track)
+        // 0.6.20: the track's pinned lyrics entry leaves with
+        // its download (see Lyrics.dropEntry).
+        Lyrics.dropEntry(ctx, track)
         val all = entries(ctx)
         val entry = all.firstOrNull { key(it.track) == key(track) } ?: return
         File(dir(ctx), entry.fileName).delete()

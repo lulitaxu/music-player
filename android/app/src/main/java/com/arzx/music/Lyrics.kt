@@ -69,7 +69,9 @@ object Lyrics {
     private const val FAIL_MISS_TTL_MS = 3600 * 1000L
 
     /** Positive results expire too (0.6.13): a wrong search-gate
-     *  match used to be permanent until a manual cache clear. */
+     *  match used to be permanent until a manual cache clear.
+     *  0.6.20 exception: entries pinned at write time (the track
+     *  was downloaded) never expire — see writeCache/readCache. */
     private const val HIT_TTL_MS = 90L * 24 * 3600 * 1000
     private const val MAX_CACHE_FILES = 1000
     private const val CACHE_VER = 2
@@ -108,9 +110,15 @@ object Lyrics {
                 val ttl = if (o.optBoolean("failMiss")) FAIL_MISS_TTL_MS else MISS_TTL_MS
                 val fresh = System.currentTimeMillis() - o.optLong("ts") < ttl
                 if (fresh) Cached(null, miss = true, report = rep) else null
-            } else if (System.currentTimeMillis() - o.optLong("ts") > HIT_TTL_MS) {
+            } else if (!o.optBoolean("pin") &&
+                System.currentTimeMillis() - o.optLong("ts") > HIT_TTL_MS
+            ) {
                 // Stale hit (pre-0.6.13 entries carry no ts and
                 // read as epoch 0 — they expire here too, once).
+                // 0.6.20: a PINNED hit — the lyrics of a track
+                // that was downloaded when they were written —
+                // never expires: an offline play months later
+                // must still find its synced lines.
                 null
             } else {
                 val syncedArr = o.optJSONArray("synced")
@@ -153,6 +161,14 @@ object Lyrics {
                 o.put("miss", true)
                 if (failMiss) o.put("failMiss", true)
             } else {
+                // 0.6.20: a HIT for a track that is DOWNLOADED at
+                // write time is pinned — those lyrics are part of
+                // the download, not a disposable cache entry: no
+                // HIT_TTL expiry (see readCache), no cap eviction
+                // (see evictCacheOverflow). Misses never pin: a
+                // download with no lyrics found must keep the
+                // normal retry behavior.
+                if (Downloads.isDownloaded(ctx, track)) o.put("pin", true)
                 o.put("source", data.source)
                 o.put("instrumental", data.instrumental)
                 data.synced?.let { lines ->
@@ -183,15 +199,36 @@ object Lyrics {
 
     /** Bounds the cache directory (0.6.13): one file per track
      *  ever fetched grew without limit. Oldest files beyond
-     *  [MAX_CACHE_FILES] are evicted on write. */
+     *  [MAX_CACHE_FILES] are evicted on write. 0.6.20: pinned
+     *  entries (lyrics of downloaded tracks) are NEVER evicted —
+     *  if pins alone exceed the cap, the cap loses; an entry
+     *  whose JSON can't be read counts as unpinned. */
     private fun evictCacheOverflow(ctx: Context, keep: File) {
         try {
             val files = dir(ctx).listFiles() ?: return
             if (files.size <= MAX_CACHE_FILES) return
-            files.filter { it != keep }
+            files.filter { it != keep && !isPinned(it) }
                 .sortedBy { it.lastModified() }
                 .take(files.size - MAX_CACHE_FILES)
                 .forEach { it.delete() }
+        } catch (_: Exception) {
+        }
+    }
+
+    /** The pin flag of a stored entry, read from its JSON. */
+    private fun isPinned(f: File): Boolean =
+        try {
+            JSONObject(f.readText()).optBoolean("pin")
+        } catch (_: Exception) {
+            false
+        }
+
+    /** Drops one track's cache entry (0.6.20): called from the
+     *  download-removal path, so a downloaded track's pinned
+     *  lyrics leave with the download they rode in with. */
+    fun dropEntry(ctx: Context, track: Track) {
+        try {
+            cacheFile(ctx, track).delete()
         } catch (_: Exception) {
         }
     }
