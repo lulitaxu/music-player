@@ -701,6 +701,33 @@ def _range_stream(path: Path, request: Request):
     return StreamingResponse(body(), status_code=status, headers=headers, media_type=mime)
 
 
+@app.delete("/local/file/{track_id}")
+def local_delete(track_id: str):
+    """Delete a downloaded file. Only files inside the downloads
+    dir (the app's own downloads) may be deleted through the app;
+    the user's own music elsewhere in the library folder is never
+    touched from here, by design."""
+    path = _registry_lookup(track_id)
+    if path is None:
+        raise HTTPException(404, "unknown local track")
+    try:
+        inside = path.resolve().is_relative_to(_DOWNLOADS_DIR.resolve())
+    except Exception:
+        inside = False
+    if not inside:
+        raise HTTPException(
+            403, "only files downloaded by the app can be deleted here")
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        raise HTTPException(500, "could not delete the file")
+    _cache.pop("local:scan", None)
+    _scan_local()
+    return {"ok": True, "deleted": track_id}
+
+
 @app.get("/local/file/{track_id}")
 def local_file(track_id: str, request: Request):
     path = _registry_lookup(track_id)

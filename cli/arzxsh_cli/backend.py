@@ -75,6 +75,11 @@ class Backend:
     async def backend_lyrics(self, video_id: str) -> dict:
         return await self._get(f"/lyrics/{_q(video_id)}")
 
+    async def delete_local(self, track_id: str) -> dict:
+        r = await self._client.delete(f"/local/file/{_q(track_id)}")
+        r.raise_for_status()
+        return r.json()
+
     async def local_list(self, fresh: bool = False) -> dict:
         return await self._get("/local", fresh=1 if fresh else 0)
 

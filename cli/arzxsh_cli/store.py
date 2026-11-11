@@ -108,6 +108,14 @@ class Store:
         self.data["recent"] = [track] + r[:11]
         self.save()
 
+    def forget_download(self, local_id: str):
+        dl = self.data["downloads"]
+        gone = [vid for vid, lid in dl.items() if lid == local_id]
+        for vid in gone:
+            del dl[vid]
+        if gone:
+            self.save()
+
     def mark_downloaded(self, video_id: str, local_id: str):
         self.data["downloads"][video_id] = local_id
         self.save()

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import re
 import shutil
 import subprocess
@@ -257,6 +258,7 @@ class ArzxshApp(App):
         self._lyrics_track_id: str | None = None
         self._lyrics_data: dict | None = None
         self._bulk_dl = False
+        self._pending_local_delete: tuple[str, float] | None = None
         self._viz_bars = ""
         self._cava_proc: subprocess.Popen | None = None
 
@@ -558,7 +560,11 @@ class ArzxshApp(App):
         widgets = [
             Static("[bold]On this device[/bold]"),
             Static(f"{len(tracks)} tracks · {esc(data.get('dir',''))}", classes="dim"),
-            Button("↻ Rescan folder", id="btn-rescan"),
+            Horizontal(
+                Button("↻ Rescan folder", id="btn-rescan"),
+                Button("Delete download", id="btn-local-delete"),
+            ),
+            Static("Highlight a song and press Delete download (or x twice) to remove a file the app downloaded. Your own files in the music folder are never deleted from here.", classes="dim"),
             Static("Songs", classes="section"),
         ]
         if tracks:
@@ -903,6 +909,8 @@ class ArzxshApp(App):
             self.action_queue_panel()
         elif bid == "btn-rescan":
             await self.show_local(fresh=True)
+        elif bid == "btn-local-delete":
+            await self._delete_local_focused()
         elif bid == "btn-pl-save":
             name = self.query_one("#pl-name", Input).value
             if self.engine and self.engine.queue:
@@ -1163,9 +1171,43 @@ class ArzxshApp(App):
         self.store.playlist_add(len(pls) - 1, track)
         self.notify(f"Added to “{esc(pls[-1]['name'])}”")
 
+    async def _delete_local_focused(self):
+        """Two-step delete for downloaded files: the first press
+        arms (and says what will happen), the second press on the
+        same song within a few seconds deletes. A file deletion is
+        not undoable, so it never fires on a single keypress. The
+        backend refuses anything outside the downloads folder."""
+        track = self._focused_track()
+        if not track:
+            self.notify("Highlight a song first.", severity="warning")
+            return
+        tid = track["id"]
+        now = time.monotonic()
+        pending = self._pending_local_delete
+        if not pending or pending[0] != tid or now - pending[1] > 6:
+            self._pending_local_delete = (tid, now)
+            self.notify(f"Press Delete again to remove “{esc(track.get('title', ''))}” (only works for app downloads)")
+            return
+        self._pending_local_delete = None
+        try:
+            await self.backend.delete_local(tid)
+        except Exception as e:
+            if "403" in str(e):
+                self.notify("That file was not downloaded by the app, so the app will not delete it. Remove it from your music folder directly.", severity="error")
+            else:
+                self.notify("Couldn't delete that file. Is the backend running?", severity="error")
+            return
+        self.store.forget_download(tid)
+        self.notify("Download deleted")
+        await self.show_local(fresh=True)
+
     def action_remove_from_playlist(self):
-        # Only meaningful inside a playlist's own screen; everywhere
-        # else x is a no-op so it can never eat a keypress by surprise.
+        # Only meaningful inside a playlist's own screen and the
+        # local library; everywhere else x is a no-op so it can
+        # never eat a keypress by surprise.
+        if self._view[0] == "local":
+            self.run_worker(self._delete_local_focused())
+            return
         if self._view[0] != "playlist_detail":
             return
         track = self._focused_track()
