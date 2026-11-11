@@ -5,7 +5,7 @@
 # (textual, httpx, Pillow); the backend has its own venv, created
 # by the app itself on first use. Requires: python3, mpv.
 set -e
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 VENV="$HERE/.venv"
 if [ ! -x "$VENV/bin/python" ]; then
   echo "arzxsh: first run, creating the CLI environment…"
