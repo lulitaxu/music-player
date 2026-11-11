@@ -95,8 +95,12 @@ class MpvDeck:
                     # Handlers are tracked so shutdown can cancel
                     # them; an untracked handler outlives the app
                     # and crashes calling back into a dead UI.
+                    # The reason matters: "stop" is what mpv reports
+                    # for a file OUR loadfile replace just replaced,
+                    # so treating every end-file as a natural end
+                    # makes a manual track switch advance forever.
                     if not self._closing:
-                        self._spawn(self.on_end_file(self))
+                        self._spawn(self.on_end_file(self, msg.get("reason")))
                 elif event == "file-loaded":
                     if not self._closing:
                         self._spawn(self.on_file_loaded(self))
@@ -186,6 +190,7 @@ class Engine:
         self.position = 0.0
         self.duration = 0.0
         self._radio_busy = False
+        self._error_streak = 0  # consecutive end-file "error" advances
         self._fading = False
         self._closing = False
         self._ticker: asyncio.Task | None = None
@@ -302,6 +307,7 @@ class Engine:
     async def play_context(self, tracks: list[dict], index: int, context_name: str = ""):
         if not tracks or index < 0 or index >= len(tracks):
             return
+        self._error_streak = 0  # manual start: fresh error budget
         self.queue = list(tracks)
         self.context_name = context_name
         await self._start_at(index, fade=False)
@@ -349,6 +355,8 @@ class Engine:
         self._fading = False
 
     async def next(self, auto: bool = False):
+        if not auto:
+            self._error_streak = 0  # manual skip: fresh error budget
         n = self._next_index(auto)
         if n >= 0:
             await self._start_at(n, fade=False)
@@ -370,6 +378,7 @@ class Engine:
             self.playing = False
 
     async def prev(self):
+        self._error_streak = 0  # manual: fresh error budget
         pos = await self.active.get("time-pos") or 0
         if pos and pos > 3:
             await self.seek(0)
@@ -404,20 +413,43 @@ class Engine:
         if self._closing:
             return
         if deck is self.active:
+            # A track that actually loads breaks the error streak.
+            self._error_streak = 0
             dur = await deck.get("duration")
             if dur:
                 self.duration = float(dur)
 
-    async def _on_end_file(self, deck: MpvDeck):
+    # Consecutive broken tracks skipped on end-file "error" before
+    # the engine gives up instead of racing through the queue.
+    _ERROR_STREAK_MAX = 3
+
+    async def _on_end_file(self, deck: MpvDeck, reason: str | None = None):
         if self._closing or deck is not self.active or self._fading:
             return
-        fade_s = float(self.store.data["crossfade_s"])
-        if fade_s > 0 and self.has_next():
-            # The ticker normally starts the fade early; if the
-            # track still ends first (very short track), advance.
+        if reason == "error":
+            # A broken stream skips like the Android stage ladder,
+            # but a run of dead tracks must not cascade: after a
+            # few in a row, stop and tell the user plainly.
+            self._error_streak += 1
+            if self._error_streak > self._ERROR_STREAK_MAX:
+                if self.playing:
+                    self.playing = False
+                    self.on_error(
+                        "Playback stopped: several songs in a row "
+                        "could not be played.")
+                return
             await self.next(auto=True)
-        else:
-            await self.next(auto=True)
+            return
+        if reason != "eof":
+            # "stop" (our own loadfile replace / stop command),
+            # "quit", "redirect" and missing reasons are not the
+            # track ending; acting on them is what made a manual
+            # switch cascade through the whole queue.
+            return
+        # Natural end. The ticker normally starts the crossfade
+        # early; if the track still ends first (very short track),
+        # advance here.
+        await self.next(auto=True)
 
     # -- ticker: position, preload, crossfade trigger -----------------
     async def _tick_loop(self):
