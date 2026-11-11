@@ -37,8 +37,8 @@ android {
         applicationId = "com.arzx.music"
         minSdk = 26
         targetSdk = 35
-        versionCode = 28
-        versionName = "0.6.20"
+        versionCode = 29
+        versionName = "0.6.21"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
