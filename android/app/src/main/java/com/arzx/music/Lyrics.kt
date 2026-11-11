@@ -84,8 +84,23 @@ object Lyrics {
 
     private fun dir(ctx: Context): File = File(ctx.filesDir, "lyrics").apply { mkdirs() }
 
-    private fun cacheFile(ctx: Context, track: Track): File =
-        File(dir(ctx), Downloads.key(track).replace(Regex("[^A-Za-z0-9_-]"), "_") + ".json")
+    private fun cacheFile(ctx: Context, track: Track): File {
+        // Audit 2026-11-11: the sanitized key is lossy — two ids
+        // differing only in stripped characters used to share one
+        // lyrics file (wrong lyrics, and one track's removal took
+        // the other's pinned entry). Append the same SHA-256
+        // keyHash suffix Downloads.kt uses for audio files. Files
+        // written under the old name are simply orphaned cache and
+        // are re-fetched on demand.
+        val rawKey = Downloads.key(track)
+        val keyHash = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(rawKey.toByteArray(Charsets.UTF_8))
+            .take(4).joinToString("") { "%02x".format(it) }
+        return File(
+            dir(ctx),
+            rawKey.replace(Regex("[^A-Za-z0-9_-]"), "_") + "-" + keyHash + ".json"
+        )
+    }
 
     fun cacheBytes(ctx: Context): Long =
         dir(ctx).listFiles()?.sumOf { it.length() } ?: 0L

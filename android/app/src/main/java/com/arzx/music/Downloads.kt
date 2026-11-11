@@ -337,6 +337,18 @@ object Downloads {
         for (i in 0 until arr.length()) {
             try {
                 val o = arr.getJSONObject(i)
+                // Audit 2026-11-11: never re-trust the persisted
+                // fileName. The write path only ever generates
+                // sanitized, hash-suffixed names; anything with a
+                // separator or parent reference would escape the
+                // downloads dir in localFile/remove/delete paths,
+                // so such an entry is skipped like any bad row.
+                val storedName = o.getString("fileName")
+                if (storedName.isBlank() || storedName.contains('/') ||
+                    storedName.contains('\\') || storedName.contains("..")
+                ) {
+                    continue
+                }
                 parsed += Entry(
                     Track(
                         o.getString("id"), o.getString("title"), o.getString("artist"),
@@ -348,7 +360,7 @@ object Downloads {
                         o.optString("album", null)?.takeIf { it.isNotEmpty() },
                         o.optString("albumId", null)?.takeIf { it.isNotEmpty() }
                     ),
-                    o.getString("fileName")
+                    storedName
                 )
             } catch (_: Exception) {
                 // Skip the bad item; the rest of the index stands.

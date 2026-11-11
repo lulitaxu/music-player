@@ -16,6 +16,12 @@ from PIL import Image
 from rich.style import Style
 from rich.text import Text
 
+# Decompression-bomb bound (audit 2026-11-11): artwork is decoded
+# from catalog-supplied URLs, so cap the pixel count Pillow will
+# expand before the downscale ever happens (~20MP is far beyond any
+# real cover art).
+Image.MAX_IMAGE_PIXELS = 20_000_000
+
 _cache: dict[tuple[str, int, int], Text] = {}
 
 

@@ -5,19 +5,38 @@ server-side stream resolution via yt-dlp. Stateless, no accounts, no stored
 credentials: unauthenticated public-catalog access only.
 
 Spec: ../design/ytmusic-backend/SPEC.md
-Run:  .venv/bin/uvicorn app:app --host 0.0.0.0 --port 8077
+Run:  .venv/bin/uvicorn app:app --host 127.0.0.1 --port 8077
+WARNING: bind 127.0.0.1 only. This server has no accounts or auth
+and must never be reachable from the LAN (the same rule linux/run.sh
+states); the Host allowlist and per-run token below are seatbelts,
+not a licence to expose it.
 """
 
+import hashlib
+import hmac
+import logging
 import os
+import secrets
 import time
+from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import quote
 
 import requests
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from ytmusicapi import YTMusic
+
+logger = logging.getLogger("arzxsh-backend")
+if os.environ.get("YTM_DL_NO_VERIFY") == "1":
+    # Loud on purpose (audit 2026-11-11): this flag disables yt-dlp
+    # TLS verification, so it must never be on silently.
+    logger.warning(
+        "YTM_DL_NO_VERIFY=1 is set: yt-dlp TLS certificate verification "
+        "is DISABLED. Only ever use this inside a TLS-intercepted dev "
+        "sandbox; never in production."
+    )
 
 # Optional UA override. ytmusicapi's stock user agent is an old Firefox 88
 # string; some egress proxies (including the dev sandbox this was built in)
@@ -34,17 +53,101 @@ if _UA:
 app = FastAPI(title="arzxsh-ytm", version="0.1.0")
 ytm = YTMusic()
 
-# --- tiny in-memory TTL cache -------------------------------------------------
-_cache: dict[str, tuple[float, object]] = {}
+# --- request guards (audit 2026-11-11) ---------------------------------------
+# The service is a same-machine, single-user backend with no accounts.
+# Three layered guards keep it that way even when a browser on the
+# machine visits a hostile page:
+#  1. Host allowlist: only loopback Host headers are served. A DNS-
+#     rebinding origin carries the attacker's own hostname in Host,
+#     so classic rebinding dies here.
+#  2. Per-run token: launchers (linux/run.sh, the CLI) generate a
+#     random token, pass it via ARZXSH_API_TOKEN, and their clients
+#     send it as X-Arzxsh-Token. It is required (when configured) on
+#     every mutating request and on the /local enumeration: a drive-by
+#     cross-origin POST is a CORS-safelisted simple request and cannot
+#     set a custom header, so it can never present the token. Media
+#     GETs (/audio, /local/file, /local/art) cannot carry headers from
+#     <audio>/<img> elements; they rely on the Host allowlist, the
+#     absence of CORS headers, and (for local files) unguessable
+#     per-run ids. With no token configured (bare uvicorn dev run)
+#     the Host allowlist and headers still apply.
+#  3. Baseline security headers on every response.
+_API_TOKEN = os.environ.get("ARZXSH_API_TOKEN", "").strip()
+_ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_CSP = (
+    "default-src 'self'; script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' https: data: blob:; media-src 'self' blob:; "
+    "connect-src 'self'; frame-ancestors 'none'; base-uri 'self'"
+)
+# Coarse budget for the routes that shell out to yt-dlp / upstream
+# fetches: generous for one interactive user, useless for a loop.
+_EXPENSIVE_PREFIXES = ("/search", "/stream", "/audio", "/download",
+                       "/radio", "/artist", "/album", "/playlist", "/lyrics")
+_RATE_LIMIT = 120  # requests per minute across the expensive routes
+_rate_state: dict[str, float] = {}
+_rate_count = 0
+
+
+def _host_allowed(host_header: str) -> bool:
+    host = (host_header or "").strip().lower()
+    if host.startswith("["):  # [::1]:8077
+        host = host[1:].split("]", 1)[0]
+    else:
+        host = host.rsplit(":", 1)[0] if ":" in host else host
+    return host in _ALLOWED_HOSTS
+
+
+def _rate_ok() -> bool:
+    global _rate_count
+    now = time.time()
+    window = _rate_state.get("window", 0.0)
+    if now - window >= 60:
+        _rate_state["window"] = now
+        _rate_count = 0
+    _rate_count += 1
+    return _rate_count <= _RATE_LIMIT
+
+
+@app.middleware("http")
+async def _guard(request: Request, call_next):
+    if not _host_allowed(request.headers.get("host", "")):
+        return JSONResponse({"detail": "host not allowed"}, status_code=400)
+    if request.url.path.startswith(_EXPENSIVE_PREFIXES) and not _rate_ok():
+        return JSONResponse({"detail": "rate limit exceeded"}, status_code=429)
+    if _API_TOKEN:
+        needs_token = request.method in ("POST", "PUT", "PATCH", "DELETE") \
+            or request.url.path == "/local"
+        if needs_token and not hmac.compare_digest(
+                request.headers.get("x-arzxsh-token", ""), _API_TOKEN):
+            return JSONResponse({"detail": "missing or bad token"}, status_code=403)
+    response = await call_next(request)
+    response.headers.setdefault("x-content-type-options", "nosniff")
+    response.headers.setdefault("x-frame-options", "DENY")
+    response.headers.setdefault("content-security-policy", _CSP)
+    response.headers.setdefault("referrer-policy", "no-referrer")
+    return response
+
+
+# --- tiny in-memory TTL cache (bounded, audit 2026-11-11) --------------------
+# OrderedDict with LRU eviction: cache keys embed caller-chosen strings
+# (search queries, ids), so an unbounded dict was a memory-exhaustion
+# vector for any caller who could reach the service.
+_CACHE_MAX = 256
+_cache: "OrderedDict[str, tuple[float, object]]" = OrderedDict()
 
 
 def cached(key: str, ttl: float, fn):
     now = time.time()
     hit = _cache.get(key)
     if hit and hit[0] > now:
+        _cache.move_to_end(key)
         return hit[1]
     val = fn()
     _cache[key] = (now + ttl, val)
+    _cache.move_to_end(key)
+    while len(_cache) > _CACHE_MAX:
+        _cache.popitem(last=False)
     return val
 
 
@@ -81,7 +184,19 @@ def tracks(items) -> list[dict]:
 # --- endpoints ------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"ok": True}
+    # The identity fields let clients (the CLI) verify the service on
+    # the fixed loopback port really is this backend before trusting
+    # it with catalog/download traffic (port-squat check).
+    return {"ok": True, "app": "arzxsh-ytm", "version": "0.1.0"}
+
+
+@app.get("/ui-config")
+def ui_config():
+    """Hands the per-run token to the same-origin web UI. Reachable
+    only under the Host allowlist, and the app sets no CORS headers,
+    so a cross-origin page cannot read the response; a rebound origin
+    fails the Host check outright."""
+    return {"token": _API_TOKEN}
 
 
 @app.get("/search")
@@ -351,9 +466,17 @@ def audio(video_id: str, request: Request):
             passthrough[name] = value
 
     def body():
+        # Total byte budget (audit 2026-11-11): the upstream read
+        # timeout only bounds gaps between chunks, so without a cap a
+        # single proxied response could stream forever. 256MB is far
+        # beyond any single track's audio.
+        sent = 0
         try:
             for chunk in upstream.iter_content(chunk_size=64 * 1024):
                 if chunk:
+                    sent += len(chunk)
+                    if sent > 256 * 1024 * 1024:
+                        break
                     yield chunk
         finally:
             upstream.close()
@@ -393,11 +516,13 @@ def lyrics(video_id: str):
 # --- local library + offline downloads (Linux web app) ------------------------
 # The web player also plays the user's own audio files. The server
 # scans a music folder (ARZXSH_MUSIC_DIR, default ~/Music) and
-# serves tracks by opaque ids from its own registry: a request can
-# only ever reach a file the scan itself found under that root,
-# never an arbitrary path supplied by a client. Downloads land in
-# <music>/arzxsh/ and become local tracks.
-import hashlib
+# serves tracks by ids from its own registry: a request can only
+# ever reach a file the scan itself found under that root, never an
+# arbitrary path supplied by a client. Ids are HMACs of the path
+# keyed by a random per-process secret (audit 2026-11-11): stable
+# for the life of the process, but not computable offline from a
+# guessed path the way the old unsalted truncated SHA-1 was.
+# Downloads land in <music>/arzxsh/ and become local tracks.
 import mimetypes
 import re
 
@@ -414,8 +539,13 @@ _DOWNLOADS_DIR = _MUSIC_DIR / "arzxsh"
 _local_registry: dict[str, Path] = {}
 
 
+_LOCAL_SECRET = secrets.token_bytes(32)
+
+
 def _local_id(path: Path) -> str:
-    return "loc_" + hashlib.sha1(str(path).encode()).hexdigest()[:14]
+    return "loc_" + hmac.new(
+        _LOCAL_SECRET, str(path).encode(), hashlib.sha256
+    ).hexdigest()[:20]
 
 
 def _tag_first(tags, *keys):
@@ -551,7 +681,8 @@ def _range_stream(path: Path, request: Request):
         else:
             start, end, status = 0, size - 1, 200
     length = end - start + 1
-    headers = {"accept-ranges": "bytes", "content-length": str(length)}
+    headers = {"accept-ranges": "bytes", "content-length": str(length),
+               "x-content-type-options": "nosniff"}
     if status == 206:
         headers["content-range"] = f"bytes {start}-{end}/{size}"
 
@@ -595,8 +726,14 @@ def local_art(track_id: str):
     if not art:
         raise HTTPException(404, "no embedded artwork")
     data, mime = art
+    # The MIME string comes from inside the audio file itself
+    # (audit 2026-11-11): never serve it verbatim — a crafted file
+    # could declare text/html and run script in this origin.
+    if mime not in ("image/jpeg", "image/png", "image/webp", "image/gif"):
+        mime = "image/jpeg"
     return Response(content=data, media_type=mime,
-                    headers={"cache-control": "max-age=3600"})
+                    headers={"cache-control": "max-age=3600",
+                             "x-content-type-options": "nosniff"})
 
 
 @app.post("/download/{video_id}")
@@ -629,6 +766,10 @@ def download(video_id: str, title: str = "", artist: str = ""):
         "fragment_retries": 3,
         "continuedl": True,
     }
+    # Same dev-sandbox-only escape hatch as _resolve_stream: TLS-
+    # intercepted environments only, NEVER production — it disables
+    # certificate verification for the download too. A loud warning
+    # is logged at startup whenever the variable is set.
     if os.environ.get("YTM_DL_NO_VERIFY") == "1":
         opts["nocheckcertificate"] = True
     try:

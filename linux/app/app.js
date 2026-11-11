@@ -12,13 +12,36 @@ function esc(s) {
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   }[c]));
 }
+/* Build a CSS url() value without letting the URL break out of its
+   quoted string (audit 2026-11-11): quotes, backslashes, parens and
+   control/space characters are percent-encoded before interpolation. */
+function cssUrl(u) {
+  const extra = { "(": "%28", ")": "%29", "'": "%27" };
+  const safe = String(u).replace(/["'()\\\s\u0000-\u001f\u007f]/g,
+    (c) => extra[c] || encodeURIComponent(c));
+  return `url("${safe}")`;
+}
 function fmt(sec) {
   if (!isFinite(sec) || sec == null) return "0:00";
   sec = Math.max(0, Math.round(sec));
   return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
 }
+/* Per-run request token (audit 2026-11-11): the launcher generates
+   it and the backend hands it to this same-origin page via
+   /ui-config. Mutating calls and /local reads must present it, so a
+   cross-origin page (which cannot read /ui-config and cannot set
+   custom headers on a simple request) cannot drive the backend. */
+let apiToken = "";
+const tokenReady = fetch("/ui-config")
+  .then((r) => r.json())
+  .then((d) => { apiToken = d.token || ""; })
+  .catch(() => {});
+function authHeaders() {
+  return apiToken ? { "X-Arzxsh-Token": apiToken } : {};
+}
 async function api(path) {
-  const r = await fetch(path);
+  await tokenReady;
+  const r = await fetch(path, { headers: authHeaders() });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
@@ -105,7 +128,8 @@ function dlBtn(track) {
 async function doDownload(track) {
   toast(`Downloading “${track.title}”…`);
   try {
-    const r = await fetch(`/download/${encodeURIComponent(track.id)}?title=${encodeURIComponent(track.title)}&artist=${encodeURIComponent(track.artist)}`, { method: "POST" });
+    await tokenReady;
+    const r = await fetch(`/download/${encodeURIComponent(track.id)}?title=${encodeURIComponent(track.title)}&artist=${encodeURIComponent(track.artist)}`, { method: "POST", headers: authHeaders() });
     if (!r.ok) throw new Error();
     const data = await r.json();
     downloads[track.id] = data.track.id;
@@ -732,7 +756,7 @@ function onTrackChanged(track) {
   $("#npTitle").textContent = track.title;
   $("#npArtist").textContent = track.artist;
   $("#npBackdrop").style.backgroundImage =
-    track.artwork && /^https:\/\//.test(track.artwork) ? `url("${track.artwork}")` : "";
+    track.artwork && /^https:\/\//.test(track.artwork) ? cssUrl(track.artwork) : "";
   $("#npContext").textContent = player.contextName || "Now Playing";
   syncPlayButtons();
   syncHeartStates();
@@ -941,9 +965,12 @@ document.addEventListener("keydown", (e) => {
 document.body.classList.add("no-player");
 renderSideRecent();
 navigate({ type: "home" }, true);
-/* Debug/testing handle: lets a console (or an automated check)
-   inspect playback state without scraping the DOM. */
-window.__arzxsh = { player, decks };
+/* Debug/testing handle, gated (audit 2026-11-11): only exposed when
+   the page was opened with ?debug=1, so shipped sessions do not hand
+   playback control to any script that reaches this origin. */
+if (new URLSearchParams(location.search).has("debug")) {
+  window.__arzxsh = { player, decks };
+}
 api("/local").then((d) => {
   const present = new Set(d.tracks.map((t) => t.id));
   let changed = false;

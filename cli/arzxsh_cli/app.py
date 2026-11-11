@@ -14,11 +14,11 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import threading
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from rich.markup import escape as _markup_escape
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -31,7 +31,17 @@ from .art import art_for
 from .backend import Backend
 from .engine import Engine
 from .lyrics import LyricsFetcher, active_index
+from .paths import runtime_dir
 from .store import EQ_FREQS, Store
+
+
+def esc(value) -> str:
+    """Escape catalog metadata for Rich-markup contexts
+    (audit 2026-11-11): titles, artist names, descriptions and
+    lyrics are attacker-shaped strings, and any of them containing
+    '[...]' would otherwise be parsed as markup by Static/update/
+    notify. Paths built on rich Text objects never needed this."""
+    return _markup_escape(str(value or ""))
 
 # Accent presets, mirroring the Android app's theme-accent
 # concept: one accent drives the whole TUI (active tab, playing
@@ -299,7 +309,7 @@ class ArzxshApp(App):
         except Exception as e:
             self.engine_error = str(e)
             self.engine = None
-            self.notify(f"Playback unavailable: {e}", severity="error", timeout=8)
+            self.notify(f"Playback unavailable: {esc(e)}", severity="error", timeout=8)
         await self.show_home()
         self.set_interval(0.3, self._poll)
 
@@ -454,7 +464,7 @@ class ArzxshApp(App):
         if results:
             await box.mount(self._track_list(results, "Search"))
         else:
-            await box.mount(Static(f"No songs found for “{q}”.", classes="dim"))
+            await box.mount(Static(f"No songs found for “{esc(q)}”.", classes="dim"))
         if albums.get("results"):
             await box.mount(Static("Albums", classes="section"))
             await box.mount(ListView(*[LinkItem(a.get("title", ""), "album", a.get("id"), f"{a.get('artist','')} {a.get('year','')}") for a in albums["results"]]))
@@ -470,12 +480,12 @@ class ArzxshApp(App):
         art = await art_for(self.backend, a, cols=28, rows=9)
         if art:
             widgets.append(Static(art))
-        widgets.append(Static(f"[bold]{a.get('name','')}[/bold]"))
+        widgets.append(Static(f"[bold]{esc(a.get('name',''))}[/bold]"))
         if a.get("subscribers"):
-            widgets.append(Static(f"{a['subscribers']} subscribers", classes="dim"))
+            widgets.append(Static(f"{esc(a['subscribers'])} subscribers", classes="dim"))
         if a.get("description"):
             widgets.append(Static("About", classes="section"))
-            widgets.append(Static(a["description"]))
+            widgets.append(Static(esc(a["description"])))
         if a.get("songs"):
             widgets.append(Static("Top songs", classes="section"))
             widgets.append(self._track_list(a["songs"], a.get("name", "Artist")))
@@ -499,8 +509,8 @@ class ArzxshApp(App):
         art = await art_for(self.backend, a, cols=28, rows=9)
         if art:
             widgets.append(Static(art))
-        widgets.append(Static(f"[bold]{a.get('title','')}[/bold]"))
-        widgets.append(Static(f"{a.get('artist','')} · {a.get('year','')} · {len(a.get('tracks', []))} songs", classes="dim"))
+        widgets.append(Static(f"[bold]{esc(a.get('title',''))}[/bold]"))
+        widgets.append(Static(f"{esc(a.get('artist',''))} · {esc(a.get('year',''))} · {len(a.get('tracks', []))} songs", classes="dim"))
         widgets.append(Static("Songs", classes="section"))
         widgets.append(self._track_list(a.get("tracks", []), a.get("title", "Album")))
         await self._set_content(widgets)
@@ -546,7 +556,7 @@ class ArzxshApp(App):
         tracks = data.get("tracks", [])
         widgets = [
             Static("[bold]On this device[/bold]"),
-            Static(f"{len(tracks)} tracks · {data.get('dir','')}", classes="dim"),
+            Static(f"{len(tracks)} tracks · {esc(data.get('dir',''))}", classes="dim"),
             Button("↻ Rescan folder", id="btn-rescan"),
             Static("Songs", classes="section"),
         ]
@@ -585,7 +595,7 @@ class ArzxshApp(App):
             return
         pl = pls[index]
         widgets = [
-            Static(f"[bold]{pl['name']}[/bold]"),
+            Static(f"[bold]{esc(pl['name'])}[/bold]"),
             Static(f"{len(pl['tracks'])} songs", classes="dim"),
             Horizontal(
                 Button("▶ Play all", id="btn-pl-playall"),
@@ -605,17 +615,30 @@ class ArzxshApp(App):
         outdir = music / "arzxsh" / "playlists"
         outdir.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r"[^\w\s.-]+", "", name).strip() or "playlist"
-        m3u = outdir / f"{safe}.m3u"
-        txt = outdir / f"{safe}.txt"
+        # Never silently overwrite an earlier export (audit
+        # 2026-11-11): suffix until both target names are free.
+        stem, n = safe, 1
+        m3u, txt = outdir / f"{stem}.m3u", outdir / f"{stem}.txt"
+        while m3u.exists() or txt.exists():
+            n += 1
+            stem = f"{safe} ({n})"
+            m3u, txt = outdir / f"{stem}.m3u", outdir / f"{stem}.txt"
+
+        def clean_line(value) -> str:
+            # A CR/LF inside a title/artist would inject whole new
+            # EXTINF entries or URL lines into the export.
+            return re.sub(r"[\r\n]+", " ", str(value or ""))
+
+        from urllib.parse import quote
         lines = ["#EXTM3U"]
         plain = []
         for t in tracks:
-            lines.append(f"#EXTINF:{int(t.get('duration_s') or -1)},{t.get('artist','')} - {t.get('title','')}")
+            lines.append(f"#EXTINF:{int(t.get('duration_s') or -1)},{clean_line(t.get('artist',''))} - {clean_line(t.get('title',''))}")
             if t.get("source") == "local":
-                lines.append(f"{self.backend.base}/local/file/{t['id']}")
+                lines.append(f"{self.backend.base}/local/file/{quote(str(t['id']), safe='')}")
             else:
-                lines.append(f"https://music.youtube.com/watch?v={t['id']}")
-            plain.append(f"{t.get('artist','')} - {t.get('title','')}")
+                lines.append(f"https://music.youtube.com/watch?v={quote(str(t['id']), safe='')}")
+            plain.append(f"{clean_line(t.get('artist',''))} - {clean_line(t.get('title',''))}")
         m3u.write_text("\n".join(lines) + "\n")
         txt.write_text("\n".join(plain) + "\n")
         return m3u
@@ -669,7 +692,7 @@ class ArzxshApp(App):
             self.notify("Import found no tracks.", severity="warning")
             return
         self.store.create_playlist(name or "Imported playlist", tracks)
-        self.notify(f"Imported “{name}” ({len(tracks)} tracks)")
+        self.notify(f"Imported “{esc(name)}” ({len(tracks)} tracks)")
         await self.show_playlists()
 
     # -- settings ---------------------------------------------------------
@@ -767,8 +790,8 @@ class ArzxshApp(App):
         art = await art_for(self.backend, track, cols=30, rows=10)
         if art:
             widgets.append(Static(art))
-        widgets.append(Static(f"[bold]{track.get('title','')}[/bold]"))
-        widgets.append(Static(track.get("artist", ""), classes="dim"))
+        widgets.append(Static(f"[bold]{esc(track.get('title',''))}[/bold]"))
+        widgets.append(Static(esc(track.get("artist", "")), classes="dim"))
         widgets.append(Static("About the artist", classes="section"))
         widgets.append(Static("…", id="lyrics-about"))
         widgets.append(Static("Lyrics", classes="section"))
@@ -827,7 +850,15 @@ class ArzxshApp(App):
                     text.append(line + "\n", style="white" if abs(i - idx) <= 3 else "dim")
             el.update(text)
         elif data["plain"]:
-            el.update(data["plain"] + (f"\n\n[dim]Source: {data['source']}[/dim]" if data["source"] else ""))
+            # Built as a Text object, not a markup string: lyric
+            # text is attacker-shaped and must render literally —
+            # as markup it could inject styles and even forge the
+            # Source line appended below.
+            text = Text(str(data["plain"]))
+            if data["source"]:
+                text.append("\n\n")
+                text.append(f"Source: {data['source']}", style="dim")
+            el.update(text)
         else:
             el.update("No lyrics found for this track.")
 
@@ -873,7 +904,7 @@ class ArzxshApp(App):
             name = self.query_one("#pl-name", Input).value
             if self.engine and self.engine.queue:
                 self.store.create_playlist(name or "My playlist", self.engine.queue)
-                self.notify(f"Saved playlist “{name or 'My playlist'}”")
+                self.notify(f"Saved playlist “{esc(name or 'My playlist')}”")
                 await self.show_playlists()
             else:
                 self.notify("The queue is empty. Play something first.", severity="warning")
@@ -890,7 +921,7 @@ class ArzxshApp(App):
             pls = self.store.data["playlists"]
             if 0 <= kw.get("index", -1) < len(pls):
                 path = self._export_playlist(pls[kw["index"]]["name"], pls[kw["index"]]["tracks"])
-                self.notify(f"Exported to {path}")
+                self.notify(f"Exported to {esc(path)}")
         elif bid == "btn-pl-delete":
             _, kw = self._view
             self.store.delete_playlist(kw.get("index", -1))
@@ -1019,7 +1050,7 @@ class ArzxshApp(App):
         track = self._focused_track() or (self.engine.current if self.engine else None)
         if track:
             now = self.store.toggle_like(track)
-            self.notify(f"{'♥ Liked' if now else 'Removed from Liked'}: {track.get('title','')}")
+            self.notify(f"{'♥ Liked' if now else 'Removed from Liked'}: {esc(track.get('title',''))}")
             self._sync_like_button()
 
     def _fetch_lyrics_background(self, track: dict):
@@ -1054,7 +1085,7 @@ class ArzxshApp(App):
         if track["id"] in self.store.data["downloads"]:
             self.notify("Already saved for offline.")
             return
-        self.notify(f"Downloading “{track.get('title','')}”…")
+        self.notify(f"Downloading “{esc(track.get('title',''))}”…")
         try:
             data = await self.backend.download(track)
             self.store.mark_downloaded(track["id"], data["track"]["id"])
@@ -1082,9 +1113,9 @@ class ArzxshApp(App):
                        and t.get("id") not in self.store.data["downloads"]]
             skipped = len(tracks) - len(pending)
             if not pending:
-                self.notify(f"Everything in “{name}” is already saved for offline.")
+                self.notify(f"Everything in “{esc(name)}” is already saved for offline.")
                 return
-            self.notify(f"Downloading {len(pending)} songs from “{name}”… one at a time, this can take a while.")
+            self.notify(f"Downloading {len(pending)} songs from “{esc(name)}”… one at a time, this can take a while.")
             saved = failed = 0
             for i, track in enumerate(pending, 1):
                 try:
@@ -1095,9 +1126,9 @@ class ArzxshApp(App):
                 except Exception:
                     failed += 1
                 if i % 10 == 0 and i < len(pending):
-                    self.notify(f"“{name}”: {i} of {len(pending)} done · {saved} saved"
+                    self.notify(f"“{esc(name)}”: {i} of {len(pending)} done · {saved} saved"
                                 + (f" · {failed} failed" if failed else ""))
-            self.notify(f"“{name}” finished: {saved} saved"
+            self.notify(f"“{esc(name)}” finished: {saved} saved"
                         + (f" · {skipped} already had" if skipped else "")
                         + (f" · {failed} failed" if failed else ""))
         finally:
@@ -1116,7 +1147,7 @@ class ArzxshApp(App):
             self.notify("Created “My Playlist” and added the track (see Playlists tab)")
             return
         self.store.playlist_add(len(pls) - 1, track)
-        self.notify(f"Added to “{pls[-1]['name']}”")
+        self.notify(f"Added to “{esc(pls[-1]['name'])}”")
 
     def action_lyrics(self):
         self.run_worker(self.show_lyrics())
@@ -1164,7 +1195,7 @@ class ArzxshApp(App):
         if not shutil.which("cava"):
             return
         try:
-            cfg = Path(tempfile.gettempdir()) / "arzxsh-cava.conf"
+            cfg = runtime_dir() / "arzxsh-cava.conf"
             cfg.write_text(
                 "[general]\nbars = 26\nframerate = 30\n"
                 "[output]\nmethod = raw\nraw_target = /dev/stdout\n"

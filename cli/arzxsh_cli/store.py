@@ -63,9 +63,19 @@ class Store:
 
     def save(self):
         try:
+            # State-dir hygiene (audit 2026-11-11): the directory is
+            # 0700 and the file lands 0600, not umask defaults.
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(self.path.parent, 0o700)
+            except OSError:
+                pass
             tmp = self.path.with_suffix(".tmp")
             tmp.write_text(json.dumps(self.data))
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
             tmp.replace(self.path)
         except Exception:
             pass

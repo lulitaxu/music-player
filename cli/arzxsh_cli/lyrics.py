@@ -77,6 +77,14 @@ class LyricsFetcher:
         except Exception:
             return None
 
+    # Disk-store bound (audit 2026-11-11): entries never expire by
+    # design (downloaded tracks keep lyrics offline forever), but
+    # the store is capped by count with oldest-first eviction —
+    # the Android store's MAX_CACHE_FILES pattern. Downloaded
+    # tracks re-fetch on demand if ever evicted; the cap only
+    # bites past 500 stored tracks.
+    _MAX_DISK_FILES = 500
+
     def _write_disk(self, key: str, result: dict):
         """Atomic publish (temp + rename, like the Android cache
         and store.py): a crash mid-write never leaves a torn
@@ -84,6 +92,11 @@ class LyricsFetcher:
         only loses the persistence, not the lyrics."""
         try:
             self._dir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(self._dir, 0o700)
+                os.chmod(self._dir.parent, 0o700)
+            except OSError:
+                pass
             dest = self._disk_path(key)
             tmp = dest.with_suffix(".tmp")
             tmp.write_text(json.dumps({
@@ -91,7 +104,16 @@ class LyricsFetcher:
                 "plain": result["plain"],
                 "source": result["source"],
             }))
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
             tmp.replace(dest)
+            files = sorted(self._dir.glob("*.json"),
+                           key=lambda p: p.stat().st_mtime)
+            for old in files[: max(0, len(files) - self._MAX_DISK_FILES)]:
+                if old != dest:
+                    old.unlink(missing_ok=True)
         except Exception:
             pass
 

@@ -1,0 +1,11 @@
+# Pinned exact versions (audit 2026-11-11): first-run installs must
+# not float. Versions are the ones this backend is developed and
+# verified against on the maintainer machine. Hashes are not pinned
+# yet (--require-hashes needs a wheel-download pass to generate);
+# exact-version pinning is the enforced layer today.
+fastapi==0.162.0
+uvicorn[standard]==0.54.0
+ytmusicapi==1.12.3
+yt-dlp==2026.10.26
+requests==2.34.2
+mutagen==1.48.1

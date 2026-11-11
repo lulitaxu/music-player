@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -22,7 +24,19 @@ from pathlib import Path
 
 import httpx
 
+from .paths import runtime_dir, token_file
+
 BASE = "http://127.0.0.1:8077"
+
+_CTRL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _display(value) -> str:
+    """Make catalog metadata safe to print raw to a terminal
+    (audit 2026-11-11): C0/C1 control characters — ESC sequences
+    above all — are replaced so a hostile title cannot rewrite the
+    user's terminal, spoof prompts, or set the window title."""
+    return _CTRL_CHARS.sub(" ", str(value or ""))
 
 
 def _backend_dir() -> Path | None:
@@ -41,16 +55,52 @@ def _backend_dir() -> Path | None:
     return None
 
 
-def backend_alive() -> bool:
+def _health_probe() -> tuple[dict | None, bool]:
+    """(health JSON, did anything answer). Identity matters
+    (audit 2026-11-11): any local service can squat the fixed port
+    and answer 200, so 'alive' means 'identifies as arzxsh-ytm',
+    and a foreign responder is reported, never trusted."""
     try:
-        return httpx.get(f"{BASE}/health", timeout=2.0, trust_env=False).status_code == 200
+        r = httpx.get(f"{BASE}/health", timeout=2.0, trust_env=False)
     except Exception:
-        return False
+        return None, False
+    try:
+        return r.json(), True
+    except Exception:
+        return None, True
+
+
+def backend_alive() -> bool:
+    payload, _ = _health_probe()
+    return bool(payload and payload.get("app") == "arzxsh-ytm")
+
+
+def _write_api_token() -> str:
+    """Generate the per-run backend token, store it 0600 in the
+    shared token file (the backend client and linux/run.sh use the
+    same location), and return it for the spawned process env."""
+    token = secrets.token_urlsafe(32)
+    tf = token_file()
+    tf.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(tf.parent, 0o700)
+    except OSError:
+        pass
+    fd = os.open(tf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(token)
+    return token
 
 
 def ensure_backend() -> bool:
     if backend_alive():
         return True
+    _, answered = _health_probe()
+    if answered:
+        print("arzxsh: something that is not the arzxsh backend is already "
+              "answering on 127.0.0.1:8077; refusing to trust it. Stop that "
+              "service first.", file=sys.stderr)
+        return False
     backend = _backend_dir()
     if backend is None:
         print("arzxsh: backend not found (set ARZXSH_BACKEND_DIR).", file=sys.stderr)
@@ -65,15 +115,19 @@ def ensure_backend() -> bool:
         print("arzxsh: first run, creating the backend environment…")
         venv.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
-        subprocess.run([str(venv / "bin" / "pip"), "install", "-q", "fastapi",
-                        "uvicorn[standard]", "ytmusicapi", "yt-dlp", "requests",
-                        "mutagen"], check=True)
+        # Pinned installs only (audit 2026-11-11): the backend's
+        # requirements.txt carries exact versions; bare package
+        # names here would float to whatever PyPI serves that day.
+        subprocess.run([str(venv / "bin" / "pip"), "install", "-q",
+                        "-r", str(backend / "requirements.txt")], check=True)
     log = Path(tempfile_log())
+    token = _write_api_token()
+    env = {**os.environ, "ARZXSH_API_TOKEN": token}
     with open(log, "ab") as fh:
         subprocess.Popen(
             [str(uvicorn), "app:app", "--app-dir", str(backend),
              "--host", "127.0.0.1", "--port", "8077"],
-            stdout=fh, stderr=fh, start_new_session=True)
+            stdout=fh, stderr=fh, start_new_session=True, env=env)
     for _ in range(60):
         if backend_alive():
             return True
@@ -83,8 +137,9 @@ def ensure_backend() -> bool:
 
 
 def tempfile_log() -> str:
-    import tempfile
-    return os.path.join(tempfile.gettempdir(), "arzxsh-backend.log")
+    # Inside the per-user 0700 runtime dir (audit 2026-11-11), not a
+    # fixed symlink-followable name in the shared temp dir.
+    return str(runtime_dir() / "arzxsh-backend.log")
 
 
 async def _search_first(query: str) -> dict | None:
@@ -115,7 +170,7 @@ def cmd_search(query: str) -> int:
         return 1
     for i, t in enumerate(results, 1):
         dur = t.get("duration_s") or 0
-        print(f"{i:>2}. {t.get('title','')} — {t.get('artist','')} "
+        print(f"{i:>2}. {_display(t.get('title',''))} — {_display(t.get('artist',''))} "
               f"({dur // 60}:{dur % 60:02d})")
     return 0
 
@@ -128,10 +183,12 @@ def cmd_play(query: str) -> int:
     if not shutil.which("mpv"):
         print("mpv is not installed (pacman -S mpv).", file=sys.stderr)
         return 1
-    url = f"{BASE}/audio/{track['id']}"
-    print(f"▶ {track.get('title','')} — {track.get('artist','')}  (Ctrl+C to stop)")
+    from urllib.parse import quote
+    url = f"{BASE}/audio/{quote(str(track['id']), safe='')}"
+    title = _display(track.get('title', ''))
+    print(f"▶ {title} — {_display(track.get('artist',''))}  (Ctrl+C to stop)")
     try:
-        subprocess.run(["mpv", "--no-video", f"--title={track.get('title','')}", url])
+        subprocess.run(["mpv", "--no-video", f"--title={title}", url])
     except KeyboardInterrupt:
         pass
     return 0
@@ -162,7 +219,7 @@ def cmd_download(query: str) -> int:
         print(f"Download failed: {e}", file=sys.stderr)
         return 1
     print(("Already saved: " if data.get("already") else "Saved for offline: ")
-          + f"{track.get('title','')} — {track.get('artist','')}")
+          + f"{_display(track.get('title',''))} — {_display(track.get('artist',''))}")
     return 0
 
 

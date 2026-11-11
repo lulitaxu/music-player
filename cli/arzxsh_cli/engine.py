@@ -18,15 +18,19 @@ import json
 import os
 import random
 import shutil
-import tempfile
 
+from .paths import runtime_dir
 from .store import EQ_FREQS
 
 
 class MpvDeck:
     def __init__(self, name: str, on_end_file, on_file_loaded):
         self.name = name
-        self.sock_path = os.path.join(tempfile.gettempdir(), f"arzxsh-mpv-{name}-{os.getpid()}.sock")
+        # IPC sockets live in the per-user 0700 runtime dir
+        # (audit 2026-11-11), not at enumerable fixed names in the
+        # shared temp dir: the socket speaks unauthenticated mpv
+        # JSON IPC, so its directory is its access control.
+        self.sock_path = str(runtime_dir() / f"arzxsh-mpv-{name}-{os.getpid()}.sock")
         self.proc: asyncio.subprocess.Process | None = None
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None

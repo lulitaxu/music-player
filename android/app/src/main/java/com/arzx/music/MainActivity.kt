@@ -547,31 +547,62 @@ object ArtworkLoader {
                 // loopback host (0.6.13): artwork URLs come from
                 // remote metadata, and the loader must not become
                 // a LAN probe on their say-so.
-                val host = URL(url).host
-                val addr = if (host.isNullOrEmpty()) null else try {
-                    java.net.InetAddress.getByName(host)
-                } catch (_: Exception) {
-                    null
-                }
-                if (addr == null || addr.isLoopbackAddress || addr.isLinkLocalAddress ||
-                    addr.isSiteLocalAddress
-                ) {
-                    null
-                } else {
-                    val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                // Audit 2026-11-11: redirects are followed MANUALLY
+                // (instanceFollowRedirects=false) with the same
+                // private-address check re-run on EVERY hop and on
+                // EVERY resolved address (getAllByName): the old
+                // code checked the original host once and let the
+                // platform follow a 302 to a private target
+                // unchecked. Residual: the check and the connect
+                // still resolve DNS independently, so a rebinding
+                // hostname with a sub-TTL flip remains a narrow
+                // race; the blast radius is a blind, capped image
+                // GET whose bytes only reach the image decoder.
+                var current: URL? = URL(url)
+                var hops = 0
+                var fetched: ByteArray? = null
+                while (current != null && hops <= 3) {
+                    val hopUrl = current
+                    current = null
+                    val host = hopUrl.host
+                    val addrs = if (host.isNullOrEmpty()) null else try {
+                        java.net.InetAddress.getAllByName(host)
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (addrs.isNullOrEmpty() || addrs.any {
+                            it.isLoopbackAddress || it.isLinkLocalAddress ||
+                                it.isSiteLocalAddress
+                        }
+                    ) {
+                        break
+                    }
+                    val conn = (hopUrl.openConnection() as HttpURLConnection).apply {
                         connectTimeout = 10_000
                         readTimeout = 10_000
+                        instanceFollowRedirects = false
                         // Some artwork CDNs refuse the default Java user agent;
                         // identify the app like every other request it makes.
                         setRequestProperty("User-Agent", "arzxsh (Android)")
                     }
                     try {
-                        if (conn.responseCode !in 200..299) null
-                        else conn.inputStream.use { readCapped(it, MAX_ART_BYTES) }
+                        val code = conn.responseCode
+                        if (code in 200..299) {
+                            fetched = conn.inputStream.use { readCapped(it, MAX_ART_BYTES) }
+                        } else if (code in intArrayOf(301, 302, 303, 307, 308)) {
+                            val loc = conn.getHeaderField("Location")
+                            val next = if (loc.isNullOrEmpty()) null else
+                                try { URL(hopUrl, loc) } catch (_: Exception) { null }
+                            if (next != null && next.protocol == "https") {
+                                current = next
+                                hops++
+                            }
+                        }
                     } finally {
                         conn.disconnect()
                     }
                 }
+                fetched
             } else {
                 null
             }
@@ -7549,7 +7580,7 @@ class MainActivity : Activity() {
             .setUserAgent(userAgent ?: "arzxsh (Android)")
             .setConnectTimeoutMs(15_000)
             .setReadTimeoutMs(30_000)
-            .setAllowCrossProtocolRedirects(true)
+            .setAllowCrossProtocolRedirects(false)
         val exo = ExoPlayer.Builder(this)
             .setMediaSourceFactory(
                 DefaultMediaSourceFactory(DefaultDataSource.Factory(this, httpFactory))
@@ -8123,7 +8154,7 @@ class MainActivity : Activity() {
             .setUserAgent(resolved?.userAgent ?: "arzxsh (Android)")
             .setConnectTimeoutMs(15_000)
             .setReadTimeoutMs(30_000)
-            .setAllowCrossProtocolRedirects(true)
+            .setAllowCrossProtocolRedirects(false)
         val exo = ExoPlayer.Builder(this)
             .setMediaSourceFactory(
                 DefaultMediaSourceFactory(DefaultDataSource.Factory(this, httpFactory))
@@ -8551,7 +8582,7 @@ class MainActivity : Activity() {
             .setUserAgent(resolved?.userAgent ?: "arzxsh (Android)")
             .setConnectTimeoutMs(15_000)
             .setReadTimeoutMs(30_000)
-            .setAllowCrossProtocolRedirects(true)
+            .setAllowCrossProtocolRedirects(false)
         val exo = ExoPlayer.Builder(this)
             .setMediaSourceFactory(
                 DefaultMediaSourceFactory(DefaultDataSource.Factory(this, httpFactory))

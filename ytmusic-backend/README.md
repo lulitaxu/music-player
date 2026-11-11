@@ -7,9 +7,14 @@ resolution via yt-dlp. Spec: `../design/ytmusic-backend/SPEC.md`.
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install fastapi "uvicorn[standard]" ytmusicapi yt-dlp
-.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8077
+.venv/bin/pip install -r requirements.txt
+.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8077
 ```
+
+WARNING: bind 127.0.0.1 only. This server has no accounts or auth
+and must never be reachable from the LAN (the rule `linux/run.sh`
+states); launchers that want request authentication generate a
+per-run token and pass it as `ARZXSH_API_TOKEN`.
 
 Endpoints: `/health` `/search` `/artist/{id}` `/album/{id}` `/charts`
 `/radio?video_id=` `/stream/{videoId}` `/audio/{videoId}` (same-origin

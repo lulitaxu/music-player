@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Pre-Android-12 counterpart of data_extraction_rules.xml
+     (audit 2026-11-11), referenced via fullBackupContent: exclude
+     every domain from full backup. allowBackup=false remains the
+     substantive control on all versions. -->
+<full-backup-content>
+    <exclude domain="root" path="." />
+    <exclude domain="file" path="." />
+    <exclude domain="database" path="." />
+    <exclude domain="sharedpref" path="." />
+    <exclude domain="external" path="." />
+</full-backup-content>
