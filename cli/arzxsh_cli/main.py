@@ -24,7 +24,7 @@ from pathlib import Path
 
 import httpx
 
-from .paths import runtime_dir, token_file
+from .paths import load_api_token, runtime_dir, token_file
 
 BASE = "http://127.0.0.1:8077"
 
@@ -92,9 +92,70 @@ def _write_api_token() -> str:
     return token
 
 
+def _token_accepted() -> bool:
+    """Probe a token-gated route with the token our client will
+    actually send. Only a 403 proves a mismatch; anything else
+    (200, a slow or busy backend, a transient error) is not a
+    reason to restart anything."""
+    token = load_api_token()
+    headers = {"X-Arzxsh-Token": token} if token else None
+    try:
+        r = httpx.get(f"{BASE}/local", timeout=3.0, trust_env=False,
+                      headers=headers)
+    except Exception:
+        return True
+    return r.status_code != 403
+
+
+def _kill_stale_backends() -> None:
+    """SIGTERM the uvicorn processes serving this app on our port,
+    matched by full command line. A foreign service that merely
+    squats the port never matches and is never killed; that case
+    stays a refusal below."""
+    import signal
+    me = os.getpid()
+    for entry in Path("/proc").glob("[0-9]*"):
+        try:
+            pid = int(entry.name)
+            if pid == me:
+                continue
+            raw = (entry / "cmdline").read_bytes()
+            args = [p.decode("utf-8", "replace") for p in raw.split(b"\0") if p]
+        except Exception:
+            continue
+        if ("app:app" in args and "8077" in args
+                and any("uvicorn" in a for a in args)):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+    for _ in range(20):
+        _, answered = _health_probe()
+        if not answered:
+            return
+        time.sleep(0.25)
+
+
 def ensure_backend() -> bool:
     if backend_alive():
-        return True
+        if _token_accepted():
+            return True
+        # Identifies as our backend but rejects our token: an
+        # earlier launch rewrote the shared token file after this
+        # backend had already started under the previous token
+        # (its replacement could not take the port, so the old
+        # process kept serving). /health stays green while every
+        # data screen fails. Restart it so the token it demands
+        # and the token the client sends are from the same run.
+        print("arzxsh: the running backend is from an earlier launch "
+              "and rejects the current token; restarting it…",
+              file=sys.stderr)
+        _kill_stale_backends()
+        if backend_alive():
+            print("arzxsh: could not stop the earlier backend on "
+                  "127.0.0.1:8077; stop it manually "
+                  "(fuser -k 8077/tcp) and relaunch.", file=sys.stderr)
+            return False
     _, answered = _health_probe()
     if answered:
         print("arzxsh: something that is not the arzxsh backend is already "
