@@ -21,6 +21,10 @@ DEFAULTS = {
     "eq": [0] * 10,       # dB per band, EQ_FREQS order
     "loudnorm": False,
     "speed": 1.0,
+    # UI customization: accent preset name (see app.ACCENTS) and
+    # the two list-badge toggles. Badges default ON — the
+    # behavior the TUI shipped with.
+    "settings": {"accent": "green", "download_badges": True, "lyrics_badges": True},
 }
 
 
@@ -39,6 +43,23 @@ class Store:
                 self.data.update({k: saved[k] for k in DEFAULTS if k in saved})
         except Exception:
             pass
+        # Normalize the nested settings dict: fill any missing
+        # key from the defaults (older state files predate it)
+        # and detach it from the shared DEFAULTS object so
+        # in-place updates can never corrupt the defaults.
+        saved_settings = self.data.get("settings")
+        self.data["settings"] = {
+            **DEFAULTS["settings"],
+            **(saved_settings if isinstance(saved_settings, dict) else {}),
+        }
+
+    # -- ui settings --------------------------------------------------
+    def setting(self, key: str):
+        return self.data["settings"].get(key, DEFAULTS["settings"].get(key))
+
+    def set_setting(self, key: str, value):
+        self.data["settings"] = {**self.data["settings"], key: value}
+        self.save()
 
     def save(self):
         try:

@@ -23,6 +23,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.theme import Theme
 from textual.widgets import (Button, Input, Label, ListItem, ListView,
                              ProgressBar, Static, Switch)
 
@@ -32,7 +33,30 @@ from .engine import Engine
 from .lyrics import LyricsFetcher, active_index
 from .store import EQ_FREQS, Store
 
-ACCENT = "#fc3c44"
+# Accent presets, mirroring the Android app's theme-accent
+# concept: one accent drives the whole TUI (active tab, playing
+# marker, progress, selection, buttons) through Textual theme
+# variables, so switching recolors live, no restart. Spotify
+# green is the default; the old CLI red survives as a preset.
+ACCENTS = {
+    "green": "#1DB954",
+    "red": "#fc3c44",
+    "blue": "#3b82f6",
+    "violet": "#8b5cf6",
+    "amber": "#f59e0b",
+    "teal": "#14b8a6",
+}
+ACCENT_ORDER = list(ACCENTS)
+
+# The one track-row grid, shared by every list (search, playlist
+# detail, Liked Songs, queue, home shelves): status marker,
+# flexible title, fixed artist, fixed badges, right-aligned
+# fixed duration. Widths are constants — columns cannot drift
+# with title length.
+COL_MARKER_W = 2
+COL_ARTIST_W = 26
+COL_BADGES_W = 9
+COL_DUR_W = 6
 
 
 def fmt(sec) -> str:
@@ -56,34 +80,66 @@ def greeting() -> tuple[str, str]:
 
 class TrackItem(ListItem):
     """One playable row. Carries its track + the list it belongs
-    to, so activation can hand the whole context to the engine."""
+    to, so activation can hand the whole context to the engine.
+
+    The row is the shared fixed grid (see COL_* above): marker,
+    title (flex, ellipsis-truncated), artist (fixed width,
+    truncated), badges, duration (fixed width, right-aligned) —
+    built once here so every list in the app aligns identically.
+    """
 
     def __init__(self, app_ref, track: dict, context: list[dict], context_name: str):
         self.app_ref = app_ref
         self.track = track
         self.context = context
         self.context_name = context_name
-        markers = []
-        if app_ref.store.is_liked(track["id"]):
-            markers.append("♥")
-        if track.get("source") != "local" and track["id"] in app_ref.store.data["downloads"]:
-            markers.append("✓")
+        store = app_ref.store
+        accent = app_ref.accent_hex
+        badges = []
+        if store.is_liked(track["id"]):
+            badges.append("♥")
+        if store.setting("download_badges") \
+                and track.get("source") != "local" \
+                and track["id"] in store.data["downloads"]:
+            badges.append("✓")
+        if store.setting("lyrics_badges") \
+                and app_ref.lyrics_fetcher.has_lyrics(track["id"]):
+            badges.append("♪")
         if track.get("source") == "local":
-            markers.append("local")
-        playing = app_ref.engine and app_ref.engine.current and app_ref.engine.current["id"] == track["id"]
-        title = track.get("title", "")
+            badges.append("local")
+        playing = app_ref.engine and app_ref.engine.current \
+            and app_ref.engine.current["id"] == track["id"]
         sub = track.get("artist", "")
         if track.get("album"):
             sub += f" · {track['album']}"
-        label = Text()
-        if playing:
-            label.append("▶ ", style=f"bold {ACCENT}")
-        label.append(title, style=f"bold {ACCENT}" if playing else "bold")
-        label.append(f"   {sub}", style="dim")
-        label.append(f"   {fmt(track.get('duration_s'))}", style="dim")
-        if markers:
-            label.append("   " + " ".join(markers), style=ACCENT)
-        super().__init__(Static(label))
+        row = Horizontal(
+            Static(
+                Text("▶" if playing else "", style=f"bold {accent}"),
+                classes="col-marker",
+            ),
+            Static(
+                Text(
+                    track.get("title", ""),
+                    style=f"bold {accent}" if playing else "bold",
+                    no_wrap=True, overflow="ellipsis",
+                ),
+                classes="col-title",
+            ),
+            Static(
+                Text(sub, style="dim", no_wrap=True, overflow="ellipsis"),
+                classes="col-artist",
+            ),
+            Static(
+                Text(" ".join(badges), style=accent),
+                classes="col-badges",
+            ),
+            Static(
+                Text(fmt(track.get("duration_s"))),
+                classes="col-duration",
+            ),
+            classes="track-row",
+        )
+        super().__init__(row)
 
 
 class LinkItem(ListItem):
@@ -101,33 +157,39 @@ class LinkItem(ListItem):
 
 class ArzxshApp(App):
     CSS = """
-    Screen { background: #0a0a0a; }
-    #topbar { height: 3; background: #121212; padding: 0 1; }
+    Screen { background: $background; }
+    #topbar { height: 3; background: $surface; padding: 0 1; }
     #topbar .wordmark { width: auto; text-style: bold; padding: 1 2 0 0; }
     .tab { margin: 0 1; min-width: 10; }
-    .tab.active { background: #fc3c44; color: #ffffff; }
+    .tab.active { background: $accent; color: #ffffff; }
     #middle { height: 1fr; }
     #content { width: 1fr; padding: 0 1; }
-    #queue-panel { width: 42; background: #121212; border-left: solid #232323; padding: 0 1; display: none; }
+    #queue-panel { width: 42; background: $surface; border-left: solid $panel; padding: 0 1; display: none; }
     #queue-panel.open { display: block; }
-    #playerbar { height: 6; background: #101010; border-top: solid #232323; padding: 0 1; }
+    #playerbar { height: 6; background: $surface; border-top: solid $panel; padding: 0 1; }
     #np-title { width: 1fr; }
     #np-times { width: auto; color: #8a8a8a; }
     #progressbar { width: 1fr; margin: 0 1; }
     #controls { height: 3; align: center middle; }
     #controls Button { min-width: 7; margin: 0 1; }
-    #controls Button.on { background: #fc3c44; color: white; }
-    #viz { width: 30; color: #fc3c44; }
+    #controls Button.on { background: $accent; color: white; }
+    #viz { width: 30; color: $accent; }
     .section { text-style: bold; margin: 1 0 0 0; color: #ffffff; }
     .dim { color: #8a8a8a; }
     ListView { background: transparent; }
-    ListView > ListItem { padding: 0 1; }
-    ListView > ListItem.--highlight { background: #232323; }
+    ListView > ListItem { padding: 0; }
+    ListView > ListItem.--highlight { background: $accent-darken-3; }
+    .track-row { height: 1; width: 1fr; }
+    .col-marker { width: 2; }
+    .col-title { width: 1fr; }
+    .col-artist { width: 26; color: #8a8a8a; }
+    .col-badges { width: 9; }
+    .col-duration { width: 6; text-align: right; color: #8a8a8a; }
     .setting-row { height: 3; }
     .setting-row Button { min-width: 5; margin: 0 1; }
     .setting-name { width: 26; padding: 1 0; }
     .setting-value { width: 10; padding: 1 0; text-align: center; }
-    #helpbar { height: 1; background: #121212; color: #6a6a6a; padding: 0 1; }
+    #helpbar { height: 1; background: $surface; color: #6a6a6a; padding: 0 1; }
     Input { margin: 0 0 1 0; }
     """
 
@@ -160,6 +222,24 @@ class ArzxshApp(App):
         self.store = Store()
         self.backend = Backend()
         self.lyrics_fetcher = LyricsFetcher(self.backend)
+        # One registered theme per accent preset: the CSS speaks
+        # only in theme variables ($accent, $background, $surface,
+        # $panel), so switching the theme recolors the whole TUI
+        # live. Background stays in the near-black #121212 family
+        # for every preset, like the Android app.
+        for name, hexv in ACCENTS.items():
+            self.register_theme(Theme(
+                name=f"arzxsh-{name}",
+                primary=hexv,
+                accent=hexv,
+                background="#121212",
+                surface="#1a1a1a",
+                panel="#232323",
+                foreground="#f5f5f5",
+                dark=True,
+            ))
+        saved_accent = self.store.setting("accent")
+        self.theme = f"arzxsh-{saved_accent if saved_accent in ACCENTS else 'green'}"
         self.engine: Engine | None = None
         self.engine_error: str | None = None
         self._view = ("home", {})
@@ -168,6 +248,13 @@ class ArzxshApp(App):
         self._bulk_dl = False
         self._viz_bars = ""
         self._cava_proc: subprocess.Popen | None = None
+
+    @property
+    def accent_hex(self) -> str:
+        """The current accent preset's color, for the places
+        that style Rich text inline (row titles, the active
+        lyrics line) rather than through CSS variables."""
+        return ACCENTS.get(self.store.setting("accent"), ACCENTS["green"])
 
     # -- layout -------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -598,6 +685,19 @@ class ArzxshApp(App):
             Static("Loudness normalization", classes="setting-name"),
             Switch(value=bool(d["loudnorm"]), id="sw-loudnorm"),
             classes="setting-row"))
+        widgets.append(Static("Appearance", classes="section"))
+        accent_name = self.store.setting("accent")
+        if accent_name not in ACCENTS:
+            accent_name = "green"
+        widgets.append(self._setting_row("Accent color", accent_name.capitalize(), "accent"))
+        widgets.append(Horizontal(
+            Static("Download badges in lists", classes="setting-name"),
+            Switch(value=bool(self.store.setting("download_badges")), id="sw-badge-download"),
+            classes="setting-row"))
+        widgets.append(Horizontal(
+            Static("Lyrics badges in lists", classes="setting-name"),
+            Switch(value=bool(self.store.setting("lyrics_badges")), id="sw-badge-lyrics"),
+            classes="setting-row"))
         widgets.append(Static("Equalizer (dB)", classes="section"))
         for i, freq in enumerate(EQ_FREQS):
             label = f"{freq} Hz" if freq < 1000 else f"{freq // 1000} kHz"
@@ -615,7 +715,18 @@ class ArzxshApp(App):
 
     async def _adjust_setting(self, key: str, delta: int):
         d = self.store.data
-        if key == "crossfade":
+        if key == "accent":
+            cur = self.store.setting("accent")
+            i = ACCENT_ORDER.index(cur) if cur in ACCENT_ORDER else 0
+            new = ACCENT_ORDER[(i + delta) % len(ACCENT_ORDER)]
+            self.store.set_setting("accent", new)
+            # Live recolor: the theme swap restyles every
+            # CSS-variable surface at once; the queue panel is
+            # rebuilt so its inline-styled rows follow too.
+            self.theme = f"arzxsh-{new}"
+            self.query_one("#set-accent-value", Static).update(new.capitalize())
+            self._refresh_queue_panel()
+        elif key == "crossfade":
             d["crossfade_s"] = max(0, min(12, d["crossfade_s"] + delta))
             self.store.save()
             self.query_one("#set-crossfade-value", Static).update(str(d["crossfade_s"]))
@@ -711,7 +822,7 @@ class ArzxshApp(App):
             text = Text()
             for i, (_, line) in enumerate(data["synced"]):
                 if i == idx:
-                    text.append(line + "\n", style=f"bold {ACCENT}")
+                    text.append(line + "\n", style=f"bold {self.accent_hex}")
                 elif abs(i - idx) <= 12:
                     text.append(line + "\n", style="white" if abs(i - idx) <= 3 else "dim")
             el.update(text)
@@ -809,6 +920,12 @@ class ArzxshApp(App):
                 await self.engine.apply_eq()
             else:
                 self.store.save()
+        elif event.switch.id == "sw-badge-download":
+            self.store.set_setting("download_badges", event.value)
+            self._refresh_queue_panel()
+        elif event.switch.id == "sw-badge-lyrics":
+            self.store.set_setting("lyrics_badges", event.value)
+            self._refresh_queue_panel()
 
     async def on_input_submitted(self, event: Input.Submitted):
         if event.input.id == "search-input":

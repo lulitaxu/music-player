@@ -95,6 +95,19 @@ class LyricsFetcher:
         except Exception:
             pass
 
+    def has_lyrics(self, track_id: str) -> bool:
+        """Cheap availability probe for list badges: true when
+        this track's lyrics are already in the memory cache or
+        the on-disk store. Disk files only ever hold real lyrics
+        (misses are never written), so existence is proof. No
+        network, safe to call per row."""
+        if not track_id:
+            return False
+        hit = self._cache.get(track_id)
+        if hit and (hit.get("synced") or hit.get("plain")):
+            return True
+        return self._disk_path(track_id).exists()
+
     async def get(self, track: dict) -> dict:
         """Returns {"synced": [(t, text)...], "plain": str|None,
         "source": str}. Lookup order: memory cache, then the
