@@ -216,6 +216,7 @@ class ArzxshApp(App):
         Binding("l", "like", "Like", show=False),
         Binding("d", "download_focused", "Download", show=False),
         Binding("a", "add_to_playlist", "Add to playlist", show=False),
+        Binding("x", "remove_from_playlist", "Remove from playlist", show=False),
         Binding("y", "lyrics", "Lyrics", show=False),
         Binding("ctrl+y", "lyrics", "Lyrics", show=False),
         Binding("q", "queue_panel", "Queue", show=False),
@@ -605,6 +606,7 @@ class ArzxshApp(App):
             ),
         ]
         if pl["tracks"]:
+            widgets.append(Static("Highlight a song and press x to remove it from this playlist.", classes="dim"))
             widgets.append(self._track_list(pl["tracks"], pl["name"]))
         else:
             widgets.append(Static("Empty. Press a on any track to add it here.", classes="dim"))
@@ -1148,6 +1150,22 @@ class ArzxshApp(App):
             return
         self.store.playlist_add(len(pls) - 1, track)
         self.notify(f"Added to “{esc(pls[-1]['name'])}”")
+
+    def action_remove_from_playlist(self):
+        # Only meaningful inside a playlist's own screen; everywhere
+        # else x is a no-op so it can never eat a keypress by surprise.
+        if self._view[0] != "playlist_detail":
+            return
+        track = self._focused_track()
+        if not track:
+            return
+        index = self._view[1].get("index", -1)
+        pls = self.store.data["playlists"]
+        if not (0 <= index < len(pls)):
+            return
+        self.store.playlist_remove(index, track["id"])
+        self.notify(f"Removed from “{esc(pls[index]['name'])}”")
+        self.run_worker(self.show_playlist_detail(index))
 
     def action_lyrics(self):
         self.run_worker(self.show_lyrics())
