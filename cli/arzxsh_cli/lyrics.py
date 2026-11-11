@@ -3,15 +3,32 @@ source) with the backend's plain-text lyrics as the fallback.
 
 Synced lines are (timestamp_seconds, text) pairs parsed from LRC.
 The active line for a playback position is a binary search away.
+
+Persistence parity with the Android app: a successful fetch is
+written through to an on-disk store (one JSON per track id under
+the XDG state dir's lyrics/ subdir, next to state.json). Disk
+hits never expire, so downloaded tracks keep their lyrics
+offline and across restarts — the in-memory cache alone lost
+them on every exit.
 """
 from __future__ import annotations
 
 import bisect
+import json
+import os
 import re
+from pathlib import Path
 
 import httpx
 
 _LRC_TAG = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
+
+
+def lyrics_dir() -> Path:
+    """The on-disk lyrics store: <state dir>/arzxsh/lyrics,
+    beside store.py's state.json."""
+    root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return root / "arzxsh" / "lyrics"
 
 
 def parse_lrc(text: str) -> list[tuple[float, str]]:
@@ -35,19 +52,64 @@ def active_index(lines: list[tuple[float, str]], pos: float) -> int:
 
 
 class LyricsFetcher:
-    def __init__(self, backend):
+    def __init__(self, backend, store_dir: Path | None = None):
         self.backend = backend
         self._cache: dict[str, dict] = {}
+        self._dir = Path(store_dir) if store_dir is not None else lyrics_dir()
+
+    # -- on-disk store -------------------------------------------------
+    def _disk_path(self, key: str) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9_-]", "_", key)
+        return self._dir / f"{safe}.json"
+
+    def _read_disk(self, key: str) -> dict | None:
+        """A stored entry, or None. Disk hits NEVER expire: the
+        store exists so a downloaded track's lyrics outlive any
+        session. Corrupt or unreadable files count as absent."""
+        try:
+            data = json.loads(self._disk_path(key).read_text())
+            synced = [(float(t), str(x)) for t, x in data.get("synced", [])]
+            return {
+                "synced": synced,
+                "plain": data.get("plain"),
+                "source": data.get("source", ""),
+            }
+        except Exception:
+            return None
+
+    def _write_disk(self, key: str, result: dict):
+        """Atomic publish (temp + rename, like the Android cache
+        and store.py): a crash mid-write never leaves a torn
+        file for the next read. Best-effort — a failed write
+        only loses the persistence, not the lyrics."""
+        try:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            dest = self._disk_path(key)
+            tmp = dest.with_suffix(".tmp")
+            tmp.write_text(json.dumps({
+                "synced": [[t, x] for t, x in result["synced"]],
+                "plain": result["plain"],
+                "source": result["source"],
+            }))
+            tmp.replace(dest)
+        except Exception:
+            pass
 
     async def get(self, track: dict) -> dict:
         """Returns {"synced": [(t, text)...], "plain": str|None,
-        "source": str}. Every track tries LRCLIB by metadata
-        (local files included: their tags carry artist/title);
-        only the backend fallback is stream-only, since it is
-        keyed to a YouTube video id."""
+        "source": str}. Lookup order: memory cache, then the
+        on-disk store, then the network chain. Every track tries
+        LRCLIB by metadata (local files included: their tags
+        carry artist/title); only the backend fallback is
+        stream-only, since it is keyed to a YouTube video id."""
         key = track.get("id", "")
         if key in self._cache:
             return self._cache[key]
+        if key:
+            disk = self._read_disk(key)
+            if disk is not None and (disk["synced"] or disk["plain"]):
+                self._cache[key] = disk
+                return disk
         result = {"synced": [], "plain": None, "source": ""}
         duration = track.get("duration_s")
         try:
@@ -103,4 +165,9 @@ class LyricsFetcher:
             except Exception:
                 pass
         self._cache[key] = result
+        if key and (result["synced"] or result["plain"]):
+            # Only real lyrics persist — a miss must keep the
+            # network retry behavior on the next play, not become
+            # a permanent disk "hit" of nothing.
+            self._write_disk(key, result)
         return result

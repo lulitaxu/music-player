@@ -905,6 +905,28 @@ class ArzxshApp(App):
             self.notify(f"{'♥ Liked' if now else 'Removed from Liked'}: {track.get('title','')}")
             self._sync_like_button()
 
+    def _fetch_lyrics_background(self, track: dict):
+        # Lyrics ride along with downloads (mirrors the Android
+        # app since 0.6.12): the moment a track lands, fetch its
+        # lyrics so the fetcher's on-disk store is populated at
+        # download time and the song has synced lyrics offline
+        # and after a restart. Scheduled as its own worker —
+        # best-effort, silent, and never awaited by (so never
+        # slowing or failing) the download itself.
+        if not self.is_running:
+            return
+
+        async def _go():
+            try:
+                await self.lyrics_fetcher.get(track)
+            except Exception:
+                pass
+
+        try:
+            self.run_worker(_go(), exclusive=False)
+        except RuntimeError:
+            pass
+
     async def _download_current_or_focused(self):
         track = self._focused_track() or (self.engine.current if self.engine else None)
         if not track:
@@ -919,6 +941,7 @@ class ArzxshApp(App):
         try:
             data = await self.backend.download(track)
             self.store.mark_downloaded(track["id"], data["track"]["id"])
+            self._fetch_lyrics_background(track)
             self.notify("Saved for offline" if not data.get("already") else "Already saved for offline")
         except Exception:
             self.notify("Download failed. Check your connection.", severity="error")
@@ -950,6 +973,7 @@ class ArzxshApp(App):
                 try:
                     data = await self.backend.download(track)
                     self.store.mark_downloaded(track["id"], data["track"]["id"])
+                    self._fetch_lyrics_background(track)
                     saved += 1
                 except Exception:
                     failed += 1
