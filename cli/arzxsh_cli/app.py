@@ -167,6 +167,8 @@ class LinkItem(ListItem):
 
 
 class ArzxshApp(App):
+    ALLOW_SELECT = False
+
     CSS = """
     Screen { background: $background; }
     #topbar { height: 3; background: $surface; padding: 0 1; }
@@ -257,6 +259,7 @@ class ArzxshApp(App):
         self._view = ("home", {})
         self._lyrics_track_id: str | None = None
         self._lyrics_data: dict | None = None
+        self._lyrics_idx: int | None = None
         self._bulk_dl = False
         self._pending_local_delete: tuple[str, float] | None = None
         self._viz_bars = ""
@@ -332,6 +335,7 @@ class ArzxshApp(App):
             return
         self._lyrics_track_id = None
         self._lyrics_data = None
+        self._lyrics_idx = None
         self._refresh_queue_panel()
         coro = self._update_np_art(track)
         try:
@@ -837,6 +841,7 @@ class ArzxshApp(App):
     async def _fill_lyrics(self, track: dict):
         data = await self.lyrics_fetcher.get(track)
         self._lyrics_data = data
+        self._lyrics_idx = None
         self._lyrics_track_id = track["id"]
         self._render_lyrics_body()
 
@@ -851,13 +856,22 @@ class ArzxshApp(App):
         pos = self.engine.position if self.engine else 0
         if data["synced"]:
             idx = active_index(data["synced"], pos)
+            if idx == self._lyrics_idx:
+                return
+            self._lyrics_idx = idx
             text = Text()
             for i, (_, line) in enumerate(data["synced"]):
                 if i == idx:
                     text.append(line + "\n", style=f"bold {self.accent_hex}")
-                elif abs(i - idx) <= 12:
+                else:
                     text.append(line + "\n", style="white" if abs(i - idx) <= 3 else "dim")
             el.update(text)
+            if idx >= 0:
+                try:
+                    content = self.query_one("#content", VerticalScroll)
+                    content.scroll_to(y=max(0, el.virtual_region.y + idx - 3), animate=False)
+                except Exception:
+                    pass
         elif data["plain"]:
             # Built as a Text object, not a markup string: lyric
             # text is attacker-shaped and must render literally —
