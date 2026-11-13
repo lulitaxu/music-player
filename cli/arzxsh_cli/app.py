@@ -380,7 +380,7 @@ class ArzxshApp(App):
         # Re-mark the playing row without a full rebuild: cheapest
         # correct approach is re-running the current view renderer.
         name, kw = self._view
-        if name in ("home", "liked", "local", "playlist_detail", "album", "artist"):
+        if name in ("home", "liked", "local", "playlist_detail", "album", "artist", "lyrics"):
             coro = self._rerun_view()
             try:
                 self.run_worker(coro, exclusive=True, group="rerun")
@@ -391,7 +391,8 @@ class ArzxshApp(App):
         name, kw = self._view
         fn = {"home": self.show_home, "liked": self.show_liked, "local": self.show_local,
               "album": self.show_album, "artist": self.show_artist,
-              "playlist_detail": self.show_playlist_detail}.get(name)
+              "playlist_detail": self.show_playlist_detail,
+              "lyrics": self.show_lyrics}.get(name)
         if fn:
             await fn(**kw, _rerun=True)
 
@@ -793,7 +794,7 @@ class ArzxshApp(App):
             self.query_one(f"#set-{key}-value", Static).update(str(d["eq"][band]))
 
     # -- lyrics / now playing ------------------------------------------------
-    async def show_lyrics(self):
+    async def show_lyrics(self, _rerun: bool = False):
         if not self.engine or not self.engine.current:
             self.notify("Nothing is playing.")
             return
@@ -827,6 +828,9 @@ class ArzxshApp(App):
         except Exception:
             el.update("Couldn't load artist info.")
             return
+        if not self.engine or not self.engine.current \
+                or self.engine.current.get("id") != track.get("id"):
+            return
         text = Text()
         text.append(a.get("name", ""), style="bold")
         if a.get("subscribers"):
@@ -840,6 +844,9 @@ class ArzxshApp(App):
 
     async def _fill_lyrics(self, track: dict):
         data = await self.lyrics_fetcher.get(track)
+        if not self.engine or not self.engine.current \
+                or self.engine.current.get("id") != track.get("id"):
+            return
         self._lyrics_data = data
         self._lyrics_idx = None
         self._lyrics_track_id = track["id"]
