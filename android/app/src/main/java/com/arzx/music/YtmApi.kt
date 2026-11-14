@@ -1356,4 +1356,15 @@ object YtmApi {
         }
         return byId.values.take(limit)
     }
+
+    fun lyricsLines(videoId: String): List<String>? {
+        val next = post("next", JSONObject().put("videoId", videoId))
+        val browseId = Regex("\"browseId\"\\s*:\\s*\"(MPLYt_[A-Za-z0-9_-]+)\"")
+            .find(next.toString())?.groupValues?.get(1) ?: return null
+        val page = post("browse", JSONObject().put("browseId", browseId))
+        val shelf = findByKey(page, "musicDescriptionShelfRenderer") ?: return null
+        val desc = shelf.obj("description")?.let { runsText(it.arr("runs")) } ?: return null
+        val lines = desc.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        return lines.takeIf { it.size >= 4 }
+    }
 }

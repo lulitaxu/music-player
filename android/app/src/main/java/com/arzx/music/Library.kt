@@ -569,3 +569,52 @@ object LyricOffsets {
         trackMs(ctx, track) ?: globalMs(ctx)
 }
 
+
+// ------------------------------------------------------------ sort prefs + link media
+
+object SortPrefs {
+    const val RECENT = "recent"
+    const val ORDER = "order"
+    const val TITLE = "title"
+    const val ARTIST = "artist"
+    const val DURATION = "duration"
+
+    private fun prefs(ctx: Context) =
+        ctx.getSharedPreferences(LIB_PREFS, Context.MODE_PRIVATE)
+
+    fun get(ctx: Context, key: String, fallback: String): String =
+        prefs(ctx).getString("sort_" + key, null) ?: fallback
+
+    fun set(ctx: Context, key: String, mode: String) {
+        prefs(ctx).edit().putString("sort_" + key, mode).apply()
+    }
+}
+
+fun sortTracksByMode(list: List<Track>, mode: String): List<Track> = when (mode) {
+    SortPrefs.TITLE -> list.sortedWith(compareBy<Track> { it.title.lowercase() })
+    SortPrefs.ARTIST -> list.sortedWith(
+        compareBy<Track> { it.artist.lowercase() }
+            .thenBy { it.title.lowercase() }
+    )
+    SortPrefs.DURATION -> list.sortedBy { it.duration }
+    else -> list
+}
+
+object LinkMedia {
+    private const val KEY = "link_media_ids"
+
+    private fun prefs(ctx: Context) =
+        ctx.getSharedPreferences(LIB_PREFS, Context.MODE_PRIVATE)
+
+    fun mark(ctx: Context, videoId: String) {
+        val cur = prefs(ctx).getStringSet(KEY, emptySet()) ?: emptySet()
+        if (videoId in cur) return
+        prefs(ctx).edit().putStringSet(KEY, HashSet(cur).apply { add(videoId) }).apply()
+    }
+
+    fun isMarked(ctx: Context, track: Track): Boolean {
+        if (track.source != SOURCE_YOUTUBE) return false
+        val cur = prefs(ctx).getStringSet(KEY, emptySet()) ?: return false
+        return track.id in cur
+    }
+}

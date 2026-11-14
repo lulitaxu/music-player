@@ -253,6 +253,10 @@ object Lyrics {
      *  joined notes become [lastReport] either way, so a total
      *  failure still explains itself on screen. */
     fun fetch(ctx: Context, track: Track): LyricsData? {
+        if (LinkMedia.isMarked(ctx, track)) {
+            lastReport = "Lyrics are off for videos opened from a link"
+            return null
+        }
         readCache(ctx, track)?.let { cached ->
             lastReport = cached.report
                 ?: if (cached.miss) "Providers had nothing when last asked (cached)"
@@ -270,6 +274,9 @@ object Lyrics {
         val result = lrclibGet(clean, notes)
             ?: lrclibSearch(cleanTitle, cleanArtist, track.duration, notes, "normalized")
             ?: lrclibSearch(track.title, null, track.duration, notes, "raw title")
+            ?: ytmLyrics(track, notes)
+            ?: neteaseLyrics(cleanTitle, cleanArtist, track.duration, notes)
+            ?: chartLyrics(cleanTitle, cleanArtist, notes)
             ?: lyricsOvh(cleanTitle, cleanArtist, notes)
             ?: if (changed) lyricsOvh(track.title, track.artist, notes) else null
         lastReport = notes.joinToString(" · ")
@@ -494,6 +501,161 @@ object Lyrics {
             null
         }
     }
+
+    private fun ytmLyrics(track: Track, notes: MutableList<String>): LyricsData? = try {
+        if (track.source != SOURCE_YOUTUBE) {
+            notes += "YouTube Music: skipped (not a YouTube track)"
+            null
+        } else {
+            val lines = YtmApi.lyricsLines(track.id)
+            if (lines.isNullOrEmpty()) {
+                notes += "YouTube Music: HTTP 200, no lyrics sheet for this track"
+                null
+            } else {
+                notes += "YouTube Music: 200"
+                LyricsData(null, lines, "YouTube Music")
+            }
+        }
+    } catch (e: Exception) {
+        notes += "YouTube Music: ${shortOutcome(e)}"
+        null
+    }
+
+    private fun neteaseLyrics(
+        title: String,
+        artist: String,
+        durationSec: Int,
+        notes: MutableList<String>
+    ): LyricsData? {
+        return try {
+            val q = enc(listOf(title, artist).filter { it.isNotBlank() }.joinToString(" "))
+            val (code, text) = get(
+                "https://music.163.com/api/search/get/web?csrf_token=&s=$q&type=1&offset=0&total=true&limit=10"
+            )
+            if (code != 200) {
+                notes += "NetEase: HTTP $code"
+                return null
+            }
+            val songs = JSONObject(text).optJSONObject("result")?.optJSONArray("songs")
+            if (songs == null || songs.length() == 0) {
+                notes += "NetEase: 200, no matches"
+                return null
+            }
+            var bestId = -1L
+            var bestDiff = Long.MAX_VALUE
+            for (i in 0 until songs.length()) {
+                val s = songs.optJSONObject(i) ?: continue
+                if (titleSimilarity(title, s.optString("name", "")) < 45) continue
+                val durMs = s.optLong("duration", 0L)
+                val diff = if (durationSec > 0 && durMs > 0) {
+                    kotlin.math.abs(durMs / 1000 - durationSec)
+                } else {
+                    30L
+                }
+                if (diff < bestDiff) {
+                    bestDiff = diff
+                    bestId = s.optLong("id", -1L)
+                }
+            }
+            if (bestId <= 0L) {
+                notes += "NetEase: 200, ${songs.length()} matches, none close enough"
+                return null
+            }
+            val (lcode, ltext) = get(
+                "https://music.163.com/api/song/lyric?os=pc&id=$bestId&lv=-1&kv=-1&tv=-1"
+            )
+            if (lcode != 200) {
+                notes += "NetEase lyric: HTTP $lcode"
+                return null
+            }
+            val lrc = JSONObject(ltext).optJSONObject("lrc")
+                ?.optString("lyric", "")?.takeIf { it.isNotBlank() }
+            if (lrc == null) {
+                notes += "NetEase lyric: 200, empty"
+                return null
+            }
+            val synced = parseLrc(lrc).takeIf { it.isNotEmpty() }
+            val tagLine = Regex("^\\[[a-zA-Z#]+:.*\\]$")
+            val plain = if (synced != null) {
+                synced.map { it.text }
+            } else {
+                lrc.lines().map { it.trim() }
+                    .filter { it.isNotEmpty() && !tagLine.matches(it) }
+            }
+            if (plain.isEmpty()) {
+                notes += "NetEase lyric: 200, unparsable"
+                return null
+            }
+            notes += "NetEase: 200"
+            LyricsData(synced, plain, "NetEase")
+        } catch (e: Exception) {
+            notes += "NetEase: ${shortOutcome(e)}"
+            null
+        }
+    }
+
+    private fun chartLyrics(
+        title: String,
+        artist: String,
+        notes: MutableList<String>
+    ): LyricsData? {
+        return try {
+            if (artist.isBlank()) {
+                notes += "ChartLyrics: skipped (no artist)"
+                return null
+            }
+            val (code, text) = get(
+                "https://api.chartlyrics.com/apiv1.asmx/SearchLyric?artist=${enc(artist)}&song=${enc(title)}"
+            )
+            if (code != 200) {
+                notes += "ChartLyrics: HTTP $code"
+                return null
+            }
+            val ids = Regex("<LyricId>(\\d+)</LyricId>").findAll(text)
+                .map { it.groupValues[1] }.toList()
+            val sums = Regex("<LyricChecksum>([^<]+)</LyricChecksum>").findAll(text)
+                .map { it.groupValues[1] }.toList()
+            val songs = Regex("<Song>([^<]*)</Song>").findAll(text)
+                .map { xmlUnescape(it.groupValues[1]) }.toList()
+            var pick = -1
+            for (i in ids.indices) {
+                val song = songs.getOrNull(i) ?: continue
+                if (titleSimilarity(title, song) < 45) continue
+                pick = i
+                break
+            }
+            val sum = if (pick >= 0) sums.getOrNull(pick) else null
+            if (pick < 0 || sum == null) {
+                notes += "ChartLyrics: 200, ${ids.size} matches, none close enough"
+                return null
+            }
+            val (gcode, gtext) = get(
+                "https://api.chartlyrics.com/apiv1.asmx/GetLyric?lyricId=${ids[pick]}&lyricCheckSum=${enc(sum)}"
+            )
+            if (gcode != 200) {
+                notes += "ChartLyrics lyric: HTTP $gcode"
+                return null
+            }
+            val rawLyric = Regex("<Lyric>([\\s\\S]*?)</Lyric>").find(gtext)
+                ?.groupValues?.get(1)
+            val lines = rawLyric?.let { xmlUnescape(it) }?.lines()
+                ?.map { it.trimEnd() }?.filter { it.isNotBlank() }
+            if (lines.isNullOrEmpty()) {
+                notes += "ChartLyrics lyric: 200, empty"
+                return null
+            }
+            notes += "ChartLyrics: 200"
+            LyricsData(null, lines, "ChartLyrics")
+        } catch (e: Exception) {
+            notes += "ChartLyrics: ${shortOutcome(e)}"
+            null
+        }
+    }
+
+    private fun xmlUnescape(s: String): String = s
+        .replace("&lt;", "<").replace("&gt;", ">")
+        .replace("&quot;", "\"").replace("&apos;", "'")
+        .replace("&#39;", "'").replace("&amp;", "&")
 
     private fun lyricsOvh(title: String, artist: String, notes: MutableList<String>): LyricsData? = try {
         if (artist.isBlank()) {

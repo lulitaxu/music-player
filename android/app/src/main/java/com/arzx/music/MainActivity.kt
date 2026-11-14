@@ -5,6 +5,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.ClipboardManager
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
@@ -890,6 +891,8 @@ private class ProgressRingView(context: android.content.Context) : View(context)
 class MainActivity : Activity() {
     private val executor = Executors.newSingleThreadExecutor()
 
+    @Volatile private var pendingLinkId: String? = null
+
     /** Playback-only executor. v5 ran stream resolution on the shared
      *  [executor], where a single in-flight DOWNLOAD (minutes long)
      *  blocked every YouTube resolution queued behind it — a real
@@ -1586,6 +1589,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        handleLinkIntent(intent)
         // 0.6.3 (WS-D Bug A — the zombie player): before anything
         // else, take process ownership of playback. The claim
         // releases EVERY player a previous instance of this
@@ -3755,6 +3759,7 @@ class MainActivity : Activity() {
         fun runSearch(query: String) {
             val q = query.trim()
             if (q.isEmpty()) return
+            YoutubeSource.videoIdFromText(q)?.let { openLinkVideo(it); return }
             lastSearchQuery = q
             // 0.6.17: a submitted query joins the on-device
             // history, and submitting always closes the
@@ -4124,6 +4129,13 @@ class MainActivity : Activity() {
         // real search history existed).
         historyBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         browseBox.addView(historyBox)
+        browseBox.addView(
+            settingsRow(
+                "Open a YouTube Link",
+                "Play or download any YouTube video as audio, even if it is not on YouTube Music",
+                iconRes = R.drawable.ic_share
+            ) { openLinkFromClipboard() }
+        )
         renderSearchHistory()
         browseBox.addView(sectionTitle("Recently Played"))
         if (recentTracks.isEmpty()) {
@@ -10633,9 +10645,81 @@ class MainActivity : Activity() {
         visualizerAnimator?.cancel()
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLinkIntent(intent)
+    }
+
+    private fun handleLinkIntent(intent: Intent?) {
+        if (intent == null) return
+        val text = when (intent.action) {
+            Intent.ACTION_SEND -> intent.getStringExtra(Intent.EXTRA_TEXT)
+            Intent.ACTION_VIEW -> intent.dataString
+            else -> null
+        } ?: return
+        YoutubeSource.videoIdFromText(text)?.let { pendingLinkId = it }
+    }
+
+    private fun openLinkFromClipboard() {
+        val clip = (getSystemService(CLIPBOARD_SERVICE) as? ClipboardManager)
+            ?.primaryClip?.takeIf { it.itemCount > 0 }
+            ?.getItemAt(0)?.coerceToText(this)?.toString()
+        val id = clip?.let { YoutubeSource.videoIdFromText(it) }
+        if (id == null) {
+            Toast.makeText(this, "No YouTube link on the clipboard", Toast.LENGTH_SHORT).show()
+        } else {
+            openLinkVideo(id)
+        }
+    }
+
+    private fun openLinkVideo(videoId: String) {
+        pushNav("link:$videoId") { openLinkVideo(videoId) }
+        visibleScreen = "Link"
+        generation++
+        val gen = generation
+        beginScreen("YouTube Link", showAvatar = false)
+        val loading = label("Opening link…", 15f, white50)
+        content.addView(loading)
+        fetchPool.execute {
+            val track = try {
+                YoutubeSource.trackFromId(videoId)
+            } catch (_: Throwable) {
+                null
+            }
+            runOnUiThread {
+                if (gen != generation) return@runOnUiThread
+                content.removeView(loading)
+                if (track == null) {
+                    content.addView(sectionTitle("Couldn't open that link"))
+                    content.addView(
+                        label(
+                            "The video may be private, age-restricted or unavailable. Check the link and try again.",
+                            15f, white50
+                        )
+                    )
+                    content.addView(pillButton("Retry", filled = true) { openLinkVideo(videoId) })
+                } else {
+                    LinkMedia.mark(this@MainActivity, videoId)
+                    content.addView(statusLine("From a YouTube link · plays and downloads as audio"))
+                    addRowsChunked(
+                        listOf(track), content,
+                        queueContext = listOf(track),
+                        alive = { gen == generation }
+                    )
+                }
+            }
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         if (::content.isInitialized) updateVisualizerState()
+        val linkId = pendingLinkId
+        if (linkId != null && ::content.isInitialized) {
+            pendingLinkId = null
+            openLinkVideo(linkId)
+        }
     }
 
     override fun onRequestPermissionsResult(
@@ -10852,6 +10936,21 @@ class MainActivity : Activity() {
             return
         }
         beginScreen(p.name, showAvatar = false)
+        val sortMode = SortPrefs.get(this, "playlist", SortPrefs.ORDER)
+        val indexed = p.tracks.withIndex().toList()
+        val displayIndexed = when (sortMode) {
+            SortPrefs.RECENT -> indexed.reversed()
+            SortPrefs.TITLE -> indexed.sortedWith(
+                compareBy<IndexedValue<Track>> { it.value.title.lowercase() }
+            )
+            SortPrefs.ARTIST -> indexed.sortedWith(
+                compareBy<IndexedValue<Track>> { it.value.artist.lowercase() }
+                    .thenBy { it.value.title.lowercase() }
+            )
+            SortPrefs.DURATION -> indexed.sortedBy { it.value.duration }
+            else -> indexed
+        }
+        val displayTracks = displayIndexed.map { it.value }
         // 0.6.13 PLAYLIST REDESIGN (inspo: the iOS 27 beta page
         // Arz supplied): a tall artwork banner whose image melts
         // into the page through a shade gradient, the title set
@@ -10961,10 +11060,10 @@ class MainActivity : Activity() {
                 setOnClickListener {
                     shuffleOn = true
                     setPlayContext("Playlist", p.name)
-                    setQueue(p.tracks)
+                    setQueue(displayTracks)
                     mixPlaylistId = p.id
                     refreshTransportStates()
-                    play(p.tracks[playOrder.firstOrNull() ?: 0])
+                    play(displayTracks[playOrder.firstOrNull() ?: 0])
                 }
             }
             actions.addView(shuffleBtn, LinearLayout.LayoutParams(dp(44), dp(44)))
@@ -10984,9 +11083,9 @@ class MainActivity : Activity() {
                 contentDescription = "Play"
                 setOnClickListener {
                     setPlayContext("Playlist", p.name)
-                    setQueue(p.tracks)
+                    setQueue(displayTracks)
                     mixPlaylistId = p.id
-                    play(p.tracks.first())
+                    play(displayTracks.first())
                 }
             }
             MotionPress.attach(playDisc, primary = true) { springsOff() }
@@ -11006,7 +11105,7 @@ class MainActivity : Activity() {
                 background = solidBg(999f, surface2)
                 setPadding(dp(11), dp(11), dp(11), dp(11))
                 contentDescription = "Download all"
-                setOnClickListener { downloadAllTracks(p.tracks, p.name) }
+                setOnClickListener { downloadAllTracks(displayTracks, p.name) }
             }
             val dlLp = LinearLayout.LayoutParams(dp(44), dp(44))
             dlLp.marginEnd = dp(14)
@@ -11069,12 +11168,32 @@ class MainActivity : Activity() {
                 // UI has no drag framework; numbered moves are exact).
                 // Chunked (0.6.3, S1): a 200-track playlist no longer
                 // builds in one main-thread pass.
+                content.addView(
+                    sortRowView(
+                        "playlist",
+                        listOf(
+                            SortPrefs.ORDER to "Playlist order",
+                            SortPrefs.RECENT to "Recently added",
+                            SortPrefs.TITLE to "Title",
+                            SortPrefs.ARTIST to "Artist",
+                            SortPrefs.DURATION to "Duration"
+                        ),
+                        SortPrefs.ORDER
+                    ) { showPlaylist(p.id) }
+                )
                 val gen = generation
                 addRowsChunked(
-                    p.tracks, content,
-                    queueContext = p.tracks,
+                    displayTracks, content,
+                    queueContext = displayTracks,
                     contextLabel = "Playlist" to p.name,
-                    menuOverrideFor = { i -> { showPlaylistTrackMenu(p.id, p.tracks[i], i) } },
+                    menuOverrideFor = { i ->
+                        {
+                            showPlaylistTrackMenu(
+                                p.id, displayTracks[i], displayIndexed[i].index,
+                                sorted = sortMode != SortPrefs.ORDER
+                            )
+                        }
+                    },
                     alive = { gen == generation },
                     playHook = { mixPlaylistId = p.id }
                 )
@@ -11087,18 +11206,18 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun showPlaylistTrackMenu(playlistId: String, track: Track, index: Int) {
+    private fun showPlaylistTrackMenu(playlistId: String, track: Track, index: Int, sorted: Boolean = false) {
         val p = Playlists.get(this, playlistId) ?: return
         val items = mutableListOf<Pair<String, () -> Unit>>()
         items += "Play Next" to { playNextInsert(track) }
         items += "Add to Queue" to { appendToQueue(track) }
-        if (index > 0) {
+        if (!sorted && index > 0) {
             items += "Move Up" to {
                 Playlists.moveTrack(this, playlistId, index, index - 1)
                 showPlaylist(playlistId)
             }
         }
-        if (index < p.tracks.size - 1) {
+        if (!sorted && index < p.tracks.size - 1) {
             items += "Move Down" to {
                 Playlists.moveTrack(this, playlistId, index, index + 1)
                 showPlaylist(playlistId)
@@ -11540,10 +11659,24 @@ class MainActivity : Activity() {
                     downloadAllTracks(liked, "Liked Songs")
                 }
             )
+            val likedMode = SortPrefs.get(this, "liked", SortPrefs.RECENT)
+            val likedDisplay = sortTracksByMode(liked, likedMode)
+            content.addView(
+                sortRowView(
+                    "liked",
+                    listOf(
+                        SortPrefs.RECENT to "Recently liked",
+                        SortPrefs.TITLE to "Title",
+                        SortPrefs.ARTIST to "Artist",
+                        SortPrefs.DURATION to "Duration"
+                    ),
+                    SortPrefs.RECENT
+                ) { showLiked() }
+            )
             val gen = generation
             addRowsChunked(
-                liked, content,
-                queueContext = liked,
+                likedDisplay, content,
+                queueContext = likedDisplay,
                 contextLabel = "Playlist" to "Liked Songs",
                 alive = { gen == generation }
             )
@@ -11814,6 +11947,37 @@ class MainActivity : Activity() {
         if (visibleScreen == "Downloads") showDownloads()
     }
 
+    private fun sortRowView(
+        prefKey: String,
+        modes: List<Pair<String, String>>,
+        fallback: String,
+        rerender: () -> Unit
+    ): View {
+        val current = SortPrefs.get(this, prefKey, fallback)
+        val currentLabel = modes.firstOrNull { it.first == current }?.second ?: modes.first().second
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, dp(6))
+            rippleRect()
+            setOnClickListener {
+                showMenu(
+                    "Sort by",
+                    modes.map { (mode, modeLabel) ->
+                        (if (mode == current) "✓  " else "") + modeLabel to {
+                            SortPrefs.set(this@MainActivity, prefKey, mode)
+                            rerender()
+                        }
+                    }
+                )
+            }
+        }
+        row.addView(label("Sort", 14.5f, white50, mediumTf))
+        row.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        row.addView(label(currentLabel, 14.5f, accent, mediumTf))
+        return row
+    }
+
     private fun showDownloads() {
         navRoot("tab:downloads") { showDownloads() }
         if (restoreRoot("Downloads")) return
@@ -11846,8 +12010,25 @@ class MainActivity : Activity() {
             }
         }
         if (entries.isNotEmpty()) {
-            val list = entries.map { it.track }
+            val mode = SortPrefs.get(this, "downloads", SortPrefs.RECENT)
+            val recentFirst = entries.sortedByDescending { it.addedAt }.map { it.track }
+            val list = sortTracksByMode(recentFirst, mode)
             content.addView(sectionTitle("${list.size} downloaded"))
+            content.addView(
+                sortRowView(
+                    "downloads",
+                    listOf(
+                        SortPrefs.RECENT to "Recently added",
+                        SortPrefs.TITLE to "Title",
+                        SortPrefs.ARTIST to "Artist",
+                        SortPrefs.DURATION to "Duration"
+                    ),
+                    SortPrefs.RECENT
+                ) {
+                    retainedRoots.remove("Downloads")
+                    showDownloads()
+                }
+            )
             val gen = generation
             addRowsChunked(list, content, queueContext = list, alive = { gen == generation })
         }

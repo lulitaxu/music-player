@@ -216,6 +216,40 @@ object YoutubeSource {
         return SongSearchResult(songs, note)
     }
 
+    private val idShape = Regex("^[A-Za-z0-9_-]{6,20}$")
+
+    fun videoIdFromText(text: String): String? {
+        val t = text.trim()
+        if (idShape.matches(t)) return t
+        Regex("youtu\\.be/([A-Za-z0-9_-]{6,20})").find(t)?.let { return it.groupValues[1] }
+        val full = Regex(
+            "(?:youtube\\.com|youtube-nocookie\\.com)/(?:watch\\?[^\\s#]*?v=|shorts/|live/|embed/|v/)([A-Za-z0-9_-]{6,20})"
+        ).find(t)
+        return full?.groupValues?.get(1)
+    }
+
+    fun trackFromId(videoId: String): Track? {
+        if (!idShape.matches(videoId)) return null
+        ensureInit()
+        val extractor = ServiceList.YouTube.getStreamExtractor(
+            "https://www.youtube.com/watch?v=$videoId"
+        )
+        extractor.fetchPage()
+        val title = extractor.name?.takeIf { it.isNotBlank() } ?: return null
+        val thumbs = extractor.thumbnails
+        val small = thumbs.filter { it.height >= 100 }.minByOrNull { it.height * it.width }
+            ?: thumbs.maxByOrNull { it.height * it.width }
+        return Track(
+            id = videoId,
+            title = title,
+            artist = extractor.uploaderName ?: "",
+            duration = extractor.length.toInt().coerceAtLeast(0),
+            artworkSmall = small?.url,
+            artworkLarge = "https://i.ytimg.com/vi/$videoId/maxresdefault.jpg",
+            source = SOURCE_YOUTUBE
+        )
+    }
+
     /**
      * Resolves a direct audio stream URL for a video id from
      * NewPipeExtractor's progressive streams, steered by [quality]

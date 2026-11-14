@@ -21,7 +21,7 @@ import java.util.concurrent.Executors
  * [entries]/[localFile]/[isDownloaded] which are cheap index reads.
  */
 object Downloads {
-    data class Entry(val track: Track, val fileName: String)
+    data class Entry(val track: Track, val fileName: String, val addedAt: Long = 0L)
 
     /**
      * Vault state for a track that is NOT (yet) fully downloaded.
@@ -360,7 +360,8 @@ object Downloads {
                         o.optString("album", null)?.takeIf { it.isNotEmpty() },
                         o.optString("albumId", null)?.takeIf { it.isNotEmpty() }
                     ),
-                    storedName
+                    storedName,
+                    entryAddedAt(ctx, o, storedName)
                 )
             } catch (_: Exception) {
                 // Skip the bad item; the rest of the index stands.
@@ -368,6 +369,12 @@ object Downloads {
         }
         cache = parsed
         return parsed
+    }
+
+    private fun entryAddedAt(ctx: Context, o: JSONObject, fileName: String): Long {
+        val stored = o.optLong("addedAt", 0L)
+        if (stored > 0) return stored
+        return File(dir(ctx), fileName).lastModified()
     }
 
     fun localFile(ctx: Context, track: Track): File? {
@@ -713,7 +720,7 @@ object Downloads {
             tmp.copyTo(dest, overwrite = true)
             tmp.delete()
         }
-        val entry = Entry(track, fileName)
+        val entry = Entry(track, fileName, System.currentTimeMillis())
         // Atomic completion (0.6.11): with parallel transfers,
         // the read-modify-write of the index must not interleave
         // with another transfer completing in the same moment.
@@ -882,6 +889,7 @@ object Downloads {
                 put("album", e.track.album ?: JSONObject.NULL)
                 put("albumId", e.track.albumId ?: JSONObject.NULL)
                 put("fileName", e.fileName)
+                put("addedAt", e.addedAt)
             })
         }
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
