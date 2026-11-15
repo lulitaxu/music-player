@@ -662,6 +662,10 @@ def _local_track(path: Path) -> dict:
                     duration = int(w.getnframes() / w.getframerate()) or None
             except Exception:
                 pass
+    try:
+        added_at = path.stat().st_mtime
+    except Exception:
+        added_at = None
     return {
         "id": tid,
         "source": "local",
@@ -672,6 +676,7 @@ def _local_track(path: Path) -> dict:
         "duration_s": duration,
         "artwork": f"/local/art/{tid}" if has_art else None,
         "is_explicit": False,
+        "added_at": added_at,
     }
 
 

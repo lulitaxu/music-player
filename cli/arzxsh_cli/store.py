@@ -24,7 +24,8 @@ DEFAULTS = {
     # UI customization: accent preset name (see app.ACCENTS) and
     # the two list-badge toggles. Badges default ON — the
     # behavior the TUI shipped with.
-    "settings": {"accent": "green", "download_badges": True, "lyrics_badges": True},
+    "settings": {"accent": "green", "download_badges": True, "lyrics_badges": True,
+                 "sort_local": "recent", "sort_liked": "recent", "sort_playlist": "playlist"},
 }
 
 

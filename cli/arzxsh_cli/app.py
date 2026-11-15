@@ -33,6 +33,7 @@ from .backend import Backend
 from .engine import Engine
 from .links import extract_video_id
 from .lyrics import LyricsFetcher, active_index
+from .sorting import next_mode, sort_label, sort_tracks
 from .paths import runtime_dir
 from .store import EQ_FREQS, Store
 
@@ -217,6 +218,7 @@ class ArzxshApp(App):
         Binding("minus", "vol_down", "Vol-", show=False),
         Binding("s", "shuffle", "Shuffle", show=False),
         Binding("r", "repeat", "Repeat", show=False),
+        Binding("o", "cycle_sort", "Sort", show=False),
         Binding("l", "like", "Like", show=False),
         Binding("d", "download_focused", "Download", show=False),
         Binding("a", "add_to_playlist", "Add to playlist", show=False),
@@ -302,7 +304,7 @@ class ArzxshApp(App):
                 yield Button("Lyrics", id="btn-lyrics")
                 yield Button("Queue", id="btn-queue")
                 yield Static("", id="vol-label")
-        yield Static("↑↓/jk move · Enter play · space pause · n/p skip · ←/→ seek · l like · d download · a add to playlist · y lyrics · q queue · / search", id="helpbar")
+        yield Static("↑↓/jk move · Enter play · space pause · n/p skip · ←/→ seek · l like · d download · a add to playlist · y lyrics · q queue · / search · o sort", id="helpbar")
 
     async def on_mount(self):
         self._start_cava()
@@ -560,10 +562,12 @@ class ArzxshApp(App):
     async def show_liked(self, _rerun: bool = False):
         self._view = ("liked", {})
         likes = self.store.data["likes"]
-        widgets = [Static(f"[bold]Liked Songs[/bold]"), Static(f"{len(likes)} songs · stored on this machine only", classes="dim")]
+        mode = self.store.setting("sort_liked") or ""
+        widgets = [Static(f"[bold]Liked Songs[/bold]"), Static(f"{len(likes)} songs · stored on this machine only", classes="dim"),
+                   Static(f"Sort: {sort_label('liked', mode)} · press o to change", classes="dim")]
         if likes:
             widgets.append(Horizontal(Button("⬇ Download all", id="btn-liked-download-all")))
-            widgets.append(self._track_list(likes, "Liked Songs"))
+            widgets.append(self._track_list(sort_tracks(likes, "liked", mode), "Liked Songs"))
         else:
             widgets.append(Static("Press l on any song and it lands here.", classes="dim"))
         await self._set_content(widgets)
@@ -575,10 +579,12 @@ class ArzxshApp(App):
         except Exception:
             await self._set_content(self._error_widgets("Couldn't read the local library."))
             return
-        tracks = data.get("tracks", [])
+        mode = self.store.setting("sort_local") or ""
+        tracks = sort_tracks(data.get("tracks", []), "local", mode)
         widgets = [
             Static("[bold]On this device[/bold]"),
             Static(f"{len(tracks)} tracks · {esc(data.get('dir',''))}", classes="dim"),
+            Static(f"Sort: {sort_label('local', mode)} · press o to change", classes="dim"),
             Horizontal(
                 Button("↻ Rescan folder", id="btn-rescan"),
                 Button("Delete download", id="btn-local-delete"),
@@ -620,9 +626,11 @@ class ArzxshApp(App):
             await self.show_playlists()
             return
         pl = pls[index]
+        mode = self.store.setting("sort_playlist") or ""
         widgets = [
             Static(f"[bold]{esc(pl['name'])}[/bold]"),
             Static(f"{len(pl['tracks'])} songs", classes="dim"),
+            Static(f"Sort: {sort_label('playlist', mode)} · press o to change", classes="dim"),
             Horizontal(
                 Button("▶ Play all", id="btn-pl-playall"),
                 Button("⬇ Download all", id="btn-pl-download-all"),
@@ -633,7 +641,7 @@ class ArzxshApp(App):
         ]
         if pl["tracks"]:
             widgets.append(Static("Highlight a song, then press the Remove song button (or x) to take it out of this playlist.", classes="dim"))
-            widgets.append(self._track_list(pl["tracks"], pl["name"]))
+            widgets.append(self._track_list(sort_tracks(pl["tracks"], "playlist", mode), pl["name"]))
         else:
             widgets.append(Static("Empty. Press a on any track to add it here.", classes="dim"))
         await self._set_content(widgets)
@@ -961,7 +969,9 @@ class ArzxshApp(App):
             _, kw = self._view
             pls = self.store.data["playlists"]
             if self.engine and 0 <= kw.get("index", -1) < len(pls) and pls[kw["index"]]["tracks"]:
-                await self.engine.play_context(pls[kw["index"]]["tracks"], 0, pls[kw["index"]]["name"])
+                mode = self.store.setting("sort_playlist") or ""
+                tracks = sort_tracks(pls[kw["index"]]["tracks"], "playlist", mode)
+                await self.engine.play_context(tracks, 0, pls[kw["index"]]["name"])
         elif bid == "btn-pl-export":
             _, kw = self._view
             pls = self.store.data["playlists"]
@@ -1102,6 +1112,24 @@ class ArzxshApp(App):
             if isinstance(item, TrackItem):
                 return item.track
         return None
+
+    _SORT_VIEWS = {"local": ("sort_local", "local"),
+                   "liked": ("sort_liked", "liked"),
+                   "playlist_detail": ("sort_playlist", "playlist")}
+
+    def action_cycle_sort(self):
+        entry = self._SORT_VIEWS.get(self._view[0])
+        if not entry:
+            return
+        key, sort_view = entry
+        mode = next_mode(sort_view, self.store.setting(key) or "")
+        self.store.set_setting(key, mode)
+        self.notify(f"Sort: {sort_label(sort_view, mode)}")
+        coro = self._rerun_view()
+        try:
+            self.run_worker(coro, exclusive=True, group="rerun")
+        except RuntimeError:
+            coro.close()
 
     def action_like(self):
         track = self._focused_track() or (self.engine.current if self.engine else None)
