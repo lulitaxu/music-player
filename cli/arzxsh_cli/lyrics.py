@@ -52,10 +52,17 @@ def active_index(lines: list[tuple[float, str]], pos: float) -> int:
 
 
 class LyricsFetcher:
-    def __init__(self, backend, store_dir: Path | None = None):
+    def __init__(self, backend, store_dir: Path | None = None, id_resolver=None):
         self.backend = backend
         self._cache: dict[str, dict] = {}
         self._dir = Path(store_dir) if store_dir is not None else lyrics_dir()
+        self._resolve = id_resolver or (lambda tid: tid)
+
+    def _key(self, track_id: str) -> str:
+        try:
+            return self._resolve(track_id) or track_id
+        except Exception:
+            return track_id
 
     # -- on-disk store -------------------------------------------------
     def _disk_path(self, key: str) -> Path:
@@ -125,6 +132,7 @@ class LyricsFetcher:
         network, safe to call per row."""
         if not track_id:
             return False
+        track_id = self._key(track_id)
         hit = self._cache.get(track_id)
         if hit and (hit.get("synced") or hit.get("plain")):
             return True
@@ -137,7 +145,7 @@ class LyricsFetcher:
         LRCLIB by metadata (local files included: their tags
         carry artist/title); only the backend fallback is
         stream-only, since it is keyed to a YouTube video id."""
-        key = track.get("id", "")
+        key = self._key(track.get("id", ""))
         if key in self._cache:
             return self._cache[key]
         if key:

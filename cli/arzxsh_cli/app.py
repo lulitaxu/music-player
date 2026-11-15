@@ -235,7 +235,7 @@ class ArzxshApp(App):
         super().__init__()
         self.store = Store()
         self.backend = Backend()
-        self.lyrics_fetcher = LyricsFetcher(self.backend)
+        self.lyrics_fetcher = LyricsFetcher(self.backend, id_resolver=self.store.canonical_id)
         # One registered theme per accent preset: the CSS speaks
         # only in theme variables ($accent, $background, $surface,
         # $panel), so switching the theme recolors the whole TUI

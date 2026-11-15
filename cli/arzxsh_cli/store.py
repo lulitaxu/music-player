@@ -120,6 +120,15 @@ class Store:
         self.data["downloads"][video_id] = local_id
         self.save()
 
+    def canonical_id(self, track_id: str) -> str:
+        dl = self.data["downloads"]
+        if track_id in dl:
+            return track_id
+        for vid, lid in dl.items():
+            if lid == track_id:
+                return vid
+        return track_id
+
     # -- playlists ----------------------------------------------------
     def create_playlist(self, name: str, tracks: list[dict]) -> dict:
         pl = {"name": name.strip() or "Untitled", "tracks": list(tracks)}
