@@ -31,6 +31,7 @@ from textual.widgets import (Button, Input, Label, ListItem, ListView,
 from .art import art_for
 from .backend import Backend
 from .engine import Engine
+from .links import extract_video_id
 from .lyrics import LyricsFetcher, active_index
 from .paths import runtime_dir
 from .store import EQ_FREQS, Store
@@ -452,6 +453,19 @@ class ArzxshApp(App):
         self.store.add_history(q)
         box = self.query_one("#search-results", Vertical)
         await box.remove_children()
+        video_id = extract_video_id(q)
+        if video_id:
+            await box.mount(Static("Opening link…"))
+            try:
+                song = await self.backend.song(video_id)
+            except Exception:
+                await box.remove_children()
+                await box.mount(Static("[red]Couldn't open that link. Check the link and try again.[/red]"))
+                return
+            await box.remove_children()
+            await box.mount(Static("YouTube link", classes="section"))
+            await box.mount(self._track_list([song], "YouTube link"))
+            return
         await box.mount(Static("Searching…"))
         try:
             songs, artists, albums = await asyncio.gather(

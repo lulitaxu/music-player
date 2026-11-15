@@ -83,7 +83,7 @@ _CSP = (
 # Coarse budget for the routes that shell out to yt-dlp / upstream
 # fetches: generous for one interactive user, useless for a loop.
 _EXPENSIVE_PREFIXES = ("/search", "/stream", "/audio", "/download",
-                       "/radio", "/artist", "/album", "/playlist", "/lyrics")
+                       "/radio", "/artist", "/album", "/playlist", "/lyrics", "/song")
 _RATE_LIMIT = 120  # requests per minute across the expensive routes
 _rate_state: dict[str, float] = {}
 _rate_count = 0
@@ -385,6 +385,51 @@ def radio(video_id: str):
         return cached(f"radio:{video_id}", 300, run)
     except Exception as e:
         raise HTTPException(502, f"radio failed: {e.__class__.__name__}")
+
+
+_VIDEO_ID_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+
+
+@app.get("/song/{video_id}")
+def song(video_id: str):
+    if not (6 <= len(video_id) <= 20
+            and all(c in _VIDEO_ID_CHARS for c in video_id)):
+        raise HTTPException(404, "video not found")
+
+    def run():
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+        }
+        if os.environ.get("YTM_DL_NO_VERIFY") == "1":
+            opts["nocheckcertificate"] = True
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(
+                f"https://www.youtube.com/watch?v={quote(video_id)}",
+                download=False,
+            )
+        thumbs = info.get("thumbnails") or []
+        art = info.get("thumbnail") or (thumbs[-1]["url"] if thumbs else None)
+        return {
+            "id": video_id,
+            "source": "link",
+            "title": info.get("title") or "",
+            "artist": info.get("uploader") or info.get("channel") or "",
+            "artist_id": info.get("channel_id"),
+            "album": None,
+            "duration_s": info.get("duration"),
+            "artwork": art,
+            "is_explicit": False,
+        }
+
+    try:
+        return cached(f"song:{video_id}", 3600, run)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"song failed: {e.__class__.__name__}")
 
 
 def _resolve_stream(video_id: str) -> dict:

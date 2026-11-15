@@ -72,6 +72,9 @@ class Backend:
     async def playlist(self, playlist_id: str) -> dict:
         return await self._get(f"/playlist/{_q(playlist_id)}")
 
+    async def song(self, video_id: str) -> dict:
+        return await self._get(f"/song/{_q(video_id)}")
+
     async def backend_lyrics(self, video_id: str) -> dict:
         return await self._get(f"/lyrics/{_q(video_id)}")
 

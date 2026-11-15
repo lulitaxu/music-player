@@ -145,6 +145,8 @@ class LyricsFetcher:
         LRCLIB by metadata (local files included: their tags
         carry artist/title); only the backend fallback is
         stream-only, since it is keyed to a YouTube video id."""
+        if track.get("source") == "link":
+            return {"synced": [], "plain": None, "source": ""}
         key = self._key(track.get("id", ""))
         if key in self._cache:
             return self._cache[key]
