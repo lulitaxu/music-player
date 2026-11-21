@@ -356,7 +356,13 @@ object UpdateChecker {
             } catch (_: Exception) {
                 null
             }
-            if (enriched != null && enriched.versionName == rel.versionName) return enriched
+            if (enriched != null && enriched.versionName == rel.versionName) {
+                return if (enriched.sha256 == null && rel.sha256 != null) {
+                    enriched.copy(sha256 = rel.sha256)
+                } else {
+                    enriched
+                }
+            }
             verifyApkReachable(rel.apkUrl)
         }
         return rel

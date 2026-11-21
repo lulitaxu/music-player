@@ -4131,8 +4131,8 @@ class MainActivity : Activity() {
         browseBox.addView(historyBox)
         browseBox.addView(
             settingsRow(
-                "Open a YouTube Link",
-                "Play or download any YouTube video as audio, even if it is not on YouTube Music",
+                "Open a Video Link",
+                "Play or download a pasted video link as audio",
                 iconRes = R.drawable.ic_share
             ) { openLinkFromClipboard() }
         )
@@ -4864,8 +4864,8 @@ class MainActivity : Activity() {
         content.addView(label("Version $ver", 15.5f, Color.WHITE))
         for (line in listOf(
             "arzxsh by Arafat Arzu",
-            "Sources · YouTube Music · Audius · On-device files",
-            "Lyrics · LRCLIB / lyrics.ovh when available",
+            "Sources · Streaming · Downloads · On-device files",
+            "Lyrics · Synced and plain, when available",
             "No DRM bypass, ever."
         )) {
             val lv = label(line, 15.5f, white50)
@@ -8944,7 +8944,8 @@ class MainActivity : Activity() {
                 val existing = queue.map { "${it.source}_${it.id}" }.toHashSet()
                 val fresh = more.filterNot { "${it.source}_${it.id}" in existing }
                 if (err != null) {
-                    Toast.makeText(this@MainActivity, "Autoplay unavailable: $err", Toast.LENGTH_LONG).show()
+                    android.util.Log.e("Autoplay", "unavailable: $err")
+                    Toast.makeText(this@MainActivity, "Autoplay unavailable right now.", Toast.LENGTH_LONG).show()
                     refreshPlaybackUi()
                     return@runOnUiThread
                 }
@@ -9057,7 +9058,8 @@ class MainActivity : Activity() {
             runOnUiThread {
                 if (token != playToken) return@runOnUiThread
                 if (err != null) {
-                    Toast.makeText(this@MainActivity, "Radio unavailable: $err", Toast.LENGTH_LONG).show()
+                    android.util.Log.e("Radio", "unavailable: $err")
+                    Toast.makeText(this@MainActivity, "Radio unavailable right now.", Toast.LENGTH_LONG).show()
                     return@runOnUiThread
                 }
                 val rest = list.filterNot { it.id == seed.id && it.source == seed.source }
