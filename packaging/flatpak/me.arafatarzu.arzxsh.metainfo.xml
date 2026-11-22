@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>me.arafatarzu.arzxsh</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>arzxsh</name>
+  <summary>Music player with synced lyrics, crossfade and offline downloads</summary>
+  <description>
+    <p>
+      arzxsh is a music player built for listening without friction. Search a
+      huge streaming catalog, play instantly, and keep your library, liked
+      songs and downloads on your own machine.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Synced lyrics that follow the song line by line, with the accent color taken from the artwork</li>
+      <li>Gapless playback with a smooth crossfade between tracks, and radio that continues when a queue ends</li>
+      <li>Home with a time-aware greeting, trending songs and top artists</li>
+      <li>Artist and album pages, liked songs, recently played and search history</li>
+      <li>Offline downloads saved into your Music folder, plus playback of your local music files</li>
+      <li>Live visualizer and media-key support</li>
+    </ul>
+    <p>
+      Everything runs locally: the catalog service binds to your own machine
+      only, there are no accounts, and nothing about your listening is sent
+      anywhere else.
+    </p>
+  </description>
+  <developer_name>Arafat Arzu</developer_name>
+  <launchable type="desktop-id">me.arafatarzu.arzxsh.desktop</launchable>
+  <provides>
+    <binary>arzxsh</binary>
+  </provides>
+  <url type="homepage">https://github.com/lulitaxu/music-player</url>
+  <url type="bugtracker">https://github.com/lulitaxu/music-player/issues</url>
+  <content_rating type="oars-1.1">
+    <content_attribute id="violence-cartoon">none</content_attribute>
+    <content_attribute id="violence-fantasy">none</content_attribute>
+    <content_attribute id="violence-realistic">none</content_attribute>
+    <content_attribute id="violence-bloodshed">none</content_attribute>
+    <content_attribute id="drugs-alcohol">none</content_attribute>
+    <content_attribute id="drugs-narcotics">none</content_attribute>
+    <content_attribute id="drugs-tobacco">none</content_attribute>
+    <content_attribute id="sex-nudity">none</content_attribute>
+    <content_attribute id="sex-themes">none</content_attribute>
+    <content_attribute id="language-profanity">none</content_attribute>
+    <content_attribute id="language-humor">none</content_attribute>
+    <content_attribute id="language-discrimination">none</content_attribute>
+    <content_attribute id="money-gambling">none</content_attribute>
+    <content_attribute id="money-purchasing">none</content_attribute>
+    <content_attribute id="social-chat">none</content_attribute>
+    <content_attribute id="social-info">none</content_attribute>
+    <content_attribute id="social-audio">none</content_attribute>
+    <content_attribute id="social-location">none</content_attribute>
+    <content_attribute id="social-contacts">none</content_attribute>
+  </content_rating>
+  <releases>
+    <release version="0.6.23" date="2026-11-22">
+      <description>
+        <p>Synced lyrics, artwork-accent Now Playing, and the first desktop release.</p>
+      </description>
+    </release>
+  </releases>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Player</category>
+  </categories>
+  <keywords>
+    <keyword>music</keyword>
+    <keyword>player</keyword>
+    <keyword>lyrics</keyword>
+    <keyword>stream</keyword>
+  </keywords>
+</component>

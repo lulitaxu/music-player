@@ -658,6 +658,7 @@ decks.forEach((deck) => {
     const el = deck.el;
     if (!el.duration) return;
     syncSeek(el.currentTime, el.duration);
+    updateLyricsSync(el.currentTime);
     const remaining = el.duration - el.currentTime;
     // Preload the next track into the idle deck.
     if (remaining <= 45 && remaining > CROSSFADE_S + 1) {
@@ -758,6 +759,12 @@ function onTrackChanged(track) {
   $("#npBackdrop").style.backgroundImage =
     track.artwork && /^https:\/\//.test(track.artwork) ? cssUrl(track.artwork) : "";
   $("#npContext").textContent = player.contextName || "Now Playing";
+  applyArtworkAccent(track);
+  const npLeft = document.querySelector(".np-left");
+  npLeft.classList.remove("np-swap");
+  void npLeft.offsetWidth;
+  npLeft.classList.add("np-swap");
+  setTimeout(() => npLeft.classList.remove("np-swap"), 220);
   syncPlayButtons();
   syncHeartStates();
   syncNpDownload();
@@ -820,13 +827,24 @@ if (navigator.mediaSession) {
 }
 
 /* ---------------- Now Playing panels ---------------- */
+let npCloseTimer = null;
 function openNp(showQueue = false) {
   if (!player.current) return;
-  $("#nowPlaying").classList.remove("hidden");
+  clearTimeout(npCloseTimer);
+  const np = $("#nowPlaying");
+  np.classList.remove("hidden");
+  void np.offsetWidth; // start the enter transition from the pre-visible state
+  np.classList.add("np-visible");
   if (showQueue) { $("#queueCard").classList.remove("hidden"); $("#npQueueBtn").classList.add("on"); }
   renderQueue();
+  updateLyricsSync(activeDeck.el.currentTime || 0, true);
 }
-function closeNp() { $("#nowPlaying").classList.add("hidden"); }
+function closeNp() {
+  const np = $("#nowPlaying");
+  np.classList.remove("np-visible");
+  clearTimeout(npCloseTimer);
+  npCloseTimer = setTimeout(() => np.classList.add("hidden"), 300);
+}
 $("#expandBtn").onclick = () => openNp(false);
 $("#playerTrack").onclick = () => openNp(false);
 $("#queueBtn").onclick = () => openNp(true);
@@ -878,13 +896,130 @@ async function loadAbout(track) {
   } catch { if (aboutKey === id) card.classList.add("hidden"); }
 }
 
-/* Lyrics — plain text via the backend (ytmusicapi). */
+/* Artwork accent — Now Playing takes its tint from the current
+   cover, the way the phone app does: the value lands in the
+   --np-accent custom property (registered in CSS so it crossfades
+   between tracks). Sampling runs on a small canvas; artwork is
+   same-origin (local art endpoint) or CORS-enabled
+   (googleusercontent). Any failure keeps the previous accent. */
+const accentCache = new Map();
+let accentTrackId = null;
+function applyArtworkAccent(track) {
+  accentTrackId = track.id;
+  const np = $("#nowPlaying");
+  if (!track.artwork) { np.style.removeProperty("--np-accent"); return; }
+  if (accentCache.has(track.id)) {
+    np.style.setProperty("--np-accent", accentCache.get(track.id));
+    return;
+  }
+  const img = new Image();
+  img.crossOrigin = "anonymous";
+  img.onload = () => {
+    let rgb = null;
+    try { rgb = sampleAccent(img); } catch { rgb = null; }
+    if (!rgb) return;
+    accentCache.set(track.id, rgb);
+    if (accentTrackId === track.id) np.style.setProperty("--np-accent", rgb);
+  };
+  img.onerror = () => {};
+  img.src = track.artwork;
+}
+function sampleAccent(img) {
+  const S = 28;
+  const cv = document.createElement("canvas");
+  cv.width = S; cv.height = S;
+  const ctx = cv.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, S, S);
+  const data = ctx.getImageData(0, 0, S, S).data;
+  const buckets = new Map();
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    if (data[i + 3] < 200) continue;
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    if (mx < 40 || mx > 245 || mx - mn < 28) continue; // near-black, near-white, grey
+    const key = `${Math.round(r / 32)}-${Math.round(g / 32)}-${Math.round(b / 32)}`;
+    const w = (mx - mn) * (1 - Math.abs(mx - 150) / 300);
+    const cur = buckets.get(key) || { r: 0, g: 0, b: 0, w: 0 };
+    cur.r += r * w; cur.g += g * w; cur.b += b * w; cur.w += w;
+    buckets.set(key, cur);
+  }
+  let best = null;
+  buckets.forEach((v) => { if (!best || v.w > best.w) best = v; });
+  if (!best || !best.w) return null;
+  let r = best.r / best.w, g = best.g / best.w, b = best.b / best.w;
+  const mean = (r + g + b) / 3; // saturation push, then lift the peak
+  r = mean + (r - mean) * 1.35; g = mean + (g - mean) * 1.35; b = mean + (b - mean) * 1.35;
+  const peak = Math.max(r, g, b);
+  if (peak > 0) { const lift = 212 / peak; r *= lift; g *= lift; b *= lift; }
+  const clamp = (v) => Math.max(0, Math.min(255, Math.round(v)));
+  return `rgb(${clamp(r)}, ${clamp(g)}, ${clamp(b)})`;
+}
+
+/* Lyrics — synced lines when a source has timestamps (LRCLIB or
+   the backend's timed ytmusicapi page), plain text otherwise.
+   The sync view follows the active deck's currentTime from the
+   same timeupdate hook that drives the seek bar; clicking a line
+   seeks to it. */
 const lyricsCache = new Map();
 let lyricsTrackId = null;
+const syncState = { lines: [], els: [], active: -1, trackId: null };
 function resetLyrics(track) {
   lyricsTrackId = track.id;
+  clearSyncedLyrics();
   $("#lyricsCard").classList.add("hidden");
   $("#lyricsBtn").classList.remove("on");
+}
+function clearSyncedLyrics() {
+  syncState.lines = [];
+  syncState.els = [];
+  syncState.active = -1;
+  syncState.trackId = null;
+  const box = $("#lyricsSync");
+  box.classList.add("hidden");
+  const inner = $("#lyricsSyncInner");
+  inner.innerHTML = "";
+  inner.style.transform = "";
+  $("#lyricsText").classList.remove("hidden");
+}
+function showPlainLyrics(text) {
+  clearSyncedLyrics();
+  $("#lyricsText").textContent = text;
+}
+function buildSyncedLyrics(lines) {
+  clearSyncedLyrics();
+  syncState.lines = lines;
+  syncState.trackId = lyricsTrackId;
+  const inner = $("#lyricsSyncInner");
+  inner.innerHTML = lines.map((l, i) =>
+    `<div class="sync-line" data-li="${i}">${esc(l.text)}</div>`).join("");
+  syncState.els = [...inner.children];
+  syncState.els.forEach((el, i) => el.addEventListener("click", () => {
+    activeDeck.el.currentTime = lines[i].t;
+    updateLyricsSync(lines[i].t, true);
+  }));
+  $("#lyricsText").classList.add("hidden");
+  $("#lyricsSync").classList.remove("hidden");
+  updateLyricsSync(activeDeck.el.currentTime || 0, true);
+}
+function updateLyricsSync(now, force = false) {
+  const lines = syncState.lines;
+  if (!lines.length || syncState.trackId !== lyricsTrackId) return;
+  let idx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].t <= now + 0.05) idx = i; else break;
+  }
+  if (idx === syncState.active && !force) return;
+  syncState.active = idx;
+  syncState.els.forEach((el, i) => {
+    el.classList.toggle("active", i === idx);
+    el.classList.toggle("passed", idx >= 0 && i < idx);
+  });
+  const box = $("#lyricsSync");
+  const el = syncState.els[Math.max(0, idx)];
+  if (el && box.clientHeight) {
+    const y = box.clientHeight / 2 - (el.offsetTop + el.offsetHeight / 2);
+    $("#lyricsSyncInner").style.transform = `translateY(${y}px)`;
+  }
 }
 $("#npDownload").onclick = () => {
   if (player.current && player.current.source !== "local" && !downloads[player.current.id]) doDownload(player.current);
@@ -895,7 +1030,7 @@ $("#lyricsBtn").onclick = async () => {
     const card = $("#lyricsCard");
     card.classList.remove("hidden");
     $("#lyricsBtn").classList.add("on");
-    $("#lyricsText").textContent = "Lyrics are not available for local files.";
+    showPlainLyrics("Lyrics are not available for local files.");
     $("#lyricsSource").textContent = "";
     return;
   }
@@ -906,18 +1041,19 @@ $("#lyricsBtn").onclick = async () => {
   if (!show || !player.current) return;
   const id = player.current.id;
   if (lyricsCache.has(id)) { fillLyrics(lyricsCache.get(id)); return; }
-  $("#lyricsText").textContent = "Loading…";
+  showPlainLyrics("Loading…");
   $("#lyricsSource").textContent = "";
   try {
     const r = await api(`/lyrics/${encodeURIComponent(id)}`);
     lyricsCache.set(id, r);
     if (lyricsTrackId === id) fillLyrics(r);
   } catch {
-    if (lyricsTrackId === id) { $("#lyricsText").textContent = "Lyrics could not be loaded."; }
+    if (lyricsTrackId === id) showPlainLyrics("Lyrics could not be loaded.");
   }
 };
 function fillLyrics(r) {
-  $("#lyricsText").textContent = r.lyrics || "No lyrics found for this track.";
+  if (r.synced && r.synced.length) buildSyncedLyrics(r.synced);
+  else showPlainLyrics(r.lyrics || "No lyrics found for this track.");
   $("#lyricsSource").textContent = r.source ? `Source: ${r.source}` : "";
 }
 

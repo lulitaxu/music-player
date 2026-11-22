@@ -534,23 +534,169 @@ def audio(video_id: str, request: Request):
     )
 
 
+_LRCLIB_UA = "arzxsh-backend/0.1.0 (https://github.com/lulitaxu/music-player)"
+
+
+def _parse_lrc(text: str | None) -> list[dict] | None:
+    """LRC text -> [{"t": seconds, "text": line}], sorted by time.
+    A line may carry several stamps (repeated chorus); each stamp
+    gets its own entry. Stamp-only / metadata lines are dropped.
+    The pattern compiles per call: `re` is imported further down
+    this module (local-library section), so a module-level compile
+    here would run before that import."""
+    if not text:
+        return None
+    stamp = re.compile(r"\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]")
+    out: list[dict] = []
+    for raw in text.splitlines():
+        stamps = stamp.findall(raw)
+        if not stamps:
+            continue
+        line = stamp.sub("", raw).strip()
+        if not line:
+            continue
+        for minutes, seconds, frac in stamps:
+            t = int(minutes) * 60 + int(seconds)
+            if frac:
+                t += int(frac) / (10 ** len(frac))
+            out.append({"t": round(t, 3), "text": line})
+    if not out:
+        return None
+    out.sort(key=lambda item: item["t"])
+    return out
+
+
+def _watch_track_meta(watch: dict) -> tuple[str, str, int | None]:
+    """(title, artist, duration_s) for the watch playlist's first
+    track: the lookup keys LRCLIB matches on. The watch parser
+    carries duration as a "M:SS" length string, not seconds."""
+    items = watch.get("tracks") or []
+    if not items:
+        return "", "", None
+    first = items[0] or {}
+    title = first.get("title") or ""
+    artists = first.get("artists") or []
+    artist = artists[0].get("name", "") if artists else ""
+    duration = None
+    length = first.get("length")
+    if isinstance(length, str) and length:
+        try:
+            parts = [int(p) for p in length.split(":")]
+            duration = 0
+            for p in parts:
+                duration = duration * 60 + p
+        except ValueError:
+            duration = None
+    if duration is None and isinstance(first.get("duration_seconds"), int):
+        duration = first["duration_seconds"]
+    return title, artist, duration
+
+
+def _lrclib_lookup(title: str, artist: str, duration: int | None) -> dict | None:
+    """LRCLIB (no key, public LRC database). Returns
+    {"synced": [...] | None, "plain": str | None} on a hit, None on
+    a miss or any failure: LRCLIB is an enhancement, never a hard
+    dependency of the lyrics endpoint."""
+    if not title or not artist:
+        return None
+    params = {"track_name": title, "artist_name": artist}
+    if duration:
+        params["duration"] = duration
+    try:
+        resp = requests.get(
+            "https://lrclib.net/api/get", params=params,
+            headers={"User-Agent": _LRCLIB_UA}, timeout=6,
+        )
+    except Exception:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("instrumental"):
+        return None
+    return {
+        "synced": _parse_lrc(data.get("syncedLyrics")),
+        "plain": data.get("plainLyrics"),
+    }
+
+
+def _timed_page_synced(page) -> list[dict] | None:
+    """ytmusicapi timed lyrics -> [{"t": seconds, "text": line}].
+    LyricLine start_time is milliseconds; when the timed page has
+    no timestamps after all, its lyrics field is a plain string
+    and this returns None."""
+    if not page:
+        return None
+    items = page.get("lyrics")
+    if not isinstance(items, list):
+        return None
+    out: list[dict] = []
+    for item in items:
+        if isinstance(item, dict):
+            text, start = item.get("text"), item.get("start_time")
+        else:
+            text = getattr(item, "text", None)
+            start = getattr(item, "start_time", None)
+        if text is None or start is None:
+            continue
+        text = str(text).strip()
+        if not text:
+            continue
+        out.append({"t": round(float(start) / 1000.0, 3), "text": text})
+    if not out:
+        return None
+    out.sort(key=lambda item: item["t"])
+    return out
+
+
 @app.get("/lyrics/{video_id}")
 def lyrics(video_id: str):
-    """Plain-text lyrics via the watch playlist's lyrics page
-    (ytmusicapi). Not every track has lyrics; an empty result is a
-    normal 200 with null lyrics, not an error."""
+    """Lyrics via the watch playlist's lyrics page (ytmusicapi),
+    plus synced (timestamped) lines where a source has them:
+    LRCLIB first (matched on the watch track's title / artist /
+    duration), then ytmusicapi's own timed page. Not every track
+    has lyrics; an empty result is a normal 200 with null lyrics,
+    not an error. The "lyrics" / "source" fields keep their
+    original meaning (the CLI renders them); "synced" is the
+    additive field the web player's karaoke view consumes."""
 
     def run():
         watch = ytm.get_watch_playlist(videoId=video_id, limit=1)
         browse_id = watch.get("lyrics")
+        title, artist, duration = _watch_track_meta(watch)
+
+        lrclib = _lrclib_lookup(title, artist, duration)
+        if lrclib and lrclib["synced"]:
+            plain = lrclib["plain"]
+            source = "LRCLIB"
+            if plain is None and browse_id:
+                page = ytm.get_lyrics(browse_id, timestamps=False)
+                plain = page.get("lyrics")
+            return {"id": video_id, "lyrics": plain, "source": source,
+                    "synced": lrclib["synced"]}
+
         if not browse_id:
-            return {"id": video_id, "lyrics": None, "source": None}
+            if lrclib and lrclib["plain"]:
+                return {"id": video_id, "lyrics": lrclib["plain"],
+                        "source": "LRCLIB", "synced": None}
+            return {"id": video_id, "lyrics": None, "source": None,
+                    "synced": None}
+
+        synced = None
+        try:
+            synced = _timed_page_synced(ytm.get_lyrics(browse_id, timestamps=True))
+        except Exception:
+            synced = None
         page = ytm.get_lyrics(browse_id, timestamps=False)
-        return {
-            "id": video_id,
-            "lyrics": page.get("lyrics"),
-            "source": page.get("source"),
-        }
+        plain = page.get("lyrics")
+        source = page.get("source")
+        if plain is None and lrclib and lrclib["plain"]:
+            plain, source = lrclib["plain"], "LRCLIB"
+        return {"id": video_id, "lyrics": plain, "source": source,
+                "synced": synced}
 
     try:
         return cached(f"lyrics:{video_id}", 3600, run)

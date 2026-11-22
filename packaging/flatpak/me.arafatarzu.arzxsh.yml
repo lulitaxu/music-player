@@ -1,0 +1,31 @@
+id: me.arafatarzu.arzxsh
+runtime: org.gnome.Platform
+runtime-version: '47'
+sdk: org.gnome.Sdk
+command: arzxsh
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --socket=pulseaudio
+  - --share=network
+  - --filesystem=xdg-music
+cleanup:
+  - '*.la'
+  - '*.a'
+modules:
+  - python3-backend-deps.json
+  - name: arzxsh
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 packaging/flatpak/arzxsh.sh /app/bin/arzxsh
+      - install -Dm644 ytmusic-backend/app.py /app/share/arzxsh/ytmusic-backend/app.py
+      - cp -r linux/app /app/share/arzxsh/linux/app
+      - install -Dm644 linux/shell/arzxsh_shell.py /app/share/arzxsh/shell/arzxsh_shell.py
+      - install -Dm644 packaging/flatpak/me.arafatarzu.arzxsh.desktop /app/share/applications/me.arafatarzu.arzxsh.desktop
+      - install -Dm644 packaging/flatpak/me.arafatarzu.arzxsh.metainfo.xml /app/share/metainfo/me.arafatarzu.arzxsh.metainfo.xml
+      - install -Dm644 packaging/flatpak/me.arafatarzu.arzxsh.svg /app/share/icons/hicolor/scalable/apps/me.arafatarzu.arzxsh.svg
+    sources:
+      - type: dir
+        path: ../..

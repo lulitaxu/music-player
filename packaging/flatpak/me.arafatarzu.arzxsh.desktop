@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=arzxsh
+GenericName=Music Player
+Comment=Music player with synced lyrics, crossfade and offline downloads
+Exec=arzxsh
+Icon=me.arafatarzu.arzxsh
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=music;player;lyrics;stream;
+StartupWMClass=me.arafatarzu.arzxsh

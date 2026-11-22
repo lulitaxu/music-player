@@ -215,7 +215,25 @@ input[type="range"]::-moz-range-thumb { width: 12px; height: 12px; border-radius
 #vizMini { opacity: 0.9; }
 
 /* ---------- now playing ---------- */
-#nowPlaying { position: fixed; inset: 0; z-index: 100; background: #060606; overflow-y: auto; }
+/* Registered so the artwork accent crossfades between tracks
+   instead of snapping (unregistered custom properties do not
+   transition). Falls back to an instant switch where @property
+   is unsupported. */
+@property --np-accent {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #fc3c44;
+}
+#nowPlaying {
+  position: fixed; inset: 0; z-index: 100; overflow-y: auto;
+  --np-accent: #fc3c44;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--np-accent) 16%, transparent), rgba(6, 6, 6, 0) 46%),
+    #060606;
+  opacity: 0; transform: translateY(16px);
+  transition: opacity 0.3s ease, transform 0.3s ease, --np-accent 0.9s ease;
+}
+#nowPlaying.np-visible { opacity: 1; transform: none; }
 #npBackdrop {
   position: fixed; inset: 0; background-size: cover; background-position: center;
   filter: blur(70px) brightness(0.5) saturate(1.3); transform: scale(1.3); z-index: -1;
@@ -225,7 +243,12 @@ input[type="range"]::-moz-range-thumb { width: 12px; height: 12px; border-radius
 .np-context { flex: 1; text-align: center; color: var(--text55); font-size: 13px; font-weight: 650; letter-spacing: 0.06em; text-transform: uppercase; }
 .np-head-spacer { width: 32px; }
 .np-grid { display: grid; grid-template-columns: minmax(340px, 520px) 1fr; gap: 44px; margin-top: 18px; }
-.np-left img#npArt { width: 100%; aspect-ratio: 1; border-radius: var(--radius); object-fit: cover; box-shadow: 0 30px 80px rgba(0,0,0,0.6); }
+.np-left { transition: opacity 0.22s ease, transform 0.22s ease; }
+.np-left.np-swap { opacity: 0.2; transform: translateY(8px); }
+.np-left img#npArt {
+  width: 100%; aspect-ratio: 1; border-radius: var(--radius); object-fit: cover;
+  box-shadow: 0 30px 80px rgba(0,0,0,0.6), 0 18px 70px -18px var(--np-accent);
+}
 #npTitle { font-size: 25px; font-weight: 800; letter-spacing: -0.4px; margin-top: 20px; line-height: 1.2; }
 #npArtist { font-size: 16.5px; color: var(--text55); margin-top: 3px; }
 #viz { width: 100%; height: 64px; margin-top: 14px; }
@@ -253,6 +276,27 @@ input[type="range"]::-moz-range-thumb { width: 12px; height: 12px; border-radius
 #lyricsText {
   font-family: inherit; font-size: 15px; line-height: 1.65; white-space: pre-wrap;
   color: rgba(255,255,255,0.88); max-height: 420px; overflow-y: auto;
+}
+/* Synced lyrics: a masked viewport; the inner column is moved
+   with a transform so the active line stays centered and the
+   motion is one smooth glide, never a scroll jump. */
+#lyricsSync {
+  height: min(420px, 52vh); overflow: hidden; position: relative;
+  -webkit-mask-image: linear-gradient(180deg, transparent, #000 16%, #000 84%, transparent);
+  mask-image: linear-gradient(180deg, transparent, #000 16%, #000 84%, transparent);
+}
+#lyricsSyncInner { transition: transform 0.55s cubic-bezier(0.25, 0.8, 0.3, 1); will-change: transform; }
+.sync-line {
+  font-size: 17.5px; font-weight: 650; line-height: 1.45;
+  padding: 6px 2px; color: rgba(255, 255, 255, 0.38);
+  cursor: pointer; border-radius: 6px;
+  transition: color 0.35s ease, text-shadow 0.35s ease;
+}
+.sync-line:hover { color: rgba(255, 255, 255, 0.78); }
+.sync-line.passed { color: rgba(255, 255, 255, 0.55); }
+.sync-line.active {
+  color: var(--np-accent);
+  text-shadow: 0 0 24px color-mix(in srgb, var(--np-accent) 65%, transparent);
 }
 .queue-row {
   display: flex; align-items: center; gap: 12px; width: 100%; text-align: left;
