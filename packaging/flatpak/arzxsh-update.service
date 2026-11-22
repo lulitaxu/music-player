@@ -1,0 +1,6 @@
+[Unit]
+Description=Rebuild and update the local arzxsh Flatpak
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash %h/music-player/packaging/flatpak/update-local.sh
