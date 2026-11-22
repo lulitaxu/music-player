@@ -68,6 +68,23 @@ per-arch cp312 manylinux wheels (x86_64 + aarch64, `only-arches`), so
 the Flathub build needs no Rust or C compilation at all. If you
 regenerate the file, re-apply that swap.
 
+## Staying up to date
+
+A local build never updates itself. Two ways to keep it current:
+
+- By hand, one command: `./packaging/flatpak/update-local.sh`
+  (pulls the repo, rebuilds, reinstalls; the build cache is reused,
+  so repeat runs are fast).
+- Automatically: copy `arzxsh-update.service` and
+  `arzxsh-update.timer` to `~/.config/systemd/user/`, then
+  `systemctl --user enable --now arzxsh-update.timer`. It rebuilds
+  weekly and catches up after the machine was off. The service
+  assumes the clone lives at `~/music-player`; edit its ExecStart
+  path if yours is elsewhere.
+
+Once arzxsh is on Flathub this stops mattering: `flatpak update`
+(and Discover's auto-update) ships new releases like any other app.
+
 ## Before submitting to Flathub
 
 1. Test build above passes and the player actually plays, shows synced
