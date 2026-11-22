@@ -47,6 +47,14 @@ def backend_dir() -> Path:
     return share_root() / "ytmusic-backend"
 
 
+def user_css() -> str:
+    root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    try:
+        return (root / "arzxsh" / "user.css").read_text()
+    except OSError:
+        return ""
+
+
 def data_dir() -> Path:
     root = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
     d = root / "arzxsh"
@@ -106,6 +114,13 @@ class App(Gtk.Application):
         win.set_default_size(1120, 720)
         win.set_size_request(860, 540)
         self.view = WebKit.WebView()
+        css = user_css()
+        if css.strip():
+            script = WebKit.UserScript(
+                "window.__arzxshUserCss = " + json.dumps(css) + ";",
+                WebKit.UserContentInjectedFrames.TOP_FRAME,
+                WebKit.UserScriptInjectionTime.START, None, None)
+            self.view.get_user_content_manager().add_script(script)
         settings = self.view.get_settings()
         settings.set_property("media-playback-requires-user-gesture", False)
         settings.set_property("hardware-acceleration-policy",

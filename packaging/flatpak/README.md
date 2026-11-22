@@ -30,6 +30,15 @@ dependency. Adding an mpv module is a possible phase 2.
   folder (`~/Music/arzxsh`). Nothing else in the home directory is
   visible to the app.
 
+## Customization
+
+In-app Settings cover accent (artwork-derived, arzxsh red, or a custom
+color), visualizer style (bars / wave / off) and motion level. For
+deeper theming, the desktop shell hands the player a user stylesheet:
+put CSS in `~/.config/arzxsh/user.css` (inside the Flatpak sandbox
+that is `~/.var/app/me.arafatarzu.arzxsh/config/arzxsh/user.css`) and
+it is applied on top of the app's own styles at launch, Spicetify-style.
+
 ## Local test build (on Arch)
 
 ```bash

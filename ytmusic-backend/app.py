@@ -959,6 +959,104 @@ def local_art(track_id: str):
                              "x-content-type-options": "nosniff"})
 
 
+def _lrc_text(synced) -> str | None:
+    if not synced:
+        return None
+    out = []
+    for line in synced:
+        t = float(line.get("t") or 0)
+        m, s = divmod(t, 60)
+        out.append(f"[{int(m):02d}:{s:05.2f}] {line.get('text', '')}".rstrip())
+    return "\n".join(out)
+
+
+def _fetch_art_bytes(url: str):
+    if not url:
+        return None
+    try:
+        r = requests.get(url, headers={"User-Agent": _LRCLIB_UA}, timeout=8)
+        r.raise_for_status()
+        data = r.content
+    except Exception:
+        return None
+    if data[:3] == b"\xff\xd8\xff":
+        return data, "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return data, "image/png"
+    return None
+
+
+def _embed_art_lyrics(path: Path, lyrics_text, art) -> None:
+    if mutagen is None or (not lyrics_text and not art):
+        return
+    try:
+        f = mutagen.File(path)
+        if f is None:
+            return
+        ext = path.suffix.lower()
+        if ext in (".m4a", ".mp4"):
+            from mutagen.mp4 import MP4Cover
+            if f.tags is None:
+                f.add_tags()
+            if lyrics_text:
+                f.tags["\xa9lyr"] = lyrics_text
+            if art:
+                fmt = (MP4Cover.FORMAT_PNG if art[1] == "image/png"
+                       else MP4Cover.FORMAT_JPEG)
+                f.tags["covr"] = [MP4Cover(art[0], imageformat=fmt)]
+            f.save()
+        elif ext == ".mp3":
+            from mutagen.id3 import APIC, USLT
+            if f.tags is None:
+                f.add_tags()
+            if art:
+                f.tags.delall("APIC")
+                f.tags.add(APIC(encoding=3, mime=art[1], type=3,
+                                desc="", data=art[0]))
+            if lyrics_text:
+                f.tags.delall("USLT")
+                f.tags.add(USLT(encoding=3, lang="eng", desc="",
+                                text=lyrics_text))
+            f.save()
+        elif ext in (".flac", ".ogg", ".opus"):
+            from mutagen.flac import Picture
+            pic = None
+            if art:
+                pic = Picture()
+                pic.type = 3
+                pic.mime = art[1]
+                pic.data = art[0]
+            if ext == ".flac":
+                if pic is not None:
+                    f.clear_pictures()
+                    f.add_picture(pic)
+                if lyrics_text:
+                    f["LYRICS"] = lyrics_text
+                f.save()
+            else:
+                import base64
+                if pic is not None:
+                    f["metadata_block_picture"] = \
+                        base64.b64encode(pic.write()).decode()
+                if lyrics_text:
+                    f["LYRICS"] = lyrics_text
+                f.save()
+    except Exception:
+        pass
+
+
+def _download_extras(path: Path, video_id: str, thumb_url: str = "") -> None:
+    lyrics_text = None
+    try:
+        res = lyrics(video_id)
+        lyrics_text = _lrc_text(res.get("synced")) or res.get("lyrics")
+    except Exception:
+        lyrics_text = None
+    art = _fetch_art_bytes(
+        thumb_url or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
+    _embed_art_lyrics(path, lyrics_text, art)
+
+
 @app.post("/download/{video_id}")
 def download(video_id: str, title: str = "", artist: str = ""):
     """Save a track's audio into <music>/arzxsh/ (offline). The
@@ -1023,6 +1121,9 @@ def download(video_id: str, title: str = "", artist: str = ""):
                 f.save()
         except Exception:
             pass
+    thumbs = (info or {}).get("thumbnails") or []
+    _download_extras(dest, video_id,
+                     thumbs[-1].get("url", "") if thumbs else "")
     _cache.pop("local:scan", None)
     _scan_local()
     return {"ok": True, "already": False, "track": _local_track(dest)}
