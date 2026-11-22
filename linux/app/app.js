@@ -6,6 +6,12 @@
 
 const $ = (sel) => document.querySelector(sel);
 const view = $("#view");
+if (typeof window.__arzxshUserCss === "string") {
+  const userStyle = document.createElement("style");
+  userStyle.id = "arzxsh-user-css";
+  userStyle.textContent = window.__arzxshUserCss;
+  document.head.appendChild(userStyle);
+}
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({
@@ -46,12 +52,19 @@ async function api(path) {
   return r.json();
 }
 let toastTimer = null;
+let toastHideTimer = null;
 function toast(msg) {
   const t = $("#toast");
   t.textContent = msg;
-  t.classList.remove("hidden");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.add("hidden"), 3200);
+  clearTimeout(toastHideTimer);
+  t.classList.remove("hidden", "show");
+  void t.offsetWidth;
+  t.classList.add("show");
+  toastTimer = setTimeout(() => {
+    t.classList.remove("show");
+    toastHideTimer = setTimeout(() => t.classList.add("hidden"), 240);
+  }, 3200);
 }
 
 /* ---------------- persistent local state ---------------- */
@@ -62,16 +75,96 @@ const store = {
   },
   set(key, value) { localStorage.setItem(key, JSON.stringify(value)); },
 };
+const SETTINGS_KEY = "arzxsh-settings";
+const DEFAULT_ACCENT = "#fc3c44";
+const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const storedSettings = (() => {
+  try { return JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {}; }
+  catch { return {}; }
+})();
+const settings = {
+  accentMode: ["artwork", "red", "custom"].includes(storedSettings.accentMode)
+    ? storedSettings.accentMode : "artwork",
+  customAccent: /^#[0-9a-f]{6}$/i.test(storedSettings.customAccent || "")
+    ? storedSettings.customAccent : "#3ddc84",
+  vizStyle: ["bars", "wave", "off"].includes(storedSettings.vizStyle)
+    ? storedSettings.vizStyle : "bars",
+  motion: ["full", "reduced"].includes(storedSettings.motion)
+    ? storedSettings.motion : (prefersReducedMotion ? "reduced" : "full"),
+};
+let vizMainColor = settings.accentMode === "custom" ? settings.customAccent : DEFAULT_ACCENT;
+let vizNpColor = vizMainColor;
+const motionReduced = () => settings.motion === "reduced";
+function saveSettings() {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
+}
+function applySettings(save = true) {
+  if (save) saveSettings();
+  const root = document.documentElement;
+  const np = $("#nowPlaying");
+  document.body.classList.toggle("motion-reduced", motionReduced());
+  document.body.classList.toggle("viz-off", settings.vizStyle === "off");
+  if (settings.accentMode === "custom") {
+    root.style.setProperty("--accent", settings.customAccent);
+    vizMainColor = settings.customAccent;
+  } else {
+    root.style.removeProperty("--accent");
+    vizMainColor = DEFAULT_ACCENT;
+  }
+  if (settings.accentMode === "red") {
+    np.style.setProperty("--np-accent", DEFAULT_ACCENT);
+    vizNpColor = DEFAULT_ACCENT;
+  } else if (settings.accentMode === "custom") {
+    np.style.setProperty("--np-accent", settings.customAccent);
+    vizNpColor = settings.customAccent;
+  } else if (typeof player !== "undefined" && player.current) {
+    if (accentCache.has(player.current.id)) {
+      const rgb = accentCache.get(player.current.id);
+      np.style.setProperty("--np-accent", rgb);
+      vizNpColor = rgb;
+    } else {
+      np.style.removeProperty("--np-accent");
+      vizNpColor = DEFAULT_ACCENT;
+      applyArtworkAccent(player.current);
+    }
+  } else {
+    np.style.removeProperty("--np-accent");
+    vizNpColor = DEFAULT_ACCENT;
+  }
+  const accentSelect = $("#settingAccentMode");
+  if (accentSelect) {
+    accentSelect.value = settings.accentMode;
+    $("#settingCustomAccent").value = settings.customAccent;
+    $("#customAccentRow").classList.toggle("hidden", settings.accentMode !== "custom");
+    $("#settingVizStyle").value = settings.vizStyle;
+    $("#settingMotion").value = settings.motion;
+  }
+  if (typeof wakeMotionLoop === "function") wakeMotionLoop(350);
+}
 let likes = store.get("arzxsh.likes", []);           // full track objects
 let recentPlays = store.get("arzxsh.recent", []);    // full track objects
 let searchHistory = store.get("arzxsh.searchHistory", []);
 let downloads = store.get("arzxsh.downloads", {}); // videoId -> local track id
 const isLiked = (id) => likes.some((t) => t.id === id);
+function popLikeElements(trackId) {
+  const els = [
+    ...document.querySelectorAll(`[data-like="${CSS.escape(trackId)}"]`),
+    $("#pHeart"), $("#npHeart"),
+  ].filter(Boolean);
+  els.forEach((el) => {
+    el.classList.remove("like-pop");
+    void el.offsetWidth;
+    el.classList.add("like-pop");
+    setTimeout(() => el.classList.remove("like-pop"), 360);
+  });
+}
 function toggleLike(track) {
-  if (isLiked(track.id)) likes = likes.filter((t) => t.id !== track.id);
+  const nowLiked = !isLiked(track.id);
+  if (!nowLiked) likes = likes.filter((t) => t.id !== track.id);
   else likes = [track, ...likes.filter((t) => t.id !== track.id)];
   store.set("arzxsh.likes", likes);
   refreshLikeUi();
+  if (nowLiked) popLikeElements(track.id);
 }
 function saveSearch(q) {
   q = q.trim();
@@ -109,7 +202,39 @@ function renderRoute() {
   else if (r.type === "library") renderLibrary();
   else if (r.type === "liked") renderLiked();
   else if (r.type === "local") renderLocal();
+  else if (r.type === "settings") renderSettings();
 }
+let routeAnimGen = 0;
+let routeAnimScheduled = false;
+function animateRouteBlocks() {
+  const gen = ++routeAnimGen;
+  if (motionReduced()) return;
+  const blocks = [...view.children].filter((el) => el.nodeType === 1);
+  blocks.forEach((el, i) => {
+    el.classList.remove("route-in");
+    el.style.transitionDelay = `${Math.min(i * 45, 405)}ms`;
+    el.classList.add("route-enter");
+  });
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (gen !== routeAnimGen) return;
+    blocks.forEach((el) => el.classList.add("route-in"));
+    setTimeout(() => {
+      if (gen !== routeAnimGen) return;
+      blocks.forEach((el) => {
+        el.classList.remove("route-enter", "route-in");
+        el.style.transitionDelay = "";
+      });
+    }, 760);
+  }));
+}
+new MutationObserver(() => {
+  if (routeAnimScheduled) return;
+  routeAnimScheduled = true;
+  requestAnimationFrame(() => {
+    routeAnimScheduled = false;
+    animateRouteBlocks();
+  });
+}).observe(view, { childList: true });
 $("#backBtn").onclick = () => { if (routeIdx > 0) { routeIdx--; renderRoute(); } };
 $("#fwdBtn").onclick = () => { if (routeIdx < routes.length - 1) { routeIdx++; renderRoute(); } };
 document.querySelectorAll(".nav-item").forEach((b) =>
@@ -458,6 +583,78 @@ function renderLiked() {
     <div class="section-title">Songs</div>
     ${likes.length ? likes.map((t, i) => rowHtml(t, i, { ctx: "likedList" })).join("") : `<div class="empty-note">Tap the heart on any song and it lands here.</div>`}`;
 }
+function renderSettings() {
+  view.innerHTML = `
+    <div class="section-title">Settings</div>
+    <div class="settings-panel">
+      <div class="setting-row">
+        <div>
+          <div class="setting-name">Accent</div>
+          <div class="setting-desc">Artwork colors Now Playing. Red or a custom color applies everywhere.</div>
+        </div>
+        <select id="settingAccentMode" aria-label="Accent mode">
+          <option value="artwork">Artwork</option>
+          <option value="red">arzxsh Red</option>
+          <option value="custom">Custom</option>
+        </select>
+      </div>
+      <div class="setting-row ${settings.accentMode === "custom" ? "" : "hidden"}" id="customAccentRow">
+        <div>
+          <div class="setting-name">Custom accent</div>
+          <div class="setting-desc">Used for the interface and Now Playing.</div>
+        </div>
+        <input id="settingCustomAccent" type="color" value="${esc(settings.customAccent)}" aria-label="Custom accent color">
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-name">Visualizer</div>
+          <div class="setting-desc">Choose the live audio display in the player and Now Playing.</div>
+        </div>
+        <select id="settingVizStyle" aria-label="Visualizer style">
+          <option value="bars">Bars</option>
+          <option value="wave">Wave</option>
+          <option value="off">Off</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-name">Motion</div>
+          <div class="setting-desc">Reduced motion removes travel, stagger, karaoke fill and lyric glide.</div>
+        </div>
+        <select id="settingMotion" aria-label="Motion">
+          <option value="full">Full</option>
+          <option value="reduced">Reduced</option>
+        </select>
+      </div>
+    </div>
+    <div class="settings-note">Settings are stored only in this browser on this machine. ${typeof window.__arzxshUserCss === "string" ? "A user stylesheet was supplied by the desktop shell and is active." : "No user stylesheet was supplied by the desktop shell."}</div>`;
+  $("#settingAccentMode").value = settings.accentMode;
+  $("#settingVizStyle").value = settings.vizStyle;
+  $("#settingMotion").value = settings.motion;
+  $("#settingAccentMode").addEventListener("change", (e) => {
+    settings.accentMode = e.target.value;
+    applySettings();
+  });
+  $("#settingCustomAccent").addEventListener("input", (e) => {
+    settings.customAccent = e.target.value;
+    settings.accentMode = "custom";
+    applySettings();
+  });
+  $("#settingVizStyle").addEventListener("change", (e) => {
+    settings.vizStyle = e.target.value;
+    applySettings();
+  });
+  $("#settingMotion").addEventListener("change", (e) => {
+    settings.motion = e.target.value;
+    applySettings();
+    if (motionReduced()) {
+      document.querySelectorAll(".route-enter").forEach((el) => {
+        el.classList.remove("route-enter", "route-in");
+        el.style.transitionDelay = "";
+      });
+    }
+  });
+}
 function renderSideRecent() {
   $("#likedCount").textContent = likes.length ? String(likes.length) : "";
   $("#sideRecent").innerHTML = recentPlays.slice(0, 5).map((t) => `
@@ -509,7 +706,7 @@ function ensureWebAudio() {
   try {
     actx = new (window.AudioContext || window.webkitAudioContext)();
     analyser = actx.createAnalyser();
-    analyser.fftSize = 128;
+    analyser.fftSize = 512;
     masterGain = actx.createGain();
     masterGain.gain.value = Number($("#volume").value) / 100;
     analyser.connect(masterGain);
@@ -571,6 +768,7 @@ function startAt(idx, fade) {
   player.playing = true;
   notePlayed(track);
   onTrackChanged(track);
+  wakeMotionLoop();
 }
 function hasNext(auto) {
   if (player.shuffle) return player.queue.length > 1;
@@ -630,6 +828,7 @@ function togglePlay() {
   }
   syncPlayButtons();
   markCurrentRows();
+  wakeMotionLoop(500);
 }
 function onTrackError(deck) {
   if (deck !== activeDeck) return;
@@ -649,16 +848,29 @@ decks.forEach((deck) => {
     advance(true, false);
   });
   deck.el.addEventListener("error", () => onTrackError(deck));
-  deck.el.addEventListener("playing", () => { if (deck === activeDeck) player.failCount = 0; });
-  deck.el.addEventListener("pause", () => {
-    if (deck === activeDeck && !deck.fading) { player.playing = false; syncPlayButtons(); markCurrentRows(); }
+  deck.el.addEventListener("playing", () => {
+    if (deck !== activeDeck) return;
+    player.failCount = 0;
+    player.playing = true;
+    syncPlayButtons();
+    markCurrentRows();
+    wakeMotionLoop();
   });
+  deck.el.addEventListener("pause", () => {
+    if (deck === activeDeck && !deck.fading) {
+      player.playing = false;
+      syncPlayButtons();
+      markCurrentRows();
+      wakeMotionLoop(500);
+    }
+  });
+  deck.el.addEventListener("seeking", () => { if (deck === activeDeck) wakeMotionLoop(250); });
+  deck.el.addEventListener("seeked", () => { if (deck === activeDeck) wakeMotionLoop(250); });
   deck.el.addEventListener("timeupdate", () => {
     if (deck !== activeDeck) return;
     const el = deck.el;
     if (!el.duration) return;
-    syncSeek(el.currentTime, el.duration);
-    updateLyricsSync(el.currentTime);
+    wakeMotionLoop();
     const remaining = el.duration - el.currentTime;
     // Preload the next track into the idle deck.
     if (remaining <= 45 && remaining > CROSSFADE_S + 1) {
@@ -684,32 +896,101 @@ decks.forEach((deck) => {
 
 /* ---------------- player UI sync ---------------- */
 const seekInputs = [$("#seek"), $("#npSeek")];
+const seekElapsedEls = [$("#tElapsed"), $("#npElapsed")];
+const seekTotalEls = [$("#tTotal"), $("#npTotal")];
 let scrubbing = false;
-seekInputs.forEach((s) => {
-  s.addEventListener("pointerdown", () => { scrubbing = true; });
-  s.addEventListener("input", () => {
-    const el = activeDeck.el;
-    if (el.duration) {
-      const t = (Number(s.value) / 1000) * el.duration;
-      $("#tElapsed").textContent = fmt(t);
-      $("#npElapsed").textContent = fmt(t);
+let scrubInput = null;
+let lastSeekSecond = -1;
+let lastSeekDuration = -1;
+const clamp01 = (v) => Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0));
+function bufferedRatio(el, at = el.currentTime || 0) {
+  if (!el.duration || !el.buffered) return 0;
+  try {
+    let end = 0;
+    for (let i = 0; i < el.buffered.length; i++) {
+      const start = el.buffered.start(i);
+      const stop = el.buffered.end(i);
+      if (at >= start - 0.25 && at <= stop + 0.25) { end = stop; break; }
+      if (stop > end && stop <= at) end = stop;
+    }
+    if (!end && el.buffered.length) end = el.buffered.end(el.buffered.length - 1);
+    return clamp01(end / el.duration);
+  } catch { return 0; }
+}
+function paintSeekRatio(ratio, buffered = 0) {
+  const fill = clamp01(ratio);
+  seekInputs.forEach((s) => {
+    s.style.setProperty("--fill", `${(fill * 100).toFixed(2)}%`);
+    s.style.setProperty("--buffered", `${(clamp01(Math.max(buffered, fill)) * 100).toFixed(2)}%`);
+    if (!scrubbing || s !== scrubInput) {
+      const v = Math.round(fill * 1000);
+      if (Math.abs(Number(s.value) - v) >= 0.25) s.value = v;
     }
   });
-  s.addEventListener("change", () => {
-    const el = activeDeck.el;
-    if (el.duration) el.currentTime = (Number(s.value) / 1000) * el.duration;
-    scrubbing = false;
+}
+function paintRangeFill(input) {
+  const min = Number(input.min || 0);
+  const max = Number(input.max || 100);
+  const ratio = clamp01((Number(input.value) - min) / (max - min || 1));
+  input.style.setProperty("--fill", `${(ratio * 100).toFixed(2)}%`);
+  input.style.setProperty("--buffered", `${(ratio * 100).toFixed(2)}%`);
+}
+function setSeekLabels(cur, dur) {
+  const sec = Math.floor(Math.max(0, cur));
+  if (sec !== lastSeekSecond) {
+    lastSeekSecond = sec;
+    const text = fmt(cur);
+    seekElapsedEls.forEach((el) => { el.textContent = text; });
+  }
+  const durSec = Math.floor(Math.max(0, dur || 0));
+  if (durSec !== lastSeekDuration) {
+    lastSeekDuration = durSec;
+    const text = fmt(dur);
+    seekTotalEls.forEach((el) => { el.textContent = text; });
+  }
+}
+function finishScrub(input, commit = true) {
+  if (!scrubbing) return;
+  const el = activeDeck.el;
+  if (commit && el.duration) el.currentTime = (Number(input.value) / 1000) * el.duration;
+  scrubbing = false;
+  scrubInput = null;
+  input.classList.remove("scrubbing");
+  wakeMotionLoop(250);
+}
+seekInputs.forEach((s) => {
+  s.addEventListener("pointerdown", () => {
+    scrubbing = true;
+    scrubInput = s;
+    s.classList.add("scrubbing");
+    wakeMotionLoop();
   });
+  s.addEventListener("pointerup", () => finishScrub(s));
+  s.addEventListener("pointercancel", () => finishScrub(s, false));
+  s.addEventListener("input", () => {
+    scrubbing = true;
+    scrubInput = s;
+    s.classList.add("scrubbing");
+    const el = activeDeck.el;
+    if (el.duration) {
+      const ratio = Number(s.value) / 1000;
+      paintSeekRatio(ratio, bufferedRatio(el, ratio * el.duration));
+      setSeekLabels(ratio * el.duration, el.duration);
+    }
+    wakeMotionLoop();
+  });
+  s.addEventListener("change", () => finishScrub(s));
 });
 function syncSeek(cur, dur) {
-  if (!scrubbing) {
-    const v = Math.round((cur / dur) * 1000);
-    seekInputs.forEach((s) => { s.value = v; });
+  if (!dur) return;
+  if (scrubbing && scrubInput) {
+    const ratio = Number(scrubInput.value) / 1000;
+    paintSeekRatio(ratio, bufferedRatio(activeDeck.el, ratio * dur));
+    setSeekLabels(ratio * dur, dur);
+    return;
   }
-  $("#tElapsed").textContent = fmt(cur);
-  $("#npElapsed").textContent = fmt(cur);
-  $("#tTotal").textContent = fmt(dur);
-  $("#npTotal").textContent = fmt(dur);
+  paintSeekRatio(cur / dur, bufferedRatio(activeDeck.el, cur));
+  setSeekLabels(cur, dur);
 }
 function syncPlayButtons() {
   const glyph = player.playing ? "⏸" : "▶";
@@ -747,17 +1028,43 @@ function syncNpDownload() {
   btn.textContent = saved ? "✓ Saved" : "⬇ Download";
   btn.classList.toggle("liked", !!saved);
 }
+const npArtLayers = [$("#npArtBack"), $("#npArt")];
+let npArtActive = 1;
+const npBackdropLayers = [$("#npBackdropBack"), $("#npBackdrop")];
+let npBackdropActive = 1;
+function crossfadeNpArt(src) {
+  const outgoing = npArtLayers[npArtActive];
+  const incoming = npArtLayers[1 - npArtActive];
+  if (!incoming || !outgoing) return;
+  if (incoming.getAttribute("src") === src && incoming.classList.contains("active")) return;
+  if (outgoing.getAttribute("src") === src && outgoing.classList.contains("active")) return;
+  incoming.src = src;
+  incoming.classList.add("active");
+  outgoing.classList.remove("active");
+  npArtActive = 1 - npArtActive;
+}
+function crossfadeNpBackdrop(src) {
+  const outgoing = npBackdropLayers[npBackdropActive];
+  const incoming = npBackdropLayers[1 - npBackdropActive];
+  if (!incoming || !outgoing) return;
+  const next = src ? cssUrl(src) : "";
+  if (incoming.style.backgroundImage === next && incoming.classList.contains("active")) return;
+  if (outgoing.style.backgroundImage === next && outgoing.classList.contains("active")) return;
+  incoming.style.backgroundImage = next;
+  incoming.classList.add("active");
+  outgoing.classList.remove("active");
+  npBackdropActive = 1 - npBackdropActive;
+}
 function onTrackChanged(track) {
   $("#player").classList.remove("hidden");
   document.body.classList.remove("no-player");
   $("#pArt").src = track.artwork || "";
   $("#pTitle").textContent = track.title;
   $("#pArtist").textContent = track.artist;
-  $("#npArt").src = track.artwork || "";
+  crossfadeNpArt(track.artwork || "");
   $("#npTitle").textContent = track.title;
   $("#npArtist").textContent = track.artist;
-  $("#npBackdrop").style.backgroundImage =
-    track.artwork && /^https:\/\//.test(track.artwork) ? cssUrl(track.artwork) : "";
+  crossfadeNpBackdrop(track.artwork && /^https:\/\//.test(track.artwork) ? track.artwork : "");
   $("#npContext").textContent = player.contextName || "Now Playing";
   applyArtworkAccent(track);
   const npLeft = document.querySelector(".np-left");
@@ -769,6 +1076,7 @@ function onTrackChanged(track) {
   syncHeartStates();
   syncNpDownload();
   markCurrentRows();
+  fitVizEntries();
   renderQueue();
   loadAbout(track);
   resetLyrics(track);
@@ -813,8 +1121,10 @@ $("#npShuffle").onclick = toggleShuffle;
 $("#pHeart").onclick = () => { if (player.current) toggleLike(player.current); };
 $("#npHeart").onclick = () => { if (player.current) toggleLike(player.current); };
 $("#volume").value = store.get("arzxsh.volume", 80);
+paintRangeFill($("#volume"));
 $("#volume").addEventListener("input", () => {
   const v = Number($("#volume").value);
+  paintRangeFill($("#volume"));
   store.set("arzxsh.volume", v);
   if (webAudioOk && masterGain) masterGain.gain.value = v / 100;
   else decks.forEach((d) => { d.el.volume = v / 100; });
@@ -828,22 +1138,73 @@ if (navigator.mediaSession) {
 
 /* ---------------- Now Playing panels ---------------- */
 let npCloseTimer = null;
+let npMorphClone = null;
+let npMorphTimer = null;
+function finishArtworkMorph() {
+  clearTimeout(npMorphTimer);
+  npMorphTimer = null;
+  if (npMorphClone) npMorphClone.remove();
+  npMorphClone = null;
+  npArtLayers.forEach((el) => el && el.classList.remove("morph-hidden"));
+}
+function beginArtworkMorph(opening) {
+  if (motionReduced() || !player.current || !player.current.artwork) return false;
+  const npArt = npArtLayers[npArtActive];
+  const barArt = $("#pArt");
+  const fromEl = opening ? barArt : npArt;
+  const toEl = opening ? npArt : barArt;
+  if (!fromEl || !toEl) return false;
+  const from = fromEl.getBoundingClientRect();
+  const rawTo = toEl.getBoundingClientRect();
+  if (!from.width || !from.height || !rawTo.width || !rawTo.height) return false;
+  const to = {
+    left: rawTo.left,
+    top: rawTo.top - (opening ? 16 : 0),
+    width: rawTo.width,
+    height: rawTo.height,
+  };
+  finishArtworkMorph();
+  const clone = document.createElement("img");
+  clone.src = player.current.artwork;
+  clone.alt = "";
+  clone.className = "artwork-morph-clone";
+  clone.style.left = `${from.left}px`;
+  clone.style.top = `${from.top}px`;
+  clone.style.width = `${from.width}px`;
+  clone.style.height = `${from.height}px`;
+  clone.style.borderRadius = getComputedStyle(toEl).borderRadius;
+  document.body.appendChild(clone);
+  npMorphClone = clone;
+  npArt.classList.add("morph-hidden");
+  void clone.offsetWidth;
+  clone.style.transform = `translate(${to.left - from.left}px, ${to.top - from.top}px) scale(${to.width / from.width}, ${to.height / from.height})`;
+  npMorphTimer = setTimeout(finishArtworkMorph, 390);
+  return true;
+}
 function openNp(showQueue = false) {
   if (!player.current) return;
   clearTimeout(npCloseTimer);
   const np = $("#nowPlaying");
+  const wasHidden = np.classList.contains("hidden");
   np.classList.remove("hidden");
   void np.offsetWidth; // start the enter transition from the pre-visible state
+  if (wasHidden) beginArtworkMorph(true);
   np.classList.add("np-visible");
   if (showQueue) { $("#queueCard").classList.remove("hidden"); $("#npQueueBtn").classList.add("on"); }
   renderQueue();
+  fitVizEntries();
   updateLyricsSync(activeDeck.el.currentTime || 0, true);
+  wakeMotionLoop(450);
 }
 function closeNp() {
   const np = $("#nowPlaying");
+  if (!np.classList.contains("hidden")) beginArtworkMorph(false);
   np.classList.remove("np-visible");
   clearTimeout(npCloseTimer);
-  npCloseTimer = setTimeout(() => np.classList.add("hidden"), 300);
+  npCloseTimer = setTimeout(() => {
+    np.classList.add("hidden");
+    if (!npMorphClone) npArtLayers.forEach((el) => el && el.classList.remove("morph-hidden"));
+  }, 300);
 }
 $("#expandBtn").onclick = () => openNp(false);
 $("#playerTrack").onclick = () => openNp(false);
@@ -907,9 +1268,25 @@ let accentTrackId = null;
 function applyArtworkAccent(track) {
   accentTrackId = track.id;
   const np = $("#nowPlaying");
-  if (!track.artwork) { np.style.removeProperty("--np-accent"); return; }
+  if (settings.accentMode === "red") {
+    np.style.setProperty("--np-accent", DEFAULT_ACCENT);
+    vizNpColor = DEFAULT_ACCENT;
+    return;
+  }
+  if (settings.accentMode === "custom") {
+    np.style.setProperty("--np-accent", settings.customAccent);
+    vizNpColor = settings.customAccent;
+    return;
+  }
+  if (!track.artwork) {
+    np.style.removeProperty("--np-accent");
+    vizNpColor = DEFAULT_ACCENT;
+    return;
+  }
   if (accentCache.has(track.id)) {
-    np.style.setProperty("--np-accent", accentCache.get(track.id));
+    const rgb = accentCache.get(track.id);
+    np.style.setProperty("--np-accent", rgb);
+    vizNpColor = rgb;
     return;
   }
   const img = new Image();
@@ -919,7 +1296,10 @@ function applyArtworkAccent(track) {
     try { rgb = sampleAccent(img); } catch { rgb = null; }
     if (!rgb) return;
     accentCache.set(track.id, rgb);
-    if (accentTrackId === track.id) np.style.setProperty("--np-accent", rgb);
+    if (accentTrackId === track.id && settings.accentMode === "artwork") {
+      np.style.setProperty("--np-accent", rgb);
+      vizNpColor = rgb;
+    }
   };
   img.onerror = () => {};
   img.src = track.artwork;
@@ -962,7 +1342,7 @@ function sampleAccent(img) {
    seeks to it. */
 const lyricsCache = new Map();
 let lyricsTrackId = null;
-const syncState = { lines: [], els: [], active: -1, trackId: null };
+const syncState = { lines: [], els: [], active: -1, trackId: null, karaoke: -1 };
 function resetLyrics(track) {
   lyricsTrackId = track.id;
   clearSyncedLyrics();
@@ -974,6 +1354,7 @@ function clearSyncedLyrics() {
   syncState.els = [];
   syncState.active = -1;
   syncState.trackId = null;
+  syncState.karaoke = -1;
   const box = $("#lyricsSync");
   box.classList.add("hidden");
   const inner = $("#lyricsSyncInner");
@@ -1008,17 +1389,44 @@ function updateLyricsSync(now, force = false) {
   for (let i = 0; i < lines.length; i++) {
     if (lines[i].t <= now + 0.05) idx = i; else break;
   }
-  if (idx === syncState.active && !force) return;
-  syncState.active = idx;
-  syncState.els.forEach((el, i) => {
-    el.classList.toggle("active", i === idx);
-    el.classList.toggle("passed", idx >= 0 && i < idx);
-  });
-  const box = $("#lyricsSync");
-  const el = syncState.els[Math.max(0, idx)];
-  if (el && box.clientHeight) {
-    const y = box.clientHeight / 2 - (el.offsetTop + el.offsetHeight / 2);
-    $("#lyricsSyncInner").style.transform = `translateY(${y}px)`;
+  const changed = idx !== syncState.active || force;
+  if (changed) {
+    syncState.active = idx;
+    syncState.karaoke = -1;
+    syncState.els.forEach((el, i) => {
+      const distance = idx >= 0 ? Math.abs(i - idx) : 99;
+      el.classList.toggle("active", i === idx);
+      el.classList.toggle("passed", idx >= 0 && i < idx);
+      el.classList.toggle("depth-1", distance === 1);
+      el.classList.toggle("depth-2", distance === 2);
+      el.classList.toggle("depth-3", distance === 3);
+      el.classList.toggle("depth-far", idx >= 0 && distance >= 4);
+      if (i !== idx) el.style.removeProperty("--karaoke");
+    });
+    const box = $("#lyricsSync");
+    const el = syncState.els[Math.max(0, idx)];
+    if (el && box.clientHeight) {
+      const y = box.clientHeight / 2 - (el.offsetTop + el.offsetHeight / 2);
+      $("#lyricsSyncInner").style.transform = `translateY(${y}px)`;
+    }
+  }
+  if (idx < 0) return;
+  const activeEl = syncState.els[idx];
+  if (!activeEl) return;
+  if (motionReduced()) {
+    if (syncState.karaoke !== 1) {
+      activeEl.style.setProperty("--karaoke", "100%");
+      syncState.karaoke = 1;
+    }
+    return;
+  }
+  const start = lines[idx].t;
+  const next = idx + 1 < lines.length ? lines[idx + 1].t : start + 5;
+  const duration = Math.max(0.8, next - start);
+  const pct = clamp01((now - start) / duration);
+  if (force || Math.abs(pct - syncState.karaoke) >= 0.004) {
+    activeEl.style.setProperty("--karaoke", `${(pct * 100).toFixed(2)}%`);
+    syncState.karaoke = pct;
   }
 }
 $("#npDownload").onclick = () => {
@@ -1057,34 +1465,144 @@ function fillLyrics(r) {
   $("#lyricsSource").textContent = r.source ? `Source: ${r.source}` : "";
 }
 
-/* ---------------- visualizer ---------------- */
-const vizCtx = $("#viz").getContext("2d");
-const vizMiniCtx = $("#vizMini").getContext("2d");
-function drawViz() {
-  requestAnimationFrame(drawViz);
+/* ---------------- visualizer + smoothness engine ---------------- */
+const vizEntries = [
+  { canvas: $("#viz"), ctx: $("#viz").getContext("2d"), bars: 56, np: true, w: 0, h: 0, levels: null, peaks: null },
+  { canvas: $("#vizMini"), ctx: $("#vizMini").getContext("2d"), bars: 14, np: false, w: 0, h: 0, levels: null, peaks: null },
+];
+vizEntries.forEach((entry) => {
+  entry.levels = new Float32Array(entry.bars);
+  entry.peaks = new Float32Array(entry.bars);
+});
+function fitVizEntry(entry) {
+  const w = entry.canvas.clientWidth || 0;
+  const h = entry.canvas.clientHeight || 0;
+  if (!w || !h) { entry.w = 0; entry.h = 0; return; }
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const pw = Math.round(w * dpr);
+  const ph = Math.round(h * dpr);
+  if (entry.canvas.width !== pw || entry.canvas.height !== ph) {
+    entry.canvas.width = pw;
+    entry.canvas.height = ph;
+  }
+  entry.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  entry.w = w;
+  entry.h = h;
+}
+function fitVizEntries() { vizEntries.forEach(fitVizEntry); }
+if ("ResizeObserver" in window) {
+  const vizResizeObserver = new ResizeObserver((entries) => {
+    entries.forEach((resizeEntry) => {
+      const entry = vizEntries.find((v) => v.canvas === resizeEntry.target);
+      if (entry) fitVizEntry(entry);
+    });
+  });
+  vizEntries.forEach((entry) => vizResizeObserver.observe(entry.canvas));
+}
+window.addEventListener("resize", fitVizEntries);
+function visualizerHasEnergy() {
+  return vizEntries.some((entry) =>
+    entry.levels.some((v) => v > 0.012) || entry.peaks.some((v) => v > 0.012));
+}
+function drawVisualizers(dt, ts) {
+  if (settings.vizStyle === "off") return;
   const npOpen = !$("#nowPlaying").classList.contains("hidden");
-  if (!npOpen && $("#player").classList.contains("hidden")) return;
-  const draw = (ctx, w, h, bars) => {
+  const playerVisible = !$("#player").classList.contains("hidden");
+  if (!npOpen && !playerVisible) return;
+  const live = webAudioOk && analyser && player.playing;
+  let freq = null;
+  let wave = null;
+  if (live && settings.vizStyle === "bars") {
+    freq = new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteFrequencyData(freq);
+  } else if (live && settings.vizStyle === "wave") {
+    wave = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(wave);
+  }
+  vizEntries.forEach((entry) => {
+    if (entry.np && !npOpen) return;
+    if (!entry.np && !playerVisible) return;
+    if (!entry.w || !entry.h) return;
+    const { ctx, w, h } = entry;
+    const color = entry.np ? vizNpColor : vizMainColor;
     ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = "#fc3c44";
-    const bw = w / bars;
-    let data = null;
-    if (webAudioOk && analyser && player.playing) {
-      data = new Uint8Array(analyser.frequencyBinCount);
-      analyser.getByteFrequencyData(data);
+    if (settings.vizStyle === "wave") {
+      ctx.beginPath();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.globalAlpha = live || !webAudioOk ? 0.9 : 0.38;
+      const points = 96;
+      for (let i = 0; i <= points; i++) {
+        const x = (i / points) * w;
+        let v = 0;
+        if (wave) v = (wave[Math.floor((i / points) * (wave.length - 1))] - 128) / 128;
+        else if (!webAudioOk) v = Math.sin(i * 0.32 + ts / 280) * 0.08;
+        const y = h / 2 + v * (h * 0.46);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      return;
     }
-    for (let i = 0; i < bars; i++) {
-      const v = data ? data[Math.floor((i / bars) * data.length * 0.72)] / 255 : 0.06;
-      const bh = Math.max(2, v * h);
-      ctx.globalAlpha = 0.55 + v * 0.45;
-      ctx.fillRect(i * bw + 1, h - bh, bw - 2, bh);
+    const bw = w / entry.bars;
+    ctx.fillStyle = color;
+    for (let i = 0; i < entry.bars; i++) {
+      let target = 0;
+      if (freq) target = freq[Math.floor((i / entry.bars) * freq.length * 0.72)] / 255;
+      else if (!webAudioOk) target = 0.06;
+      const level = entry.levels[i];
+      entry.levels[i] = target > level
+        ? level + (target - level) * 0.58
+        : level + (target - level) * 0.12;
+      const smoothed = entry.levels[i];
+      entry.peaks[i] = smoothed > entry.peaks[i]
+        ? smoothed
+        : Math.max(smoothed, entry.peaks[i] - dt * 0.22);
+      const bh = Math.max(2, smoothed * h);
+      ctx.globalAlpha = 0.5 + smoothed * 0.5;
+      ctx.fillRect(i * bw + 1, h - bh, Math.max(1, bw - 2), bh);
+      const peakY = Math.max(0, h - entry.peaks[i] * h - 2);
+      ctx.globalAlpha = 0.88;
+      ctx.fillRect(i * bw + 1, peakY, Math.max(1, bw - 2), 2);
     }
     ctx.globalAlpha = 1;
-  };
-  if (npOpen) draw(vizCtx, 520, 64, 56);
-  draw(vizMiniCtx, 72, 28, 14);
+  });
 }
-requestAnimationFrame(drawViz);
+const frameState = { id: 0, running: false, lastTs: 0, until: 0 };
+function wakeMotionLoop(ms = 0) {
+  if (ms) frameState.until = Math.max(frameState.until, performance.now() + ms);
+  if (frameState.running || document.hidden || !player.current) return;
+  frameState.running = true;
+  frameState.id = requestAnimationFrame(motionFrame);
+}
+function stopMotionLoop() {
+  if (frameState.id) cancelAnimationFrame(frameState.id);
+  frameState.id = 0;
+  frameState.running = false;
+  frameState.lastTs = 0;
+}
+function motionFrame(ts) {
+  frameState.id = 0;
+  frameState.running = false;
+  if (document.hidden || !player.current) { frameState.lastTs = 0; return; }
+  const dt = frameState.lastTs ? Math.min(0.05, (ts - frameState.lastTs) / 1000) : 1 / 60;
+  frameState.lastTs = ts;
+  const el = activeDeck.el;
+  const now = el.currentTime || 0;
+  const dur = el.duration || 0;
+  if (dur) syncSeek(now, dur);
+  if (!$("#lyricsSync").classList.contains("hidden")) updateLyricsSync(now);
+  drawVisualizers(dt, ts);
+  if (player.playing || scrubbing || ts < frameState.until || visualizerHasEnergy()) {
+    wakeMotionLoop();
+  } else {
+    frameState.lastTs = 0;
+  }
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopMotionLoop();
+  else wakeMotionLoop(300);
+});
 
 /* ---------------- keyboard ---------------- */
 document.addEventListener("keydown", (e) => {
@@ -1099,6 +1617,8 @@ document.addEventListener("keydown", (e) => {
 
 /* ---------------- init ---------------- */
 document.body.classList.add("no-player");
+applySettings(false);
+paintSeekRatio(0, 0);
 renderSideRecent();
 navigate({ type: "home" }, true);
 /* Debug/testing handle, gated (audit 2026-11-11): only exposed when

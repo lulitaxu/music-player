@@ -15,6 +15,7 @@
       <button class="nav-item active" data-nav="home"><span class="nav-ico">⌂</span>Home</button>
       <button class="nav-item" data-nav="search"><span class="nav-ico">⌕</span>Search</button>
       <button class="nav-item" data-nav="library"><span class="nav-ico">▤</span>Library</button>
+      <button class="nav-item" data-nav="settings"><span class="nav-ico">⚙</span>Settings</button>
     </nav>
     <div class="side-label">Your library</div>
     <button class="side-link" id="likedLink">♥&nbsp; Liked Songs <span class="side-count" id="likedCount"></span></button>
@@ -74,7 +75,8 @@
 </div>
 
 <div id="nowPlaying" class="hidden">
-  <div id="npBackdrop"></div>
+  <div id="npBackdropBack" class="np-backdrop-layer"></div>
+  <div id="npBackdrop" class="np-backdrop-layer active"></div>
   <div class="np-inner">
     <div class="np-head">
       <button id="npClose" class="round-btn" title="Close">⌄</button>
@@ -83,7 +85,10 @@
     </div>
     <div class="np-grid">
       <div class="np-left">
-        <img id="npArt" alt="">
+        <div class="np-art-stack">
+          <img id="npArtBack" class="np-art-layer" alt="">
+          <img id="npArt" class="np-art-layer active" alt="">
+        </div>
         <div id="npTitle"></div>
         <div id="npArtist"></div>
         <canvas id="viz" width="520" height="64"></canvas>
