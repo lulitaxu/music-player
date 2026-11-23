@@ -79,6 +79,9 @@ const settings = {
   motion: ["full", "reduced"].includes(storedSettings.motion)
     ? storedSettings.motion : (prefersReducedMotion ? "reduced" : "full"),
 };
+if (/AppleWebKit/.test(navigator.userAgent) && !/Chrome|Chromium|Edg|OPR/.test(navigator.userAgent)) {
+  document.body.classList.add("lowfx");
+}
 let vizMainColor = settings.accentMode === "custom" ? settings.customAccent : DEFAULT_ACCENT;
 let vizNpColor = vizMainColor;
 const motionReduced = () => settings.motion === "reduced";
@@ -1346,6 +1349,7 @@ function openNp(showQueue = false) {
   void np.offsetWidth; // start the enter transition from the pre-visible state
   if (wasHidden) beginArtworkMorph(true);
   np.classList.add("np-visible");
+  showNpLyrics();
   if (showQueue) { $("#queueCard").classList.remove("hidden"); $("#npQueueBtn").classList.add("on"); }
   renderQueue();
   fitVizEntries();
@@ -1630,11 +1634,19 @@ const syncViews = [
   { box: $("#panelLyricsSync"), inner: $("#panelLyricsSyncInner"), els: [], words: [] },
 ];
 const plainLyricsEls = [$("#lyricsText"), $("#panelLyricsText")];
+function showNpLyrics() {
+  $("#lyricsCard").classList.remove("hidden");
+  $("#lyricsBtn").classList.add("on");
+  loadLyricsForCurrent();
+}
 function resetLyrics(track) {
   lyricsTrackId = track.id;
   clearSyncedLyrics();
-  $("#lyricsCard").classList.add("hidden");
-  $("#lyricsBtn").classList.remove("on");
+  if (!$("#nowPlaying").classList.contains("hidden")) showNpLyrics();
+  else {
+    $("#lyricsCard").classList.add("hidden");
+    $("#lyricsBtn").classList.remove("on");
+  }
   if (panel.open && panel.tab === "lyrics") loadLyricsForCurrent();
 }
 function clearSyncedLyrics() {
@@ -1725,7 +1737,7 @@ function updateLyricsSync(now, force = false) {
   if (force || Math.abs(pct - syncState.karaoke) >= 0.004) {
     const wordCount = syncState.wordCounts[idx] || 0;
     syncViews.forEach((v) => {
-      if (!v.els[idx]) return;
+      if (!v.els[idx] || !v.box.clientHeight) return;
       v.els[idx].style.setProperty("--karaoke", `${(pct * 100).toFixed(2)}%`);
       const spans = v.words[idx];
       if (spans && wordCount) {
