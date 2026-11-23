@@ -157,7 +157,11 @@ def hi_res_art(url):
     if not url:
         return url
     if "googleusercontent.com" in url:
-        return re.sub(r"=w\d+-h\d+", "=w540-h540", url, count=1)
+        if re.search(r"=w\d+-h\d+", url):
+            return re.sub(r"=w\d+-h\d+", "=w1080-h1080", url, count=1)
+        if "=" not in url.rsplit("/", 1)[-1]:
+            return url + "=w1080-h1080"
+        return url
     if "i.ytimg.com" in url:
         return url.replace("mqdefault", "hqdefault")
     return url

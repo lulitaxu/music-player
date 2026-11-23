@@ -2154,8 +2154,16 @@ document.addEventListener("error", (e) => {
 }, true);
 [likes, recentPlays, ...playlists.map((p) => p.tracks)].forEach((list) => {
   list.forEach((t) => {
-    if (t && t.artwork && t.artwork.includes("maxresdefault")) {
+    if (!t || !t.artwork) return;
+    if (t.artwork.includes("maxresdefault")) {
       t.artwork = t.artwork.replace("maxresdefault", "hqdefault");
+    }
+    if (t.artwork.includes("googleusercontent.com")) {
+      if (/=w\d+-h\d+/.test(t.artwork)) {
+        t.artwork = t.artwork.replace(/=w\d+-h\d+/, "=w1080-h1080");
+      } else if (!t.artwork.split("/").pop().includes("=")) {
+        t.artwork += "=w1080-h1080";
+      }
     }
   });
 });
