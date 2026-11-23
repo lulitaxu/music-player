@@ -1406,7 +1406,12 @@ $("#npShuffle").onclick = toggleShuffle;
 $("#pHeart").onclick = (e) => { e.stopPropagation(); if (player.current) toggleLike(player.current); };
 $("#npHeart").onclick = () => { if (player.current) toggleLike(player.current); };
 let preMuteVolume = 80;
-function volumeIcon(v) { return v <= 0 ? "🔇" : v < 50 ? "🔉" : "🔊"; }
+const VOL_SVGS = [
+  '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4z" fill="currentColor" stroke="none"/><line x1="16" y1="9" x2="22" y2="15"/><line x1="22" y1="9" x2="16" y2="15"/></svg>',
+  '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4z" fill="currentColor" stroke="none"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>',
+  '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4z" fill="currentColor" stroke="none"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9.4 9.4 0 0 1 0 13"/></svg>',
+];
+function volumeIcon(v) { return VOL_SVGS[v <= 0 ? 0 : v < 50 ? 1 : 2]; }
 function setVolume(v) {
   v = Math.max(0, Math.min(100, Math.round(v)));
   if (v > 0) preMuteVolume = v;
@@ -1414,8 +1419,8 @@ function setVolume(v) {
   paintRangeFill($("#volume"));
   const npv = $("#npVolume");
   if (npv) { npv.value = v; paintRangeFill(npv); }
-  $("#muteBtn").textContent = volumeIcon(v);
-  $("#npMute").textContent = volumeIcon(v);
+  $("#muteBtn").innerHTML = volumeIcon(v);
+  $("#npMute").innerHTML = volumeIcon(v);
   store.set("arzxsh.volume", v);
   if (webAudioOk && masterGain) masterGain.gain.value = v / 100;
   else decks.forEach((d) => { d.el.volume = v / 100; });

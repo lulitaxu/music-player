@@ -901,6 +901,22 @@ def _extract_art(raw):
     return None
 
 
+_COVER_NAMES = ("cover.jpg", "cover.png", "cover.jpeg", "folder.jpg",
+                "folder.png", "album.jpg", "album.png", "front.jpg",
+                "front.png")
+
+
+def _folder_cover(path: Path):
+    try:
+        for name in _COVER_NAMES:
+            cand = path.parent / name
+            if cand.is_file():
+                return cand
+    except Exception:
+        pass
+    return None
+
+
 def _local_track(path: Path) -> dict:
     tid = _local_id(path)
     title, artist, album = path.stem, "Local file", path.parent.name
@@ -937,6 +953,8 @@ def _local_track(path: Path) -> dict:
                     duration = int(w.getnframes() / w.getframerate()) or None
             except Exception:
                 pass
+    if not has_art:
+        has_art = _folder_cover(path) is not None
     try:
         added_at = path.stat().st_mtime
     except Exception:
@@ -1075,6 +1093,14 @@ def local_art(track_id: str):
             art = _extract_art(raw) if raw else None
         except Exception:
             art = None
+    if not art:
+        cover = _folder_cover(path)
+        if cover is not None:
+            try:
+                mime = "image/png" if cover.suffix.lower() == ".png" else "image/jpeg"
+                art = (cover.read_bytes(), mime)
+            except Exception:
+                art = None
     if not art:
         raise HTTPException(404, "no embedded artwork")
     data, mime = art
