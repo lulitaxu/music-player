@@ -900,6 +900,14 @@ def _extract_art(raw):
         pics = getattr(raw, "pictures", None)
         if pics:
             return bytes(pics[0].data), pics[0].mime or "image/jpeg"
+        for key in list(raw.keys()):
+            if key.lower() == "metadata_block_picture":
+                import base64
+                from mutagen.flac import Picture
+                vals = raw[key]
+                if vals:
+                    pic = Picture(base64.b64decode(vals[0]))
+                    return bytes(pic.data), pic.mime or "image/jpeg"
     except Exception:
         return None
     return None
@@ -1242,7 +1250,7 @@ def download(video_id: str, title: str = "", artist: str = ""):
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "format": "bestaudio[ext=m4a]/bestaudio[ext=opus]/bestaudio[ext=ogg]/bestaudio/best",
         "outtmpl": str(_DOWNLOADS_DIR / f"{name}.%(ext)s"),
         "retries": 3,
         "fragment_retries": 3,

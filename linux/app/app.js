@@ -78,6 +78,11 @@ const settings = {
     ? storedSettings.vizStyle : "bars",
   motion: ["full", "reduced"].includes(storedSettings.motion)
     ? storedSettings.motion : (prefersReducedMotion ? "reduced" : "full"),
+  theme: ["midnight", "graphite", "espresso", "forest"].includes(storedSettings.theme)
+    ? storedSettings.theme : "midnight",
+  crossfade: Number.isFinite(storedSettings.crossfade)
+    ? Math.max(0, Math.min(12, Math.round(storedSettings.crossfade))) : 6,
+  name: typeof storedSettings.name === "string" ? storedSettings.name.slice(0, 40) : "",
 };
 if (/AppleWebKit/.test(navigator.userAgent) && !/Chrome|Chromium|Edg|OPR/.test(navigator.userAgent)) {
   document.body.classList.add("lowfx");
@@ -102,6 +107,7 @@ function applySettings(save = true) {
   if (save) saveSettings();
   const root = document.documentElement;
   const np = $("#nowPlaying");
+  document.body.dataset.theme = settings.theme;
   document.body.classList.toggle("motion-reduced", motionReduced());
   document.body.classList.toggle("viz-off", settings.vizStyle === "off");
   if (settings.accentMode === "custom") {
@@ -313,14 +319,14 @@ $("#railRadio").onclick = async () => {
   try {
     const r = await api(`/radio?video_id=${encodeURIComponent(player.current.id)}`);
     const fresh = (r.results || []).filter((t) => t.id !== player.current.id);
-    if (!fresh.length) { toast("No radio mix found for this song"); return; }
+    if (!fresh.length) { toast("No radio mix found for this song. Try another one."); return; }
     register(fresh, null);
     player.queue = [player.current, ...fresh];
     player.index = 0;
     player.contextName = "Radio";
     renderQueue();
     toast("Radio station started");
-  } catch { toast("Radio is unavailable right now"); }
+  } catch { toast("Radio is unavailable right now. Try again in a bit."); }
   player.radioBusy = false;
 };
 
@@ -388,13 +394,13 @@ async function quickPlayAlbum(id) {
     const a = await api(`/album/${encodeURIComponent(id)}`);
     const tracks = (a.tracks || []).map((t) => ({ ...t, album_id: a.id }));
     if (tracks.length) { register(tracks, null); playFromContext(tracks, 0, "Album"); }
-  } catch { toast("Couldn't play this album."); }
+  } catch { toast("Couldn't play this album. Try again."); }
 }
 async function quickPlayArtist(id) {
   try {
     const a = await api(`/artist/${encodeURIComponent(id)}`);
     if (a.songs && a.songs.length) { register(a.songs, null); playFromContext(a.songs, 0, "Artist"); }
-  } catch { toast("Couldn't play this artist."); }
+  } catch { toast("Couldn't play this artist. Try again."); }
 }
 const CTX_LABELS = {
   charts: "Trending now", searchSongs: "Search", artistSongs: "Artist",
@@ -430,7 +436,8 @@ view.addEventListener("click", (e) => {
   if (play) {
     const list = contexts.get(play.dataset.ctx) || [findTrack(play.dataset.play)];
     const idx = list.findIndex((t) => t.id === play.dataset.play);
-    if (idx >= 0) playFromContext(list, idx, CTX_LABELS[play.dataset.ctx] || "Songs");
+    if (idx >= 0) playFromContext(list, idx, CTX_LABELS[play.dataset.ctx] || "Songs",
+      play.dataset.ctx === "playlistTracks" && routes[routeIdx].type === "playlist" ? routes[routeIdx].id : null);
     return;
   }
   const artist = e.target.closest("[data-artist]");
@@ -449,12 +456,46 @@ function register(list, ctxName) {
 }
 function findTrack(id) { return trackReg.get(id); }
 
+const trackKey = (t) => `${t.source || "ytmusic"}_${t.id}`;
+let mixStore = store.get("arzxsh.mix", {});
+function getTransition(plId, outTrack, inTrack) {
+  if (!plId || !outTrack || !inTrack) return null;
+  const byPair = mixStore[plId];
+  if (!byPair) return null;
+  return byPair[`${trackKey(outTrack)}>${trackKey(inTrack)}`] || null;
+}
+function setTransition(plId, outTrack, inTrack, tr) {
+  if (!mixStore[plId]) mixStore[plId] = {};
+  const key = `${trackKey(outTrack)}>${trackKey(inTrack)}`;
+  if (tr) mixStore[plId][key] = tr;
+  else delete mixStore[plId][key];
+  store.set("arzxsh.mix", mixStore);
+}
+function currentTransition() {
+  const auto = { style: "fade", length: settings.crossfade, outSkip: 0, inSkip: 0 };
+  if (!player.playlistId) return auto;
+  const n = nextIndex(true);
+  if (n < 0) return auto;
+  return getTransition(player.playlistId, player.queue[player.index], player.queue[n]) || auto;
+}
+
 function greeting() {
   const h = new Date().getHours();
-  if (h >= 22 || h < 4) return ["Good night", "The late queue is yours."];
-  if (h < 12) return ["Good morning", "Start the day loud."];
-  if (h < 17) return ["Good afternoon", "The midday queue."];
-  return ["Good evening", "Tonight's rotation."];
+  const name = settings.name ? `, ${settings.name}` : "";
+  const day = Math.floor(Date.now() / 86400000);
+  const pick = (arr) => arr[day % arr.length];
+  if (h >= 22 || h < 4) return [`Good night${name}`, pick([
+    "The late queue is yours.", "Low lights, loud songs.", "Night radio, no skips.",
+    "For the ones still awake.", "Slow hours, deep cuts."])];
+  if (h < 12) return [`Good morning${name}`, pick([
+    "Start the day loud.", "First song sets the tone.", "Coffee can wait, press play.",
+    "Your morning rotation.", "Wake up the speakers."])];
+  if (h < 17) return [`Good afternoon${name}`, pick([
+    "The midday queue.", "Halfway there, keep it playing.", "Sun's up, volume up.",
+    "The afternoon rotation.", "A break between everything."])];
+  return [`Good evening${name}`, pick([
+    "Tonight's rotation.", "Golden hour, good songs.", "The day is done, the queue isn't.",
+    "Evening mode: on.", "Songs for the slow hours."])];
 }
 async function renderHome() {
   const [g, sub] = greeting();
@@ -488,7 +529,7 @@ async function renderHome() {
   } catch {
     if (routes[routeIdx].type !== "home") return;
     view.innerHTML = `<div class="greeting">${g}</div>
-      <div class="error-note">Couldn't load the catalog. Check your connection.<button data-retry>Retry</button></div>`;
+      <div class="error-note">Couldn't load the catalog. Check your connection and try again.<button data-retry>Retry</button></div>`;
   }
 }
 
@@ -635,7 +676,7 @@ async function renderSearch(q) {
   } catch {
     if (routes[routeIdx].type !== "search") return;
     view.innerHTML = `<div class="page-title">${esc(q)}</div>
-      <div class="error-note">Search failed. Check your connection.<button data-retry>Retry</button></div>`;
+      <div class="error-note">Search didn't go through. Check your connection and try again.<button data-retry>Retry</button></div>`;
   }
 }
 
@@ -665,7 +706,7 @@ async function renderArtist(id) {
       </div>
       ${a.description ? `<div class="section-title">About</div><p class="about-text">${esc(a.description)}</p>` : ""}
       <div class="section-title">Top songs</div>
-      ${a.songs.length ? a.songs.map((t, i) => rowHtml(t, i, { ctx: "artistSongs" })).join("") : `<div class="empty-note">No songs listed.</div>`}
+      ${a.songs.length ? a.songs.map((t, i) => rowHtml(t, i, { ctx: "artistSongs" })).join("") : `<div class="empty-note">No songs listed for this artist yet.</div>`}
       ${a.albums.length ? `<div class="section-title">Albums</div><div class="rail">${a.albums.map((x) => cardHtml({ ...x, artist: a.name }, "album")).join("")}</div>` : ""}
       ${a.singles.length ? `<div class="section-title">Singles</div><div class="rail">${a.singles.map((x) => cardHtml({ ...x, artist: a.name }, "album")).join("")}</div>` : ""}
       ${a.related.length ? `<div class="section-title">Fans also like</div><div class="rail">${a.related.map((x) => cardHtml(x, "artist")).join("")}</div>` : ""}`;
@@ -678,7 +719,7 @@ async function renderArtist(id) {
     };
   } catch {
     if (routes[routeIdx].type !== "artist") return;
-    view.innerHTML = `<div class="error-note">Couldn't load this artist.<button data-retry>Retry</button></div>`;
+    view.innerHTML = `<div class="error-note">Couldn't load this artist. Try again.<button data-retry>Retry</button></div>`;
   }
 }
 async function renderAlbum(id) {
@@ -716,7 +757,7 @@ async function renderAlbum(id) {
     };
   } catch {
     if (routes[routeIdx].type !== "album") return;
-    view.innerHTML = `<div class="error-note">Couldn't load this album.<button data-retry>Retry</button></div>`;
+    view.innerHTML = `<div class="error-note">Couldn't load this album. Try again.<button data-retry>Retry</button></div>`;
   }
 }
 
@@ -787,7 +828,7 @@ async function renderLocal(fresh = false) {
   } catch {
     if (routes[routeIdx].type !== "local") return;
     view.innerHTML = `<div class="section-title">On this device</div>
-      <div class="error-note">Couldn't read the local library.<button data-retry>Retry</button></div>`;
+      <div class="error-note">Couldn't read your music folder. Try again.<button data-retry>Retry</button></div>`;
   }
 }
 function coverHtml(track, glyph = "♪", cls = "") {
@@ -799,6 +840,27 @@ function playlistCoverHtml(p, cls = "") {
   if (arts.length >= 2) return `<span class="cover cover-collage ${cls}">${arts.map((a) => `<img src="${esc(a)}" alt="">`).join("")}</span>`;
   if (arts.length === 1) return `<span class="cover ${cls}"><img src="${esc(arts[0])}" alt=""></span>`;
   return `<span class="cover cover-fallback ${cls}">♪</span>`;
+}
+function mixSummary(tr) {
+  if (!tr) return `Auto · ${settings.crossfade}s fade`;
+  const skips = [];
+  if (tr.outSkip) skips.push(`ends ${tr.outSkip}s early`);
+  if (tr.inSkip) skips.push(`next starts ${tr.inSkip}s in`);
+  const label = { fade: "Fade", rise: "Rise", blend: "Blend" }[tr.style] || "Fade";
+  return `${label} · ${tr.length}s${skips.length ? " · " + skips.join(" · ") : ""}`;
+}
+function mixBarHtml(p, out, inn, i) {
+  const tr = getTransition(p.id, out, inn);
+  return `<button class="mix-bar" data-mixbar="${i}">⇄ <span>${esc(mixSummary(tr))}</span></button>
+  <div class="mix-editor hidden" data-mixed="${i}">
+    <div class="mix-styles">
+      ${["fade", "rise", "blend"].map((s) => `<button class="chip-btn" data-mixstyle="${s}">${s[0].toUpperCase() + s.slice(1)}</button>`).join("")}
+    </div>
+    <label class="mix-slider">Mix length <input type="range" min="1" max="12" step="1" data-mixlen> <span data-mixlenval></span></label>
+    <label class="mix-slider">Skip end of this song <input type="range" min="0" max="10" step="1" data-mixout> <span data-mixoutval></span></label>
+    <label class="mix-slider">Skip start of next song <input type="range" min="0" max="10" step="1" data-mixin> <span data-mixinval></span></label>
+    <button class="chip-btn" data-mixauto>Reset to Auto</button>
+  </div>`;
 }
 function renderPlaylist(id) {
   const p = getPlaylist(id);
@@ -821,13 +883,49 @@ function renderPlaylist(id) {
       </div>
     </div>
     <div class="section-title">Songs</div>
-    ${tracks.length ? tracks.map((t, i) => rowHtml(t, i, { rank: true, ctx: "playlistTracks" })).join("") : `<div class="empty-note">Nothing here yet. Right-click any song and choose Add to Playlist.</div>`}`;
-  $("#pagePlay").onclick = () => { if (tracks.length) playFromContext(tracks, 0, "Playlist"); };
+    ${tracks.length ? tracks.map((t, i) => rowHtml(t, i, { rank: true, ctx: "playlistTracks" }) + (i < tracks.length - 1 ? mixBarHtml(p, tracks[i], tracks[i + 1], i) : "")).join("") : `<div class="empty-note">Nothing here yet. Right-click any song and choose Add to Playlist.</div>`}`;
+  $("#pagePlay").onclick = () => { if (tracks.length) playFromContext(tracks, 0, "Playlist", p.id); };
   $("#pageShuffle").onclick = () => {
     if (!tracks.length) return;
     if (!player.shuffle) toggleShuffle();
-    playFromContext(tracks, Math.floor(Math.random() * tracks.length), "Playlist");
+    playFromContext(tracks, Math.floor(Math.random() * tracks.length), "Playlist", p.id);
   };
+  view.querySelectorAll("[data-mixbar]").forEach((bar) => {
+    const i = Number(bar.dataset.mixbar);
+    const ed = view.querySelector(`[data-mixed="${i}"]`);
+    if (!ed) return;
+    const out = tracks[i], inn = tracks[i + 1];
+    let draft = getTransition(p.id, out, inn) || { style: "fade", length: settings.crossfade || 6, outSkip: 0, inSkip: 0 };
+    const len = ed.querySelector("[data-mixlen]");
+    const outS = ed.querySelector("[data-mixout]");
+    const inS = ed.querySelector("[data-mixin]");
+    const paint = () => {
+      ed.querySelectorAll("[data-mixstyle]").forEach((b) => b.classList.toggle("on", b.dataset.mixstyle === draft.style));
+      len.value = draft.length; outS.value = draft.outSkip; inS.value = draft.inSkip;
+      ed.querySelector("[data-mixlenval]").textContent = `${draft.length}s`;
+      ed.querySelector("[data-mixoutval]").textContent = `${draft.outSkip}s`;
+      ed.querySelector("[data-mixinval]").textContent = `${draft.inSkip}s`;
+      bar.querySelector("span").textContent = mixSummary(getTransition(p.id, out, inn));
+    };
+    bar.onclick = () => { ed.classList.toggle("hidden"); paint(); };
+    ed.querySelectorAll("[data-mixstyle]").forEach((b) => { b.onclick = () => {
+      draft = { ...draft, style: b.dataset.mixstyle };
+      setTransition(p.id, out, inn, draft);
+      paint();
+    }; });
+    const onSlide = () => {
+      draft = { ...draft, length: Number(len.value), outSkip: Number(outS.value), inSkip: Number(inS.value) };
+      setTransition(p.id, out, inn, draft);
+      paint();
+    };
+    [len, outS, inS].forEach((s) => s.addEventListener("input", onSlide));
+    ed.querySelector("[data-mixauto]").onclick = () => {
+      setTransition(p.id, out, inn, null);
+      draft = { style: "fade", length: settings.crossfade || 6, outSkip: 0, inSkip: 0 };
+      paint();
+    };
+    paint();
+  });
   $("#plRename").onclick = async () => {
     const n = await askName("Rename Playlist", p.name);
     if (n) { p.name = n; savePlaylists(); renderPlaylist(id); }
@@ -857,6 +955,25 @@ function renderSettings() {
   view.innerHTML = `
     <div class="section-title">Settings</div>
     <div class="settings-panel">
+      <div class="setting-row">
+        <div>
+          <div class="setting-name">Crossfade</div>
+          <div class="setting-desc">Auto mix between songs. Playlists can override it per pair with their own Mix.</div>
+        </div>
+        <span class="setting-range"><input id="settingCrossfade" type="range" min="0" max="12" step="1"> <span id="crossfadeVal"></span></span>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-name">Theme</div>
+          <div class="setting-desc">The base look of the whole app. Accent colors apply on top.</div>
+        </div>
+        <select id="settingTheme" aria-label="Theme">
+          <option value="midnight">Midnight</option>
+          <option value="graphite">Graphite</option>
+          <option value="espresso">Espresso</option>
+          <option value="forest">Forest</option>
+        </select>
+      </div>
       <div class="setting-row">
         <div>
           <div class="setting-name">Accent</div>
@@ -896,6 +1013,13 @@ function renderSettings() {
           <option value="reduced">Reduced</option>
         </select>
       </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-name">Your name</div>
+          <div class="setting-desc">Used in the Home greeting. Stays on this machine.</div>
+        </div>
+        <input id="settingName" type="text" maxlength="40" placeholder="e.g. Arzu" autocomplete="off" spellcheck="false">
+      </div>
     </div>
     <div class="section-title">Keyboard shortcuts</div>
     <div>
@@ -913,6 +1037,27 @@ function renderSettings() {
   $("#settingAccentMode").value = settings.accentMode;
   $("#settingVizStyle").value = settings.vizStyle;
   $("#settingMotion").value = settings.motion;
+  $("#settingTheme").value = settings.theme;
+  $("#settingTheme").addEventListener("change", (e) => {
+    settings.theme = e.target.value;
+    applySettings();
+  });
+  const cfInput = $("#settingCrossfade");
+  cfInput.value = settings.crossfade;
+  paintRangeFill(cfInput);
+  $("#crossfadeVal").textContent = settings.crossfade === 0 ? "Off" : `${settings.crossfade}s`;
+  cfInput.addEventListener("input", (e) => {
+    settings.crossfade = Number(e.target.value);
+    $("#crossfadeVal").textContent = settings.crossfade === 0 ? "Off" : `${settings.crossfade}s`;
+    paintRangeFill(cfInput);
+    applySettings();
+  });
+  const nameInput = $("#settingName");
+  nameInput.value = settings.name;
+  nameInput.addEventListener("change", (e) => {
+    settings.name = e.target.value.trim().slice(0, 40);
+    applySettings();
+  });
   $("#settingAccentMode").addEventListener("change", (e) => {
     settings.accentMode = e.target.value;
     applySettings();
@@ -961,10 +1106,9 @@ function refreshLikeUi() {
   syncHeartStates();
 }
 
-const CROSSFADE_S = 3;
 const player = {
   queue: [], index: -1, current: null, contextName: "",
-  playing: false, shuffle: false, repeat: 0,
+  playing: false, shuffle: false, repeat: 0, playlistId: null,
   radioBusy: false, failCount: 0,
 };
 function makeDeck() {
@@ -989,8 +1133,13 @@ function ensureWebAudio() {
     masterGain.connect(actx.destination);
     decks.forEach((d) => {
       d.source = actx.createMediaElementSource(d.el);
+      d.filter = actx.createBiquadFilter();
+      d.filter.type = "lowpass";
+      d.filter.frequency.value = 18000;
+      d.filter.Q.value = 0.4;
       d.gain = actx.createGain();
-      d.source.connect(d.gain);
+      d.source.connect(d.filter);
+      d.filter.connect(d.gain);
       d.gain.connect(analyser);
     });
     webAudioOk = true;
@@ -1008,19 +1157,33 @@ function rampDeck(deck, v, seconds) {
     deck.gain.gain.linearRampToValueAtTime(v, actx.currentTime + seconds);
   }
 }
+function setDeckFilter(deck, freq) {
+  if (webAudioOk && deck.filter && actx) {
+    deck.filter.frequency.cancelScheduledValues(actx.currentTime);
+    deck.filter.frequency.setTargetAtTime(freq, actx.currentTime, 0.05);
+  }
+}
+function rampFilter(deck, freq, seconds) {
+  if (webAudioOk && deck.filter && actx) {
+    deck.filter.frequency.cancelScheduledValues(actx.currentTime);
+    deck.filter.frequency.setValueAtTime(deck.filter.frequency.value, actx.currentTime);
+    deck.filter.frequency.exponentialRampToValueAtTime(Math.max(40, freq), actx.currentTime + seconds);
+  }
+}
 
 function urlFor(track) {
   return track.source === "local"
     ? `/local/file/${encodeURIComponent(track.id)}`
     : `/audio/${encodeURIComponent(track.id)}`;
 }
-function playFromContext(list, idx, ctxLabel) {
+function playFromContext(list, idx, ctxLabel, playlistId) {
   if (!list || !list.length || idx < 0) return;
   player.queue = list.slice();
   player.contextName = ctxLabel || "Songs";
+  player.playlistId = playlistId || null;
   startAt(idx, false);
 }
-function startAt(idx, fade) {
+function startAt(idx, fade, tr) {
   const track = player.queue[idx];
   if (!track) return;
   player.index = idx;
@@ -1033,13 +1196,37 @@ function startAt(idx, fade) {
   const wasPreloaded = to.trackId === track.id && to.el.src;
   to.trackId = track.id;
   if (!wasPreloaded) to.el.src = urlFor(track);
-  to.el.currentTime = 0;
+  to.el.currentTime = fade && tr ? (tr.inSkip || 0) : 0;
   if (webAudioOk) setDeckLevel(to, 1);
   to.el.play().catch(() => onTrackError(to));
   if (fade) {
-    rampDeck(to, 1, CROSSFADE_S);
-    rampDeck(from, 0, CROSSFADE_S);
-    setTimeout(() => { from.el.pause(); from.trackId = null; }, CROSSFADE_S * 1000 + 120);
+    const F = Math.max(0.4, (tr && tr.length) || settings.crossfade || 3);
+    const style = (tr && tr.style) || "fade";
+    if (webAudioOk && to.gain && actx) {
+      to.gain.gain.cancelScheduledValues(actx.currentTime);
+      to.gain.gain.setValueAtTime(0, actx.currentTime);
+    }
+    if (style === "rise") {
+      setDeckFilter(to, 500);
+      rampFilter(to, 18000, F);
+      setDeckFilter(from, 18000);
+    } else if (style === "blend") {
+      setDeckFilter(to, 500);
+      rampFilter(to, 18000, F);
+      rampFilter(from, 500, F);
+    } else {
+      setDeckFilter(to, 18000);
+      setDeckFilter(from, 18000);
+    }
+    rampDeck(to, 1, F);
+    rampDeck(from, 0, F);
+    setTimeout(() => {
+      from.el.pause();
+      from.trackId = null;
+      setDeckFilter(from, 18000);
+    }, F * 1000 + 120);
+  } else if (webAudioOk) {
+    setDeckFilter(to, 18000);
   }
   player.playing = true;
   notePlayed(track);
@@ -1062,9 +1249,9 @@ function nextIndex(auto) {
   if (player.repeat === 1) return 0;
   return -1;
 }
-async function advance(auto, fade) {
+async function advance(auto, fade, tr) {
   const n = nextIndex(auto);
-  if (n >= 0) { startAt(n, fade); return; }
+  if (n >= 0) { startAt(n, fade, tr); return; }
   if (auto) {
     if (player.radioBusy || !player.current) return stopPlayback();
     player.radioBusy = true;
@@ -1108,10 +1295,10 @@ function onTrackError(deck) {
   if (deck !== activeDeck) return;
   player.failCount++;
   if (player.failCount <= 2) {
-    toast("Couldn't load this track. Skipping.");
+    toast("Couldn't load this track, skipping to the next one.");
     advance(true, false);
   } else {
-    toast("Playback stopped. The stream could not be loaded.");
+    toast("Playback stopped, the stream couldn't be loaded.");
     stopPlayback();
   }
 }
@@ -1146,7 +1333,7 @@ decks.forEach((deck) => {
     if (!el.duration) return;
     wakeMotionLoop();
     const remaining = el.duration - el.currentTime;
-    if (remaining <= 45 && remaining > CROSSFADE_S + 1) {
+    if (remaining <= 45 && remaining > 2) {
       const n = nextIndex(true);
       if (n >= 0 && player.repeat !== 2) {
         const nt = player.queue[n];
@@ -1157,11 +1344,14 @@ decks.forEach((deck) => {
         }
       }
     }
-    if (CROSSFADE_S > 0 && remaining <= CROSSFADE_S && remaining > 0.15 &&
-        player.repeat !== 2 && hasNext(true) && !deck.fading) {
-      deck.fading = true;
-      advance(true, true);
-      setTimeout(() => { deck.fading = false; }, CROSSFADE_S * 1000 + 200);
+    if (remaining <= 20 && player.repeat !== 2 && hasNext(true) && !deck.fading) {
+      const tr = currentTransition();
+      const F = tr.length || 0;
+      if (F > 0 && remaining <= F + (tr.outSkip || 0) && remaining > 0.15) {
+        deck.fading = true;
+        advance(true, true, tr);
+        setTimeout(() => { deck.fading = false; }, (F + (tr.outSkip || 0)) * 1000 + 200);
+      }
     }
   });
 });

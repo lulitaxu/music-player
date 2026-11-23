@@ -664,6 +664,37 @@ body.motion-reduced .like-pop { animation: none; }
 .modal-card input[type="text"]:focus { border-color: rgba(255, 255, 255, 0.35); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 16px; }
 
+body[data-theme="graphite"] { --glass-side: rgba(32, 34, 38, 0.72); --glass-content: rgba(58, 62, 70, 0.38); --glass-dark: rgba(24, 26, 30, 0.62); }
+body[data-theme="graphite"] #ambientA { background-image: radial-gradient(1100px 750px at 72% 18%, #232830, #090a0c 72%); }
+body[data-theme="espresso"] { --glass-side: rgba(38, 30, 26, 0.72); --glass-content: rgba(84, 66, 54, 0.38); --glass-dark: rgba(32, 24, 20, 0.62); }
+body[data-theme="espresso"] #ambientA { background-image: radial-gradient(1100px 750px at 72% 18%, #33241a, #0c0806 72%); }
+body[data-theme="forest"] { --glass-side: rgba(26, 36, 30, 0.72); --glass-content: rgba(52, 72, 60, 0.38); --glass-dark: rgba(20, 28, 24, 0.62); }
+body[data-theme="forest"] #ambientA { background-image: radial-gradient(1100px 750px at 72% 18%, #1e2e24, #070a08 72%); }
+.mix-bar {
+  display: flex; align-items: center; gap: 8px;
+  margin: 2px 0 2px 52px; padding: 5px 12px; border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05); color: var(--text55);
+  font-size: 12.5px; font-weight: 600;
+}
+.mix-bar:hover { background: rgba(255, 255, 255, 0.1); color: var(--text); }
+.mix-editor {
+  margin: 6px 0 10px 52px; padding: 14px 16px; border-radius: 16px;
+  background: rgba(255, 255, 255, 0.05);
+  display: flex; flex-direction: column; gap: 12px; max-width: 520px;
+}
+.mix-styles { display: flex; gap: 8px; }
+.mix-slider { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text55); }
+.mix-slider input { flex: 1; }
+.mix-slider span { min-width: 30px; text-align: right; font-weight: 650; color: var(--text); }
+.setting-range { display: flex; align-items: center; gap: 10px; min-width: 200px; }
+.setting-range input { flex: 1; }
+.setting-range span { min-width: 32px; text-align: right; font-weight: 650; }
+.settings-panel input[type="text"] {
+  background: rgba(255, 255, 255, 0.08); color: var(--text);
+  border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 10px;
+  padding: 9px 12px; font-size: 14px; outline: none; min-width: 200px;
+}
+
 body.lowfx #main, body.lowfx #sidebar, body.lowfx #sidePanel, body.lowfx #rail, body.lowfx #player {
   -webkit-backdrop-filter: none; backdrop-filter: none;
 }
