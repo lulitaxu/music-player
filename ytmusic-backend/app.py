@@ -159,8 +159,7 @@ def hi_res_art(url):
     if "googleusercontent.com" in url:
         return re.sub(r"=w\d+-h\d+", "=w540-h540", url, count=1)
     if "i.ytimg.com" in url:
-        return url.replace("hqdefault", "maxresdefault").replace(
-            "mqdefault", "maxresdefault")
+        return url.replace("mqdefault", "hqdefault")
     return url
 
 

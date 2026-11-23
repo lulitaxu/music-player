@@ -25,6 +25,9 @@
     <div class="side-sub">arzxsh · your music, on this computer</div>
     <div class="side-label">Your library</div>
     <button class="side-link" id="likedLink">♥&nbsp; Liked Songs <span class="side-count" id="likedCount"></span></button>
+    <div class="side-label">Playlists</div>
+    <div id="sidePlaylists"></div>
+    <button class="side-link" id="sideNewPlaylist">＋&nbsp; New Playlist</button>
     <div class="side-label">Recently played</div>
     <div id="sideRecent"></div>
     <div class="side-foot">Local web app · same catalog<br>and design as the phone app.</div>
@@ -92,7 +95,7 @@
     <canvas id="vizMini" width="72" height="28" title="Visualizer"></canvas>
     <button id="panelLyricsBtn" class="icon-btn" title="Lyrics (L)"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><line x1="8" y1="8" x2="16" y2="8"/><line x1="8" y1="12" x2="13" y2="12"/></svg></button>
     <button id="queueBtn" class="icon-btn" title="Up Next (Q)">☰</button>
-    <span class="vol-ico">🔊</span>
+    <button id="muteBtn" class="icon-btn" title="Mute">🔊</button>
     <input id="volume" type="range" min="0" max="100" value="80">
     <button id="expandBtn" class="icon-btn" title="Now Playing (F)">⤢</button>
   </div>
@@ -134,6 +137,10 @@
           <button id="npDownload" class="chip-btn">⬇ Download</button>
           <button id="npHeart" class="chip-btn">♡ Like</button>
         </div>
+        <div class="np-volume">
+          <button id="npMute" class="icon-btn" title="Mute">🔊</button>
+          <input id="npVolume" type="range" min="0" max="100" value="80">
+        </div>
       </div>
       <div class="np-right">
         <div id="npPanel">
@@ -161,6 +168,17 @@
           </section>
         </div>
       </div>
+    </div>
+  </div>
+</div>
+
+<div id="modalOverlay" class="hidden">
+  <div class="modal-card">
+    <div id="modalTitle" class="modal-title"></div>
+    <input id="modalInput" type="text" autocomplete="off" spellcheck="false">
+    <div class="modal-actions">
+      <button id="modalCancel" class="chip-btn">Cancel</button>
+      <button id="modalOk" class="chip-btn on">Save</button>
     </div>
   </div>
 </div>

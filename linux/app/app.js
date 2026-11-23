@@ -184,6 +184,63 @@ function notePlayed(track) {
   renderSideRecent();
 }
 
+let modalResolve = null;
+function askName(title, initial = "") {
+  return new Promise((resolve) => {
+    modalResolve = resolve;
+    $("#modalTitle").textContent = title;
+    const input = $("#modalInput");
+    input.value = initial;
+    $("#modalOverlay").classList.remove("hidden");
+    setTimeout(() => { input.focus(); input.select(); }, 30);
+  });
+}
+function closeModal(value) {
+  $("#modalOverlay").classList.add("hidden");
+  if (modalResolve) { modalResolve(value); modalResolve = null; }
+}
+$("#modalOk").onclick = () => closeModal($("#modalInput").value.trim() || null);
+$("#modalCancel").onclick = () => closeModal(null);
+$("#modalOverlay").addEventListener("mousedown", (e) => { if (e.target === e.currentTarget) closeModal(null); });
+$("#modalInput").addEventListener("keydown", (e) => {
+  e.stopPropagation();
+  if (e.key === "Enter") closeModal($("#modalInput").value.trim() || null);
+  if (e.key === "Escape") closeModal(null);
+});
+
+let playlists = store.get("arzxsh.playlists", []);
+function savePlaylists() { store.set("arzxsh.playlists", playlists); renderSidePlaylists(); }
+function getPlaylist(id) { return playlists.find((p) => p.id === id); }
+async function createPlaylist(name) {
+  const n = name || await askName("New Playlist", `My Playlist ${playlists.length + 1}`);
+  if (!n) return null;
+  const p = { id: "pl_" + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36), name: n, tracks: [] };
+  playlists = [p, ...playlists];
+  savePlaylists();
+  return p;
+}
+function addToPlaylist(p, track) {
+  if (p.tracks.some((t) => t.id === track.id)) { toast(`Already in ${p.name}`); return; }
+  p.tracks = [...p.tracks, track];
+  savePlaylists();
+  toast(`Added to ${p.name}`);
+}
+function removeFromPlaylist(p, trackId) {
+  p.tracks = p.tracks.filter((t) => t.id !== trackId);
+  savePlaylists();
+}
+function renderSidePlaylists() {
+  const box = $("#sidePlaylists");
+  if (!box) return;
+  box.innerHTML = playlists.map((p) =>
+    `<button class="side-link" data-pl="${esc(p.id)}">♪&nbsp; ${esc(p.name)} <span class="side-count">${p.tracks.length}</span></button>`).join("");
+  box.querySelectorAll("[data-pl]").forEach((b) => { b.onclick = () => navigate({ type: "playlist", id: b.dataset.pl }); });
+}
+$("#sideNewPlaylist").onclick = async () => {
+  const p = await createPlaylist();
+  if (p) navigate({ type: "playlist", id: p.id });
+};
+
 const routes = [];
 let routeIdx = -1;
 function navigate(route, replace = false) {
@@ -206,6 +263,7 @@ function renderRoute() {
   else if (r.type === "album") renderAlbum(r.id);
   else if (r.type === "library") renderLibrary();
   else if (r.type === "liked") renderLiked();
+  else if (r.type === "playlist") renderPlaylist(r.id);
   else if (r.type === "local") renderLocal();
   else if (r.type === "settings") renderSettings();
 }
@@ -342,6 +400,7 @@ const CTX_LABELS = {
   charts: "Trending now", searchSongs: "Search", artistSongs: "Artist",
   albumTracks: "Album", recent: "Jump back in", recentLib: "Recently played",
   recentSide: "Recently played", likedList: "Liked Songs", localList: "On this device",
+  playlistTracks: "Playlist",
 };
 function skeletons(n, h = 62) {
   return Array.from({ length: n }, () =>
@@ -666,14 +725,26 @@ function renderLibrary() {
     <div class="section-title">Library</div>
     <div class="quick-grid">
       <button class="quick-tile" id="libLiked">
-        <img src="" alt="" style="background:var(--accent)">
+        ${coverHtml(likes[0], "♥", "cover-liked")}
         <span><div class="qt-title">Liked Songs</div><div class="qt-sub">${likes.length} songs</div></span>
+      </button>
+    </div>
+    <div class="section-title">Playlists</div>
+    <div class="quick-grid">
+      ${playlists.map((p) => `
+      <button class="quick-tile" data-libpl="${esc(p.id)}">
+        ${playlistCoverHtml(p)}
+        <span><div class="qt-title">${esc(p.name)}</div><div class="qt-sub">${p.tracks.length} songs</div></span>
+      </button>`).join("")}
+      <button class="quick-tile" id="libNewPlaylist">
+        <span class="cover cover-fallback">＋</span>
+        <span><div class="qt-title">New Playlist</div><div class="qt-sub">Make your own</div></span>
       </button>
     </div>
     <div class="section-title">On this device</div>
     <div class="quick-grid">
       <button class="quick-tile" id="libLocal">
-        <img src="" alt="" style="background:var(--surface2)">
+        <span id="libLocalCover">${coverHtml(null, "♪")}</span>
         <span><div class="qt-title">Local files & downloads</div><div class="qt-sub" id="libLocalCount">From your music folder</div></span>
       </button>
     </div>
@@ -682,9 +753,16 @@ function renderLibrary() {
   register(recentPlays, "recentLib");
   $("#libLiked").onclick = () => navigate({ type: "liked" });
   $("#libLocal").onclick = () => navigate({ type: "local" });
+  view.querySelectorAll("[data-libpl]").forEach((b) => { b.onclick = () => navigate({ type: "playlist", id: b.dataset.libpl }); });
+  $("#libNewPlaylist").onclick = async () => {
+    const p = await createPlaylist();
+    if (p) navigate({ type: "playlist", id: p.id });
+  };
   api("/local").then((d) => {
     const el = $("#libLocalCount");
     if (el) el.textContent = `${d.tracks.length} tracks · ${d.dir}`;
+    const cov = $("#libLocalCover");
+    if (cov && d.tracks.length) cov.innerHTML = coverHtml(d.tracks[0], "♪");
   }).catch(() => {});
 }
 async function renderLocal(fresh = false) {
@@ -695,7 +773,7 @@ async function renderLocal(fresh = false) {
     register(data.tracks, "localList");
     view.innerHTML = `
       <div class="page-head plain">
-        <img src="" alt="" style="background:var(--surface2);box-shadow:none">
+        ${coverHtml(data.tracks[0], "♪")}
         <div>
           <div class="page-kind">Local library</div>
           <div class="page-name">On this device</div>
@@ -712,11 +790,60 @@ async function renderLocal(fresh = false) {
       <div class="error-note">Couldn't read the local library.<button data-retry>Retry</button></div>`;
   }
 }
+function coverHtml(track, glyph = "♪", cls = "") {
+  if (track && track.artwork) return `<span class="cover ${cls}"><img src="${esc(track.artwork)}" alt=""></span>`;
+  return `<span class="cover cover-fallback ${cls}">${glyph}</span>`;
+}
+function playlistCoverHtml(p, cls = "") {
+  const arts = [...new Set(p.tracks.map((t) => t.artwork).filter(Boolean))].slice(0, 4);
+  if (arts.length >= 2) return `<span class="cover cover-collage ${cls}">${arts.map((a) => `<img src="${esc(a)}" alt="">`).join("")}</span>`;
+  if (arts.length === 1) return `<span class="cover ${cls}"><img src="${esc(arts[0])}" alt=""></span>`;
+  return `<span class="cover cover-fallback ${cls}">♪</span>`;
+}
+function renderPlaylist(id) {
+  const p = getPlaylist(id);
+  if (!p) { navigate({ type: "library" }, true); return; }
+  const tracks = p.tracks;
+  register(tracks, "playlistTracks");
+  view.innerHTML = `
+    <div class="page-head plain">
+      ${playlistCoverHtml(p)}
+      <div>
+        <div class="page-kind">Playlist</div>
+        <div class="page-name">${esc(p.name)}</div>
+        <div class="page-meta">${tracks.length} songs · stored on this machine only</div>
+        <div class="page-actions">
+          <button class="play-pill" id="pagePlay">▶ Play</button>
+          <button class="shuffle-pill" id="pageShuffle">⤨ Shuffle</button>
+          <button class="chip-btn" id="plRename">Rename</button>
+          <button class="chip-btn" id="plDelete">Delete</button>
+        </div>
+      </div>
+    </div>
+    <div class="section-title">Songs</div>
+    ${tracks.length ? tracks.map((t, i) => rowHtml(t, i, { rank: true, ctx: "playlistTracks" })).join("") : `<div class="empty-note">Nothing here yet. Right-click any song and choose Add to Playlist.</div>`}`;
+  $("#pagePlay").onclick = () => { if (tracks.length) playFromContext(tracks, 0, "Playlist"); };
+  $("#pageShuffle").onclick = () => {
+    if (!tracks.length) return;
+    if (!player.shuffle) toggleShuffle();
+    playFromContext(tracks, Math.floor(Math.random() * tracks.length), "Playlist");
+  };
+  $("#plRename").onclick = async () => {
+    const n = await askName("Rename Playlist", p.name);
+    if (n) { p.name = n; savePlaylists(); renderPlaylist(id); }
+  };
+  $("#plDelete").onclick = () => {
+    playlists = playlists.filter((x) => x.id !== id);
+    savePlaylists();
+    toast("Playlist deleted");
+    navigate({ type: "library" }, true);
+  };
+}
 function renderLiked() {
   register(likes, "likedList");
   view.innerHTML = `
     <div class="page-head plain">
-      <img src="" alt="" style="background:var(--accent);box-shadow:none">
+      ${coverHtml(likes[0], "♥", "cover-liked")}
       <div>
         <div class="page-kind">Playlist</div>
         <div class="page-name">Liked Songs</div>
@@ -1278,17 +1405,31 @@ $("#shuffleBtn").onclick = toggleShuffle;
 $("#npShuffle").onclick = toggleShuffle;
 $("#pHeart").onclick = (e) => { e.stopPropagation(); if (player.current) toggleLike(player.current); };
 $("#npHeart").onclick = () => { if (player.current) toggleLike(player.current); };
-$("#volume").value = store.get("arzxsh.volume", 80);
-paintRangeFill($("#volume"));
+let preMuteVolume = 80;
+function volumeIcon(v) { return v <= 0 ? "🔇" : v < 50 ? "🔉" : "🔊"; }
 function setVolume(v) {
   v = Math.max(0, Math.min(100, Math.round(v)));
+  if (v > 0) preMuteVolume = v;
   $("#volume").value = v;
   paintRangeFill($("#volume"));
+  const npv = $("#npVolume");
+  if (npv) { npv.value = v; paintRangeFill(npv); }
+  $("#muteBtn").textContent = volumeIcon(v);
+  $("#npMute").textContent = volumeIcon(v);
   store.set("arzxsh.volume", v);
   if (webAudioOk && masterGain) masterGain.gain.value = v / 100;
   else decks.forEach((d) => { d.el.volume = v / 100; });
 }
+function toggleMute() {
+  const cur = Number($("#volume").value);
+  if (cur > 0) setVolume(0);
+  else setVolume(preMuteVolume || 80);
+}
 $("#volume").addEventListener("input", () => setVolume(Number($("#volume").value)));
+$("#npVolume").addEventListener("input", () => setVolume(Number($("#npVolume").value)));
+$("#muteBtn").onclick = toggleMute;
+$("#npMute").onclick = toggleMute;
+setVolume(store.get("arzxsh.volume", 80));
 if (navigator.mediaSession) {
   navigator.mediaSession.setActionHandler("play", togglePlay);
   navigator.mediaSession.setActionHandler("pause", togglePlay);
@@ -1458,7 +1599,9 @@ function closeCtxMenu() {
   ctxMenu.classList.add("hidden");
   ctxOpen = false;
 }
+let ctxLastX = 0, ctxLastY = 0;
 function openCtxMenu(x, y, items) {
+  ctxLastX = x; ctxLastY = y;
   ctxMenu.innerHTML = items.map((it, i) => it.sep
     ? `<div class="ctx-sep"></div>`
     : `<button class="ctx-item" data-ctx-item="${i}"><span class="ctx-ico">${it.icon || ""}</span>${esc(it.label)}</button>`).join("");
@@ -1486,6 +1629,7 @@ function trackCtxItems(track, playAction) {
     icon: isLiked(track.id) ? "♥" : "♡",
     action: () => toggleLike(track),
   });
+  items.push({ label: "Add to Playlist", icon: "＋", action: () => openPlaylistPicker(track) });
   if (track.source !== "local" && !downloads[track.id]) {
     items.push({ label: "Download", icon: "⬇", action: () => doDownload(track) });
   }
@@ -1498,6 +1642,18 @@ function trackCtxItems(track, playAction) {
   }
   return items;
 }
+function openPlaylistPicker(track) {
+  const items = playlists.map((p) => ({
+    label: p.name, icon: "♪",
+    action: () => addToPlaylist(p, track),
+  }));
+  if (items.length) items.push({ sep: true });
+  items.push({
+    label: "New Playlist…", icon: "＋",
+    action: async () => { const p = await createPlaylist(); if (p) addToPlaylist(p, track); },
+  });
+  openCtxMenu(ctxLastX, ctxLastY, items);
+}
 document.addEventListener("contextmenu", (e) => {
   const row = e.target.closest("[data-play]");
   const albumCard = e.target.closest("[data-album]");
@@ -1509,8 +1665,19 @@ document.addEventListener("contextmenu", (e) => {
     if (!track) return;
     const list = contexts.get(row.dataset.ctx) || [track];
     const idx = list.findIndex((t) => t.id === track.id);
-    openCtxMenu(e.clientX, e.clientY, trackCtxItems(track,
-      idx >= 0 ? () => playFromContext(list, idx, CTX_LABELS[row.dataset.ctx] || "Songs") : null));
+    const items = trackCtxItems(track,
+      idx >= 0 ? () => playFromContext(list, idx, CTX_LABELS[row.dataset.ctx] || "Songs") : null);
+    if (row.dataset.ctx === "playlistTracks" && routes[routeIdx].type === "playlist") {
+      items.push({ sep: true });
+      items.push({
+        label: "Remove from Playlist", icon: "✕",
+        action: () => {
+          const p = getPlaylist(routes[routeIdx].id);
+          if (p) { removeFromPlaylist(p, track.id); renderPlaylist(p.id); }
+        },
+      });
+    }
+    openCtxMenu(e.clientX, e.clientY, items);
   } else if (albumCard) {
     const id = albumCard.dataset.album;
     openCtxMenu(e.clientX, e.clientY, [
@@ -1974,6 +2141,22 @@ document.body.classList.add("no-player");
 applySettings(false);
 paintSeekRatio(0, 0);
 renderSideRecent();
+renderSidePlaylists();
+const ART_SPACER = "data:image/gif;base64,R0lGODlhAQABAAAAACw=";
+document.addEventListener("error", (e) => {
+  const t = e.target;
+  if (t && t.tagName === "IMG" && t.src !== ART_SPACER) t.src = ART_SPACER;
+}, true);
+[likes, recentPlays, ...playlists.map((p) => p.tracks)].forEach((list) => {
+  list.forEach((t) => {
+    if (t && t.artwork && t.artwork.includes("maxresdefault")) {
+      t.artwork = t.artwork.replace("maxresdefault", "hqdefault");
+    }
+  });
+});
+store.set("arzxsh.likes", likes);
+store.set("arzxsh.recent", recentPlays);
+store.set("arzxsh.playlists", playlists);
 navigate({ type: "home" }, true);
 if (new URLSearchParams(location.search).has("debug")) {
   window.__arzxsh = { player, decks };
