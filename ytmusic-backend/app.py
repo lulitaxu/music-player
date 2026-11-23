@@ -152,13 +152,25 @@ def cached(key: str, ttl: float, fn):
 
 
 # --- shape helpers (mirror the app's Track / Artist models) -------------------
+
+def hi_res_art(url):
+    if not url:
+        return url
+    if "googleusercontent.com" in url:
+        return re.sub(r"=w\d+-h\d+", "=w540-h540", url, count=1)
+    if "i.ytimg.com" in url:
+        return url.replace("hqdefault", "maxresdefault").replace(
+            "mqdefault", "maxresdefault")
+    return url
+
+
 def track(t: dict) -> dict | None:
     vid = t.get("videoId")
     if not vid:
         return None
     artists = t.get("artists") or []
     thumbs = t.get("thumbnails") or []
-    art = thumbs[-1]["url"] if thumbs else None
+    art = hi_res_art(thumbs[-1]["url"]) if thumbs else None
     return {
         "id": vid,
         "source": "ytmusic",
@@ -216,7 +228,7 @@ def search(q: str = Query(min_length=1), filter: str = "songs", limit: int = 25)
                     {
                         "id": r.get("browseId"),
                         "name": r.get("artist"),
-                        "artwork": (r.get("thumbnails") or [{}])[-1].get("url"),
+                        "artwork": hi_res_art((r.get("thumbnails") or [{}])[-1].get("url")),
                     }
                     for r in res
                     if r.get("browseId")
@@ -230,7 +242,7 @@ def search(q: str = Query(min_length=1), filter: str = "songs", limit: int = 25)
                     "title": r.get("title"),
                     "artist": ", ".join(a.get("name", "") for a in (r.get("artists") or [])),
                     "year": r.get("year"),
-                    "artwork": (r.get("thumbnails") or [{}])[-1].get("url"),
+                    "artwork": hi_res_art((r.get("thumbnails") or [{}])[-1].get("url")),
                 }
                 for r in res
                 if r.get("browseId")
@@ -274,7 +286,7 @@ def artist(channel_id: str):
             "id": channel_id,
             "name": a.get("name"),
             "description": a.get("description"),
-            "artwork": (a.get("thumbnails") or [{}])[-1].get("url"),
+            "artwork": hi_res_art((a.get("thumbnails") or [{}])[-1].get("url")),
             "subscribers": a.get("subscribers"),
             "songs": tracks(songs.get("results")),
             "albums": [
@@ -282,7 +294,7 @@ def artist(channel_id: str):
                     "id": r.get("browseId"),
                     "title": r.get("title"),
                     "year": r.get("year"),
-                    "artwork": (r.get("thumbnails") or [{}])[-1].get("url"),
+                    "artwork": hi_res_art((r.get("thumbnails") or [{}])[-1].get("url")),
                 }
                 for r in (albums.get("results") or [])
                 if r.get("browseId")
@@ -292,7 +304,7 @@ def artist(channel_id: str):
                     "id": r.get("browseId"),
                     "title": r.get("title"),
                     "year": r.get("year"),
-                    "artwork": (r.get("thumbnails") or [{}])[-1].get("url"),
+                    "artwork": hi_res_art((r.get("thumbnails") or [{}])[-1].get("url")),
                 }
                 for r in (singles.get("results") or [])
                 if r.get("browseId")
@@ -301,7 +313,7 @@ def artist(channel_id: str):
                 {
                     "id": r.get("browseId"),
                     "name": r.get("title"),
-                    "artwork": (r.get("thumbnails") or [{}])[-1].get("url"),
+                    "artwork": hi_res_art((r.get("thumbnails") or [{}])[-1].get("url")),
                 }
                 for r in (related.get("results") or [])
                 if r.get("browseId")
@@ -323,7 +335,7 @@ def album(browse_id: str):
             "title": a.get("title"),
             "artist": ", ".join(x.get("name", "") for x in (a.get("artists") or [])),
             "year": a.get("year"),
-            "artwork": (a.get("thumbnails") or [{}])[-1].get("url"),
+            "artwork": hi_res_art((a.get("thumbnails") or [{}])[-1].get("url")),
             "tracks": tracks(a.get("tracks")),
         }
 
@@ -364,7 +376,7 @@ def charts(country: str = "GLOBAL"):
                 {
                     "id": r.get("browseId") or r.get("channelId"),
                     "name": r.get("title") or r.get("name"),
-                    "artwork": (r.get("thumbnails") or [{}])[-1].get("url"),
+                    "artwork": hi_res_art((r.get("thumbnails") or [{}])[-1].get("url")),
                 }
                 for r in (arts or [])
                 if (r.get("browseId") or r.get("channelId"))
@@ -433,7 +445,7 @@ def song(video_id: str):
                 download=False,
             )
         thumbs = info.get("thumbnails") or []
-        art = info.get("thumbnail") or (thumbs[-1]["url"] if thumbs else None)
+        art = hi_res_art(info.get("thumbnail") or (thumbs[-1]["url"] if thumbs else None))
         return {
             "id": video_id,
             "source": "link",
@@ -1096,6 +1108,8 @@ def _fetch_art_bytes(url: str):
         r.raise_for_status()
         data = r.content
     except Exception:
+        if "maxresdefault" in url:
+            return _fetch_art_bytes(url.replace("maxresdefault", "hqdefault"))
         return None
     if data[:3] == b"\xff\xd8\xff":
         return data, "image/jpeg"
@@ -1171,7 +1185,7 @@ def _download_extras(path: Path, video_id: str, thumb_url: str = "") -> None:
     except Exception:
         lyrics_text = None
     art = _fetch_art_bytes(
-        thumb_url or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
+        thumb_url or f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg")
     _embed_art_lyrics(path, lyrics_text, art)
 
 
@@ -1241,7 +1255,7 @@ def download(video_id: str, title: str = "", artist: str = ""):
             pass
     thumbs = (info or {}).get("thumbnails") or []
     _download_extras(dest, video_id,
-                     thumbs[-1].get("url", "") if thumbs else "")
+                     hi_res_art(thumbs[-1].get("url", "")) if thumbs else "")
     _cache.pop("local:scan", None)
     _scan_local()
     return {"ok": True, "already": False, "track": _local_track(dest)}
