@@ -21,7 +21,7 @@ modules:
     build-commands:
       - install -Dm755 packaging/flatpak/arzxsh.sh /app/bin/arzxsh
       - install -Dm644 ytmusic-backend/app.py /app/share/arzxsh/ytmusic-backend/app.py
-      - cp -r linux/app /app/share/arzxsh/linux/app
+      - mkdir -p /app/share/arzxsh/linux && cp -r linux/app /app/share/arzxsh/linux/app
       - install -Dm644 linux/shell/arzxsh_shell.py /app/share/arzxsh/shell/arzxsh_shell.py
       - install -Dm644 packaging/flatpak/me.arafatarzu.arzxsh.desktop /app/share/applications/me.arafatarzu.arzxsh.desktop
       - install -Dm644 packaging/flatpak/me.arafatarzu.arzxsh.metainfo.xml /app/share/metainfo/me.arafatarzu.arzxsh.metainfo.xml
