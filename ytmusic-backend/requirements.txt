@@ -9,3 +9,4 @@ ytmusicapi==1.12.3
 yt-dlp==2026.10.26
 requests==2.34.2
 mutagen==1.48.1
+numpy==2.2.6

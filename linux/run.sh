@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 BACKEND="$PWD/../ytmusic-backend"
 PORT="${ARZXSH_PORT:-8077}"
 
-if [ ! -x "$BACKEND/.venv/bin/uvicorn" ]; then
+if [ ! -x "$BACKEND/.venv/bin/uvicorn" ] || ! "$BACKEND/.venv/bin/python" -c "import numpy" 2>/dev/null; then
   echo "First run: creating the backend environment (one time)…"
   python3 -m venv "$BACKEND/.venv"
   "$BACKEND/.venv/bin/pip" install -q -r "$BACKEND/requirements.txt"

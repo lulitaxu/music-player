@@ -14,9 +14,12 @@ not a licence to expose it.
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 import secrets
+import subprocess
+import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -83,7 +86,8 @@ _CSP = (
 # Coarse budget for the routes that shell out to yt-dlp / upstream
 # fetches: generous for one interactive user, useless for a loop.
 _EXPENSIVE_PREFIXES = ("/search", "/stream", "/audio", "/download",
-                       "/radio", "/artist", "/album", "/playlist", "/lyrics", "/song")
+                       "/radio", "/artist", "/album", "/playlist", "/lyrics", "/song",
+                       "/analyze")
 _RATE_LIMIT = 120  # requests per minute across the expensive routes
 _rate_state: dict[str, float] = {}
 _rate_count = 0
@@ -1296,6 +1300,264 @@ def download(video_id: str, title: str = "", artist: str = ""):
     _cache.pop("local:scan", None)
     _scan_local()
     return {"ok": True, "already": False, "track": _local_track(dest)}
+
+
+# --- track analysis for Auto Mix ---------------------------------------------
+# BPM + musical key analysis, the desktop/CLI counterpart of the
+# Android app's on-device analysis (0.6.19). Same method and same
+# honesty rules: values are computed from the track's real audio or
+# not at all. Local files are read from the scanned library; catalog
+# tracks are fetched once into an analysis cache under the data dir
+# and read from there. Results persist per track key
+# ("<source>_<id>") so analysis runs once per track.
+#
+# Method (mirrors the Android DSP): decode to mono 22,050 Hz PCM
+# (ffmpeg), spectral-flux onset envelope (2,048-point FFT, hop 512),
+# autocorrelation over ~35-240 BPM with a Gaussian tempo prior at
+# 120, Krumhansl-Schmuckler chroma key mapped to a Camelot code,
+# plus a beat phase (first-beat offset) and head/tail loudness so
+# the players can align beats and match levels across a transition.
+# numpy does the math; without it the endpoints report unavailable
+# and every other feature keeps working.
+
+try:
+    import numpy as _np
+except ImportError:
+    _np = None
+
+_DATA_DIR = Path(
+    os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
+) / "arzxsh"
+_ANALYSIS_FILE = _DATA_DIR / "analysis.json"
+_ANALYSIS_AUDIO_DIR = _DATA_DIR / "analysis-audio"
+_analysis_cache: "dict | None" = None
+_analysis_lock = threading.Lock()
+
+_FIFTHS_ABOVE_C = [0, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10, 5]
+_KS_MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
+_KS_MINOR = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
+
+
+def _camelot(root: int, minor: bool) -> str:
+    pc = ((root % 12) + 12) % 12
+    if minor:
+        rel_major = (pc + 3) % 12
+        return f"{((_FIFTHS_ABOVE_C[rel_major] + 7) % 12) + 1}A"
+    return f"{((_FIFTHS_ABOVE_C[pc] + 7) % 12) + 1}B"
+
+
+def _analysis_load() -> dict:
+    global _analysis_cache
+    if _analysis_cache is not None:
+        return _analysis_cache
+    data = {}
+    try:
+        raw = json.loads(_ANALYSIS_FILE.read_text())
+        if isinstance(raw, dict):
+            data = {k: v for k, v in raw.items() if isinstance(v, dict)}
+    except Exception:
+        data = {}
+    _analysis_cache = data
+    return data
+
+
+def _analysis_save() -> None:
+    try:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _ANALYSIS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_analysis_cache or {}))
+        tmp.replace(_ANALYSIS_FILE)
+    except Exception:
+        pass
+
+
+def _analysis_audio_path(source: str, tid: str) -> "Path | None":
+    if source == "local":
+        path = _local_registry.get(tid)
+        if path is None:
+            _scan_local()
+            path = _local_registry.get(tid)
+        return path
+    if source != "ytmusic":
+        return None
+    _ANALYSIS_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    for existing in _ANALYSIS_AUDIO_DIR.iterdir():
+        if existing.is_file() and existing.stem == tid \
+                and existing.suffix.lower() in _AUDIO_EXTS:
+            return existing
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": "bestaudio[ext=m4a]/bestaudio[ext=opus]/bestaudio[ext=ogg]/bestaudio/best",
+        "outtmpl": str(_ANALYSIS_AUDIO_DIR / f"{tid}.%(ext)s"),
+        "retries": 3,
+        "fragment_retries": 3,
+    }
+    if os.environ.get("YTM_DL_NO_VERIFY") == "1":
+        opts["nocheckcertificate"] = True
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([f"https://music.youtube.com/watch?v={tid}"])
+    except Exception:
+        return None
+    for existing in _ANALYSIS_AUDIO_DIR.iterdir():
+        if existing.is_file() and existing.stem == tid \
+                and existing.suffix.lower() in _AUDIO_EXTS:
+            return existing
+    return None
+
+
+def _decode_pcm(path: Path):
+    if _np is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "error", "-nostdin", "-i", str(path),
+             "-t", "240", "-ac", "1", "-ar", "22050", "-f", "f32le", "-"],
+            capture_output=True, timeout=120)
+    except Exception:
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    return _np.frombuffer(proc.stdout, dtype=_np.float32).copy()
+
+
+def _analyze_pcm(x) -> "dict | None":
+    sr, n_fft, hop = 22050, 2048, 512
+    fps = sr / hop
+    if x is None or len(x) < sr * 20:
+        return None
+    window = _np.hanning(n_fft).astype(_np.float32)
+    n_frames = 1 + (len(x) - n_fft) // hop
+    if n_frames < int(fps * 20):
+        return None
+    freqs = _np.fft.rfftfreq(n_fft, 1.0 / sr)
+    chroma_mask = (freqs >= 55.0) & (freqs <= 5000.0)
+    pcs = _np.zeros(len(freqs), dtype=_np.int64)
+    with _np.errstate(divide="ignore", invalid="ignore"):
+        pcs = ((_np.round(12.0 * _np.log2(_np.where(freqs > 0, freqs, 1.0) / 440.0)) + 9) % 12).astype(_np.int64)
+    chroma_mat = _np.zeros((len(freqs), 12), dtype=_np.float64)
+    rows = _np.where(chroma_mask)[0]
+    chroma_mat[rows, pcs[rows]] = 1.0
+    env = _np.zeros(n_frames, dtype=_np.float64)
+    chroma = _np.zeros(12, dtype=_np.float64)
+    prev = _np.zeros((1, n_fft // 2 - 1), dtype=_np.float64)
+    chunk = 2048
+    for start in range(0, n_frames, chunk):
+        idx = _np.arange(start, min(start + chunk, n_frames))
+        frames = _np.stack([x[i * hop:i * hop + n_fft] for i in idx]) * window
+        mag = _np.abs(_np.fft.rfft(frames, axis=1)).astype(_np.float64)
+        chroma += mag.sum(axis=0) @ chroma_mat
+        flux_src = mag[:, 2:]
+        d = _np.diff(_np.vstack([prev, flux_src]), axis=0)
+        env[idx] = _np.where(d > 0, d, 0).sum(axis=1)
+        prev = flux_src[-1:]
+    e = env - env.mean()
+    if float(e @ e) < 1e-9:
+        return None
+    min_lag = max(4, int(fps * 60.0 / 240.0))
+    max_lag = min(int(fps * 60.0 / 35.0), len(e) // 2)
+    if max_lag <= min_lag:
+        return None
+
+    def ac(lag: int) -> float:
+        return float(e[:-lag] @ e[lag:]) / (len(e) - lag)
+
+    best_lag, best_score = -1, -1e308
+    for lag in range(min_lag, max_lag + 1):
+        bpm = 60.0 * fps / lag
+        octaves = _np.log2(bpm / 120.0)
+        prior = _np.exp(-(octaves * octaves) / (2 * 0.55 * 0.55))
+        score = ac(lag) * (0.35 + 0.65 * prior)
+        if score > best_score:
+            best_score, best_lag = score, lag
+    if best_lag < 0:
+        return None
+    refined = float(best_lag)
+    if min_lag < best_lag < max_lag:
+        a, b, c = ac(best_lag - 1), ac(best_lag), ac(best_lag + 1)
+        denom = a - 2 * b + c
+        if denom != 0.0:
+            refined = best_lag + 0.5 * (a - c) / denom
+    bpm = 60.0 * fps / refined
+    if not (30.0 <= bpm <= 250.0):
+        return None
+    bpm = round(bpm * 2) / 2.0
+    if chroma.sum() < 1e-9:
+        return None
+    cvec = chroma / chroma.sum()
+
+    def pearson(a, b) -> float:
+        a = a - a.mean()
+        b = b - b.mean()
+        den = float(_np.sqrt((a @ a) * (b @ b)))
+        return float(a @ b) / den if den else 0.0
+
+    best_corr, best_root, best_minor = -2.0, 0, False
+    for minor, profile in ((False, _KS_MAJOR), (True, _KS_MINOR)):
+        prof = _np.array(profile, dtype=_np.float64)
+        for root in range(12):
+            rotated = _np.array([prof[(i - root) % 12] for i in range(12)])
+            corr = pearson(cvec, rotated)
+            if corr > best_corr:
+                best_corr, best_root, best_minor = corr, root, minor
+    period = fps * 60.0 / bpm
+    best_phase, best_energy = 0, -1.0
+    for phase in range(max(1, int(period))):
+        grid = _np.arange(phase, len(env), period)
+        energy = float(env[grid.astype(_np.int64)].sum())
+        if energy > best_energy:
+            best_energy, best_phase = energy, phase
+    win = min(int(sr * 15), len(x) // 2)
+
+    def db(segment) -> float:
+        if len(segment) == 0:
+            return -60.0
+        rms = float(_np.sqrt(_np.mean(segment.astype(_np.float64) ** 2)))
+        return max(-60.0, min(0.0, 20.0 * _np.log10(rms + 1e-9)))
+
+    return {
+        "bpm": bpm,
+        "root": best_root,
+        "minor": best_minor,
+        "camelot": _camelot(best_root, best_minor),
+        "phase": round(best_phase / fps, 3),
+        "headDb": round(db(x[:win]), 1),
+        "tailDb": round(db(x[-win:]), 1),
+    }
+
+
+@app.get("/analysis")
+def analysis(keys: str = ""):
+    store_map = _analysis_load()
+    out = {}
+    for key in [k.strip() for k in keys.split(",") if k.strip()][:200]:
+        out[key] = store_map.get(key)
+    return out
+
+
+@app.post("/analyze")
+def analyze(source: str = "ytmusic", id: str = ""):
+    if _np is None:
+        raise HTTPException(503, "analysis is unavailable on this install")
+    if not id or len(id) > 200 or "/" in id or "\\" in id or ".." in id:
+        raise HTTPException(400, "bad track id")
+    if source not in ("ytmusic", "local"):
+        raise HTTPException(400, "bad source")
+    key = f"{source}_{id}"
+    with _analysis_lock:
+        store_map = _analysis_load()
+        if key in store_map:
+            return store_map[key]
+        path = _analysis_audio_path(source, id)
+        if path is None:
+            raise HTTPException(422, "no audio available for this track")
+        result = _analyze_pcm(_decode_pcm(path))
+        if result is None:
+            raise HTTPException(422, "could not analyze this track")
+        store_map[key] = result
+        _analysis_save()
+        return result
 
 
 # --- Linux web app (static frontend, same origin) ------------------------------
