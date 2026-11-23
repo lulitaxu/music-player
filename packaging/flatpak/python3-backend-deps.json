@@ -291,6 +291,31 @@
      "sha256": "4f077fe87d3fc7fba259aa63d8c026b18382ca6a42ef37c61e16f1b1b5b82fe7"
     }
    ]
+  },
+  {
+   "name": "python3-numpy",
+   "buildsystem": "simple",
+   "build-commands": [
+    "pip3 install --verbose --exists-action=i --no-index --find-links=\"file://${PWD}\" --prefix=${FLATPAK_DEST} \"numpy==2.2.6\" --no-build-isolation"
+   ],
+   "sources": [
+    {
+     "type": "file",
+     "url": "https://files.pythonhosted.org/packages/8c/3d/1e1db36cfd41f895d266b103df00ca5b3cbe965184df824dec5c08c6b803/numpy-2.2.6-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+     "sha256": "fd83c01228a688733f1ded5201c678f0c53ecc1006ffbc404db9f7a899ac6249",
+     "only-arches": [
+      "x86_64"
+     ]
+    },
+    {
+     "type": "file",
+     "url": "https://files.pythonhosted.org/packages/f8/35/8c80729f1ff76b3921d5c9487c7ac3de9b2a103b1cd05e905b3090513510/numpy-2.2.6-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+     "sha256": "f2618db89be1b4e05f7a1a847a9c1c0abd63e63a1607d892dd54668dd92faf87",
+     "only-arches": [
+      "aarch64"
+     ]
+    }
+   ]
   }
  ]
 }

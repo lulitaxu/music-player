@@ -62,8 +62,8 @@ repo, pip/ folder.)
 
 Note: the committed `python3-backend-deps.json` has one hand-applied
 fix on top of the generator output. The generator emits source tarballs
-for the five packages with compiled code (pydantic-core, uvloop,
-httptools, watchfiles, PyYAML); those were swapped for their official
+for the six packages with compiled code (pydantic-core, uvloop,
+httptools, watchfiles, PyYAML, numpy); those were swapped for their official
 per-arch cp312 manylinux wheels (x86_64 + aarch64, `only-arches`), so
 the Flathub build needs no Rust or C compilation at all. If you
 regenerate the file, re-apply that swap.
