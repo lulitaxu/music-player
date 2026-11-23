@@ -33,6 +33,7 @@ from .backend import Backend
 from .engine import Engine
 from .links import extract_video_id
 from .lyrics import LyricsFetcher, active_index
+from .mix import generate_transition, smart_reorder, track_key
 from .sorting import next_mode, sort_label, sort_tracks
 from .paths import runtime_dir
 from .store import EQ_FREQS, Store
@@ -223,6 +224,8 @@ class ArzxshApp(App):
         Binding("d", "download_focused", "Download", show=False),
         Binding("a", "add_to_playlist", "Add to playlist", show=False),
         Binding("x", "remove_from_playlist", "Remove from playlist", show=False),
+        Binding("m", "automix", "Auto Mix", show=False),
+        Binding("M", "smart_reorder", "Smart reorder", show=False),
         Binding("y", "lyrics", "Lyrics", show=False),
         Binding("ctrl+y", "lyrics", "Lyrics", show=False),
         Binding("q", "queue_panel", "Queue", show=False),
@@ -627,9 +630,14 @@ class ArzxshApp(App):
             return
         pl = pls[index]
         mode = self.store.setting("sort_playlist") or ""
+        automix_on = bool(self.store.data["automix"].get(str(index)))
+        analyzed_n = sum(1 for t in pl["tracks"] if track_key(t) in self.store.data["analysis"])
+        mix_line = (f"Auto Mix: on · {analyzed_n}/{len(pl['tracks'])} analyzed · M smart reorder · m turns it off"
+                    if automix_on else "Auto Mix: off · press m to enable")
         widgets = [
             Static(f"[bold]{esc(pl['name'])}[/bold]"),
             Static(f"{len(pl['tracks'])} songs", classes="dim"),
+            Static(mix_line, classes="dim"),
             Static(f"Sort: {sort_label('playlist', mode)} · press o to change", classes="dim"),
             Horizontal(
                 Button("▶ Play all", id="btn-pl-playall"),
@@ -971,7 +979,8 @@ class ArzxshApp(App):
             if self.engine and 0 <= kw.get("index", -1) < len(pls) and pls[kw["index"]]["tracks"]:
                 mode = self.store.setting("sort_playlist") or ""
                 tracks = sort_tracks(pls[kw["index"]]["tracks"], "playlist", mode)
-                await self.engine.play_context(tracks, 0, pls[kw["index"]]["name"])
+                await self.engine.play_context(tracks, 0, pls[kw["index"]]["name"],
+                                               mix_for=self._mix_provider(kw["index"]))
         elif bid == "btn-pl-export":
             _, kw = self._view
             pls = self.store.data["playlists"]
@@ -1040,7 +1049,10 @@ class ArzxshApp(App):
                 ctx = item.context
                 idx = next((i for i, t in enumerate(ctx) if t["id"] == item.track["id"]), -1)
                 if idx >= 0:
-                    await self.engine.play_context(ctx, idx, item.context_name)
+                    mix_for = None
+                    if self._view[0] == "playlist_detail":
+                        mix_for = self._mix_provider(self._view[1].get("index", -1))
+                    await self.engine.play_context(ctx, idx, item.context_name, mix_for=mix_for)
             else:
                 self.notify("Playback unavailable (mpv missing?).", severity="error")
         elif isinstance(item, LinkItem):
@@ -1104,6 +1116,97 @@ class ArzxshApp(App):
             self.query_one("#btn-repeat", Button).set_class(r > 0, "on")
             self.query_one("#btn-repeat", Button).label = ["↻", "↻¹", "↻²"][r]
             self.notify(["Repeat off", "Repeat all", "Repeat one"][r])
+
+    # -- Auto Mix -----------------------------------------------------
+    def _mix_provider(self, index: int):
+        if not self.store.data["automix"].get(str(index)):
+            return None
+        analyses = self.store.data["analysis"]
+
+        def provide(out_t, in_t):
+            a = analyses.get(track_key(out_t))
+            b = analyses.get(track_key(in_t))
+            if not a or not b:
+                return None
+            return generate_transition(a, b, out_t.get("duration_s"), in_t.get("duration_s"))
+
+        return provide
+
+    async def _prime_analysis(self, tracks: list[dict]):
+        cache = self.store.data["analysis"]
+        missing = [t for t in tracks if track_key(t) not in cache]
+        if not missing:
+            return
+        try:
+            got = await self.backend.analysis([track_key(t) for t in tracks])
+            for t in tracks:
+                a = got.get(track_key(t))
+                if a:
+                    cache[track_key(t)] = a
+            missing = [t for t in tracks if track_key(t) not in cache]
+        except Exception:
+            pass
+        for t in missing:
+            try:
+                cache[track_key(t)] = await self.backend.analyze(t)
+            except Exception:
+                pass
+        self.store.save()
+        if self._view[0] == "playlist_detail":
+            await self.show_playlist_detail(self._view[1].get("index", -1))
+
+    def action_automix(self):
+        if self._view[0] != "playlist_detail":
+            return
+        index = self._view[1].get("index", -1)
+        pls = self.store.data["playlists"]
+        if not (0 <= index < len(pls)):
+            return
+        key = str(index)
+        if self.store.data["automix"].get(key):
+            del self.store.data["automix"][key]
+            self.store.save()
+            self.notify("Auto Mix off")
+            self.run_worker(self.show_playlist_detail(index))
+        else:
+            self.store.data["automix"][key] = True
+            self.store.save()
+            self.notify("Auto Mix on. Analyzing songs for BPM and key…")
+            self.run_worker(self._prime_analysis(list(pls[index]["tracks"])))
+
+    def action_smart_reorder(self):
+        if self._view[0] != "playlist_detail":
+            return
+        index = self._view[1].get("index", -1)
+        pls = self.store.data["playlists"]
+        if not (0 <= index < len(pls)):
+            return
+        self.run_worker(self._smart_reorder(index))
+
+    async def _smart_reorder(self, index: int):
+        pls = self.store.data["playlists"]
+        if not (0 <= index < len(pls)):
+            return
+        tracks = list(pls[index]["tracks"])
+        await self._prime_analysis(tracks)
+        analyses = self.store.data["analysis"]
+        known = sum(1 for t in tracks if track_key(t) in analyses)
+        if known < 2:
+            self.notify("Not enough analyzed songs yet. Turn Auto Mix on and give it a moment.",
+                        severity="warning")
+            return
+        reordered = smart_reorder(tracks, analyses)
+        if all(a is b for a, b in zip(reordered, tracks)):
+            self.notify("Already in smooth order")
+            return
+        pls[index]["tracks"] = reordered
+        self.store.set_setting("sort_playlist", "playlist")
+        self.store.save()
+        unknown = len(tracks) - known
+        self.notify("Reordered for smooth mixing"
+                    + (f". {unknown} unanalyzed song{'s' if unknown > 1 else ''} moved to the end."
+                       if unknown else ""))
+        await self.show_playlist_detail(index)
 
     def _focused_track(self) -> dict | None:
         focused = self.focused

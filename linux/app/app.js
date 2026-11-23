@@ -39,6 +39,12 @@ async function api(path) {
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
+async function apiPost(path) {
+  await tokenReady;
+  const r = await fetch(path, { method: "POST", headers: authHeaders() });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
 let toastTimer = null;
 let toastHideTimer = null;
 function toast(msg) {
@@ -476,7 +482,106 @@ function currentTransition() {
   if (!player.playlistId) return auto;
   const n = nextIndex(true);
   if (n < 0) return auto;
-  return getTransition(player.playlistId, player.queue[player.index], player.queue[n]) || auto;
+  const out = player.queue[player.index], inn = player.queue[n];
+  return getTransition(player.playlistId, out, inn)
+    || (autoMixStore[player.playlistId] ? generateTransition(out, inn) : null)
+    || auto;
+}
+
+let autoMixStore = store.get("arzxsh.automix", {});
+let analysisStore = store.get("arzxsh.analysis", {});
+const analysisBusy = new Set();
+const analysisFailed = new Set();
+function getAnalysis(t) { return t ? analysisStore[trackKey(t)] || null : null; }
+async function ensureAnalysis(t, onDone) {
+  const key = trackKey(t);
+  if (analysisStore[key] || analysisFailed.has(key) || analysisBusy.has(key)) return;
+  analysisBusy.add(key);
+  try {
+    const r = await apiPost(`/analyze?source=${encodeURIComponent(t.source || "ytmusic")}&id=${encodeURIComponent(t.id)}`);
+    if (r && r.bpm) { analysisStore[key] = r; store.set("arzxsh.analysis", analysisStore); }
+    else analysisFailed.add(key);
+  } catch { analysisFailed.add(key); }
+  analysisBusy.delete(key);
+  if (onDone) onDone();
+}
+async function primeAnalyses(list, onDone) {
+  const missing = list.filter((t) => !getAnalysis(t) && !analysisFailed.has(trackKey(t)));
+  if (!missing.length) return;
+  try {
+    const r = await api(`/analysis?keys=${encodeURIComponent(list.map(trackKey).join(","))}`);
+    let got = false;
+    for (const t of list) {
+      const a = r[trackKey(t)];
+      if (a) { analysisStore[trackKey(t)] = a; got = true; }
+    }
+    if (got) { store.set("arzxsh.analysis", analysisStore); if (onDone) onDone(); }
+  } catch {}
+  for (const t of list) {
+    if (!getAnalysis(t) && !analysisFailed.has(trackKey(t))) await ensureAnalysis(t, onDone);
+  }
+}
+function camelotCost(a, b) {
+  if (!a || !b) return 3;
+  if (a === b) return 0;
+  const pa = /^(\d+)([AB])$/.exec(a), pb = /^(\d+)([AB])$/.exec(b);
+  if (!pa || !pb) return 3;
+  const na = Number(pa[1]), nb = Number(pb[1]);
+  if (na === nb) return 1;
+  const step = Math.min((na - nb + 12) % 12, (nb - na + 12) % 12);
+  return step === 1 && pa[2] === pb[2] ? 1 : 3;
+}
+function generateTransition(outT, inT) {
+  const A = getAnalysis(outT), B = getAnalysis(inT);
+  if (!A || !B) return null;
+  const gap = Math.min(Math.abs(A.bpm - B.bpm), Math.abs(A.bpm - 2 * B.bpm), Math.abs(2 * A.bpm - B.bpm));
+  const cost = camelotCost(A.camelot, B.camelot);
+  let style = "fade", bars = 2;
+  if (cost <= 1 && gap <= 6) { style = "blend"; bars = 8; }
+  else if (cost <= 1 && gap <= 14) { style = "rise"; bars = 4; }
+  let length = Math.round(bars * 4 * 60 / A.bpm);
+  length = Math.max(4, Math.min(16, length));
+  const durs = [outT.duration_s, inT.duration_s].filter((d) => d > 0);
+  if (durs.length) length = Math.max(2, Math.min(length, Math.floor(Math.min(...durs) / 4)));
+  let inSkip = 0;
+  const beatB = 60 / B.bpm;
+  if (typeof B.phase === "number") {
+    const durA = outT.duration_s;
+    if (durA) {
+      const beatA = 60 / A.bpm;
+      const T = Math.max(0, durA - length);
+      const frac = ((((T - (A.phase || 0)) % beatA) + beatA) % beatA) / beatA;
+      inSkip = (((B.phase + frac * beatB) % beatB) + beatB) % beatB;
+    } else {
+      inSkip = (((B.phase % beatB) + beatB) % beatB);
+    }
+    inSkip = Math.round(inSkip * 100) / 100;
+  }
+  let inGain = 1;
+  if (typeof A.tailDb === "number" && typeof B.headDb === "number") {
+    inGain = Math.pow(10, (A.tailDb - B.headDb) / 20);
+    inGain = Math.round(Math.max(0.5, Math.min(1.8, inGain)) * 100) / 100;
+  }
+  return { style, length, outSkip: 0, inSkip, inGain, auto: true };
+}
+function smartReorder(list) {
+  const analyzed = list.filter((t) => getAnalysis(t));
+  const unknown = list.filter((t) => !getAnalysis(t));
+  if (analyzed.length < 2) return list;
+  const remaining = [...analyzed];
+  const out = [remaining.shift()];
+  while (remaining.length) {
+    const last = getAnalysis(out[out.length - 1]);
+    let best = null, bestCost = Infinity;
+    for (const cand of remaining) {
+      const a = getAnalysis(cand);
+      const cost = Math.min(Math.abs(a.bpm - last.bpm) / 10, 4) + camelotCost(last.camelot, a.camelot);
+      if (cost < bestCost) { bestCost = cost; best = cand; }
+    }
+    out.push(best);
+    remaining.splice(remaining.indexOf(best), 1);
+  }
+  return [...out, ...unknown];
 }
 
 function greeting() {
@@ -845,13 +950,25 @@ function mixSummary(tr) {
   if (!tr) return `Auto · ${settings.crossfade}s fade`;
   const skips = [];
   if (tr.outSkip) skips.push(`ends ${tr.outSkip}s early`);
-  if (tr.inSkip) skips.push(`next starts ${tr.inSkip}s in`);
+  if (tr.inSkip >= 1) skips.push(`next starts ${Math.round(tr.inSkip)}s in`);
   const label = { fade: "Fade", rise: "Rise", blend: "Blend" }[tr.style] || "Fade";
   return `${label} · ${tr.length}s${skips.length ? " · " + skips.join(" · ") : ""}`;
 }
+function mixDisplay(p, out, inn) {
+  const manual = getTransition(p.id, out, inn);
+  if (manual) return mixSummary(manual);
+  if (!autoMixStore[p.id]) return mixSummary(null);
+  const A = getAnalysis(out), B = getAnalysis(inn);
+  if (A && B) {
+    const gen = generateTransition(out, inn);
+    return `Auto · ${mixSummary(gen)} · ${Math.round(A.bpm)} → ${Math.round(B.bpm)} BPM · ${A.camelot} → ${B.camelot}`;
+  }
+  if (analysisBusy.has(trackKey(out)) || analysisBusy.has(trackKey(inn))) return "Auto · analyzing…";
+  if (analysisFailed.has(trackKey(out)) || analysisFailed.has(trackKey(inn))) return "Auto · couldn't analyze";
+  return "Auto · analyzing…";
+}
 function mixBarHtml(p, out, inn, i) {
-  const tr = getTransition(p.id, out, inn);
-  return `<button class="mix-bar" data-mixbar="${i}">⇄ <span>${esc(mixSummary(tr))}</span></button>
+  return `<button class="mix-bar" data-mixbar="${i}">⇄ <span>${esc(mixDisplay(p, out, inn))}</span></button>
   <div class="mix-editor hidden" data-mixed="${i}">
     <div class="mix-styles">
       ${["fade", "rise", "blend"].map((s) => `<button class="chip-btn" data-mixstyle="${s}">${s[0].toUpperCase() + s.slice(1)}</button>`).join("")}
@@ -873,10 +990,12 @@ function renderPlaylist(id) {
       <div>
         <div class="page-kind">Playlist</div>
         <div class="page-name">${esc(p.name)}</div>
-        <div class="page-meta">${tracks.length} songs · stored on this machine only</div>
+        <div class="page-meta">${tracks.length} songs · stored on this machine only${autoMixStore[p.id] ? ` · Auto Mix on · ${tracks.filter((t) => getAnalysis(t)).length}/${tracks.length} analyzed` : ""}</div>
         <div class="page-actions">
           <button class="play-pill" id="pagePlay">▶ Play</button>
           <button class="shuffle-pill" id="pageShuffle">⤨ Shuffle</button>
+          <button class="chip-btn ${autoMixStore[p.id] ? "on" : ""}" id="plAutoMix">Auto Mix</button>
+          ${autoMixStore[p.id] ? `<button class="chip-btn" id="plSmart">Smart reorder</button>` : ""}
           <button class="chip-btn" id="plRename">Rename</button>
           <button class="chip-btn" id="plDelete">Delete</button>
         </div>
@@ -905,7 +1024,7 @@ function renderPlaylist(id) {
       ed.querySelector("[data-mixlenval]").textContent = `${draft.length}s`;
       ed.querySelector("[data-mixoutval]").textContent = `${draft.outSkip}s`;
       ed.querySelector("[data-mixinval]").textContent = `${draft.inSkip}s`;
-      bar.querySelector("span").textContent = mixSummary(getTransition(p.id, out, inn));
+      bar.querySelector("span").textContent = mixDisplay(p, out, inn);
     };
     bar.onclick = () => { ed.classList.toggle("hidden"); paint(); };
     ed.querySelectorAll("[data-mixstyle]").forEach((b) => { b.onclick = () => {
@@ -926,6 +1045,31 @@ function renderPlaylist(id) {
     };
     paint();
   });
+  const autoBtn = $("#plAutoMix");
+  if (autoBtn) autoBtn.onclick = () => {
+    autoMixStore[p.id] = !autoMixStore[p.id];
+    if (!autoMixStore[p.id]) delete autoMixStore[p.id];
+    store.set("arzxsh.automix", autoMixStore);
+    renderPlaylist(id);
+  };
+  const smartBtn = $("#plSmart");
+  if (smartBtn) smartBtn.onclick = () => {
+    const reordered = smartReorder(tracks);
+    const changed = reordered.some((t, i) => t !== tracks[i]);
+    if (!changed) { toast("Already in smooth order"); return; }
+    const unknown = tracks.filter((t) => !getAnalysis(t)).length;
+    p.tracks = reordered;
+    savePlaylists();
+    renderPlaylist(id);
+    toast(unknown ? `Reordered for smooth mixing. ${unknown} unanalyzed song${unknown > 1 ? "s" : ""} moved to the end.` : "Reordered for smooth mixing");
+  };
+  if (autoMixStore[p.id] && tracks.length) {
+    let repaintTimer = null;
+    primeAnalyses(tracks, () => {
+      clearTimeout(repaintTimer);
+      repaintTimer = setTimeout(() => { const r = routes[routeIdx]; if (r && r.type === "playlist" && r.id === id) renderPlaylist(id); }, 350);
+    });
+  }
   $("#plRename").onclick = async () => {
     const n = await askName("Rename Playlist", p.name);
     if (n) { p.name = n; savePlaylists(); renderPlaylist(id); }
@@ -1218,7 +1362,7 @@ function startAt(idx, fade, tr) {
       setDeckFilter(to, 18000);
       setDeckFilter(from, 18000);
     }
-    rampDeck(to, 1, F);
+    rampDeck(to, (tr && tr.inGain) || 1, F);
     rampDeck(from, 0, F);
     setTimeout(() => {
       from.el.pause();

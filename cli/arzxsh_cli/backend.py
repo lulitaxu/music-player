@@ -78,6 +78,18 @@ class Backend:
     async def backend_lyrics(self, video_id: str) -> dict:
         return await self._get(f"/lyrics/{_q(video_id)}")
 
+    async def analysis(self, keys: list[str]) -> dict:
+        return await self._get("/analysis", keys=",".join(keys))
+
+    async def analyze(self, track: dict) -> dict:
+        r = await self._client.post(
+            "/analyze",
+            params={"source": track.get("source") or "ytmusic", "id": track["id"]},
+            timeout=300.0,
+        )
+        r.raise_for_status()
+        return r.json()
+
     async def delete_local(self, track_id: str) -> dict:
         r = await self._client.delete(f"/local/file/{_q(track_id)}")
         r.raise_for_status()

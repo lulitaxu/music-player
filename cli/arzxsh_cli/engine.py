@@ -304,12 +304,18 @@ class Engine:
     def has_next(self) -> bool:
         return self._next_index(True) >= 0
 
-    async def play_context(self, tracks: list[dict], index: int, context_name: str = ""):
+    async def play_context(self, tracks: list[dict], index: int, context_name: str = "",
+                           mix_for=None):
         if not tracks or index < 0 or index >= len(tracks):
             return
         self._error_streak = 0  # manual start: fresh error budget
         self.queue = list(tracks)
         self.context_name = context_name
+        # Auto Mix provider: mix_for(out_track, in_track) returns a
+        # transition dict ({length, outSkip, inSkip, inGain}) or
+        # None. Set only for playlist contexts with Auto Mix on;
+        # every other context clears it.
+        self._mix_for = mix_for
         await self._start_at(index, fade=False)
 
     async def _start_at(self, index: int, fade: bool):
@@ -324,17 +330,30 @@ class Engine:
             self.active, self.idle = to_deck, from_deck
         url = self.backend.stream_url(track)
         to_deck.track_id = track["id"]
+        tr = getattr(self, "_pending_tr", None) if fade else None
+        self._pending_tr = None
+        in_skip = float(tr.get("inSkip") or 0) if tr else 0.0
         preloaded = getattr(to_deck, "_preloaded_id", None) == track["id"]
         if not preloaded:
-            await to_deck.load(url, play=True)
+            await to_deck.load(url, play=not (fade and in_skip > 0))
         else:
-            await to_deck.set("pause", False)
             to_deck._preloaded_id = None
+        if fade and in_skip > 0:
+            try:
+                await to_deck.command("seek", in_skip, "absolute")
+            except Exception:
+                pass
+        if preloaded or (fade and in_skip > 0):
+            await to_deck.set("pause", False)
         await to_deck.set("speed", self.store.data["speed"])
         master = float(self.store.data["volume"])
         if fade:
             self._fading = True
-            asyncio.create_task(self._fade(master, from_deck, to_deck))
+            fade_s = float(tr["length"]) if tr else max(0.5, float(self.store.data["crossfade_s"]))
+            to_target = master
+            if tr and tr.get("inGain"):
+                to_target = min(master * float(tr["inGain"]), 130.0)
+            asyncio.create_task(self._fade(master, from_deck, to_deck, fade_s, to_target))
         else:
             await self._set_deck_volume(to_deck, master)
             await self._set_deck_volume(self.idle, 0)
@@ -342,13 +361,17 @@ class Engine:
         self.store.note_played(track)
         self.on_track_changed(track)
 
-    async def _fade(self, master: float, from_deck: MpvDeck, to_deck: MpvDeck):
-        fade_s = max(0.5, float(self.store.data["crossfade_s"]))
+    async def _fade(self, master: float, from_deck: MpvDeck, to_deck: MpvDeck,
+                    fade_s: float | None = None, to_target: float | None = None):
+        if fade_s is None:
+            fade_s = max(0.5, float(self.store.data["crossfade_s"]))
+        if to_target is None:
+            to_target = master
         steps = 12
         from_start = from_deck.volume
         for i in range(1, steps + 1):
             frac = i / steps
-            await self._set_deck_volume(to_deck, master * frac)
+            await self._set_deck_volume(to_deck, to_target * frac)
             await self._set_deck_volume(from_deck, from_start * (1 - frac))
             await asyncio.sleep(fade_s / steps)
         await from_deck.stop()
@@ -470,6 +493,16 @@ class Engine:
                 remaining = self.duration - self.position
                 fade_s = float(self.store.data["crossfade_s"])
                 nxt = self._next_index(True)
+                tr = None
+                mix_for = getattr(self, "_mix_for", None)
+                if mix_for and nxt >= 0 and self.repeat != 2 and remaining <= 50:
+                    try:
+                        tr = mix_for(self.current, self.queue[nxt])
+                    except Exception:
+                        tr = None
+                if tr:
+                    fade_s = float(tr["length"])
+                out_skip = float(tr.get("outSkip") or 0) if tr else 0.0
                 # Preload the next track on the idle deck.
                 if (nxt >= 0 and self.repeat != 2 and remaining <= 45
                         and getattr(self.idle, "_preloaded_id", None) != self.queue[nxt]["id"]):
@@ -481,7 +514,8 @@ class Engine:
                         self.idle._preloaded_id = None
                 # Crossfade window.
                 if (fade_s > 0 and nxt >= 0 and self.repeat != 2
-                        and 0.15 < remaining <= fade_s and not self._fading):
+                        and 0.15 < remaining <= fade_s + out_skip and not self._fading):
+                    self._pending_tr = tr
                     await self._start_at(nxt, fade=True)
             except asyncio.CancelledError:
                 raise

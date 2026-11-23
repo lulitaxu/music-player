@@ -16,6 +16,8 @@ DEFAULTS = {
     "recent": [],         # full track dicts, max 12
     "downloads": {},      # videoId -> local track id
     "playlists": [],      # [{"name": str, "tracks": [track dicts]}]
+    "automix": {},        # str(playlist index) -> True
+    "analysis": {},       # track key -> backend analysis dict
     "volume": 80,
     "crossfade_s": 3,
     "eq": [0] * 10,       # dB per band, EQ_FREQS order
@@ -53,6 +55,11 @@ class Store:
             **DEFAULTS["settings"],
             **(saved_settings if isinstance(saved_settings, dict) else {}),
         }
+        # Same detach for the other mutable dict values: in-place
+        # updates must never corrupt the shared DEFAULTS objects.
+        for key in ("downloads", "automix", "analysis"):
+            val = self.data.get(key)
+            self.data[key] = dict(val) if isinstance(val, dict) else {}
 
     # -- ui settings --------------------------------------------------
     def setting(self, key: str):
