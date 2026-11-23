@@ -8,15 +8,21 @@
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+<div id="ambientA" class="ambient-layer active"></div>
+<div id="ambientB" class="ambient-layer"></div>
 <div id="shell">
+  <nav id="rail">
+    <button class="rail-item nav-item active" data-nav="home" title="Home"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11l8-8 8 8"/><path d="M6 9.5V20h12V9.5"/></svg></button>
+    <button class="rail-item nav-item" data-nav="library" title="Library"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="4"/><path d="M10 15.5V10l5-1.2V14"/><circle cx="8" cy="15.5" r="1.8"/><circle cx="13" cy="14" r="1.8"/></svg></button>
+    <button class="rail-item" id="railRadio" title="Radio"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><path d="M8.8 15.2a4.6 4.6 0 0 1 0-6.4"/><path d="M15.2 8.8a4.6 4.6 0 0 1 0 6.4"/><path d="M6.2 17.8a8.6 8.6 0 0 1 0-11.6"/><path d="M17.8 6.2a8.6 8.6 0 0 1 0 11.6"/></svg></button>
+    <button class="rail-item nav-item" data-nav="settings" title="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg></button>
+    <div class="rail-sep"></div>
+    <button class="rail-item nav-item" data-nav="search" title="Search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="6.5"/><path d="M15.8 15.8 21 21"/></svg></button>
+  </nav>
+
   <aside id="sidebar">
-    <div class="wordmark">arzxsh</div>
-    <nav>
-      <button class="nav-item active" data-nav="home"><span class="nav-ico">⌂</span>Home</button>
-      <button class="nav-item" data-nav="search"><span class="nav-ico">⌕</span>Search</button>
-      <button class="nav-item" data-nav="library"><span class="nav-ico">▤</span>Library</button>
-      <button class="nav-item" data-nav="settings"><span class="nav-ico">⚙</span>Settings</button>
-    </nav>
+    <div class="side-title">Library</div>
+    <div class="side-sub">arzxsh · your music, on this computer</div>
     <div class="side-label">Your library</div>
     <button class="side-link" id="likedLink">♥&nbsp; Liked Songs <span class="side-count" id="likedCount"></span></button>
     <div class="side-label">Recently played</div>
@@ -36,30 +42,47 @@
         <button id="searchClear" class="hidden" title="Clear">✕</button>
         <div id="suggestBox" class="hidden"></div>
       </div>
-      <div class="top-spacer"></div>
     </header>
     <div id="view"></div>
   </main>
+
+  <aside id="sidePanel">
+    <div class="panel-inner">
+      <div class="panel-tabs">
+        <button id="panelTabLyrics" class="panel-tab active">Lyrics</button>
+        <button id="panelTabQueue" class="panel-tab">Up Next</button>
+        <button id="panelClose" class="panel-close" title="Close panel">✕</button>
+      </div>
+      <div id="panelLyricsView" class="panel-view">
+        <div id="panelLyricsSync" class="lyrics-sync-viewport hidden"><div id="panelLyricsSyncInner"></div></div>
+        <pre id="panelLyricsText"></pre>
+      </div>
+      <div id="panelQueueView" class="panel-view hidden">
+        <div id="panelQueueList"></div>
+        <div class="muted small" id="panelQueueNote"></div>
+      </div>
+    </div>
+  </aside>
 </div>
 
 <div id="player" class="hidden">
-  <div class="player-track" id="playerTrack">
-    <img id="pArt" alt="">
-    <div class="player-meta">
-      <div id="pTitle" class="p-title"></div>
-      <div id="pArtist" class="p-artist"></div>
-    </div>
-    <button id="pHeart" class="icon-btn" title="Like">♡</button>
+  <div class="player-controls">
+    <button id="shuffleBtn" class="icon-btn small" title="Shuffle">⤨</button>
+    <button id="prevBtn" class="icon-btn" title="Previous">⏮</button>
+    <button id="playBtn" class="play-btn" title="Play or pause">▶</button>
+    <button id="nextBtn" class="icon-btn" title="Next">⏭</button>
+    <button id="repeatBtn" class="icon-btn small" title="Repeat">↻</button>
   </div>
-  <div class="player-center">
-    <div class="player-controls">
-      <button id="shuffleBtn" class="icon-btn small" title="Shuffle">⤨</button>
-      <button id="prevBtn" class="icon-btn" title="Previous">⏮</button>
-      <button id="playBtn" class="play-btn" title="Play or pause">▶</button>
-      <button id="nextBtn" class="icon-btn" title="Next">⏭</button>
-      <button id="repeatBtn" class="icon-btn small" title="Repeat">↻</button>
+  <div class="player-chipwrap">
+    <div class="player-track" id="playerTrack">
+      <img id="pArt" alt="">
+      <div class="player-meta">
+        <div id="pTitle" class="p-title"></div>
+        <div id="pArtist" class="p-artist"></div>
+      </div>
+      <button id="pHeart" class="icon-btn" title="Like">♡</button>
     </div>
-    <div class="seek-row">
+    <div class="chip-seek">
       <span id="tElapsed">0:00</span>
       <input id="seek" type="range" min="0" max="1000" value="0">
       <span id="tTotal">0:00</span>
@@ -67,10 +90,11 @@
   </div>
   <div class="player-right">
     <canvas id="vizMini" width="72" height="28" title="Visualizer"></canvas>
-    <button id="queueBtn" class="icon-btn" title="Queue">☰</button>
+    <button id="panelLyricsBtn" class="icon-btn" title="Lyrics (L)"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><line x1="8" y1="8" x2="16" y2="8"/><line x1="8" y1="12" x2="13" y2="12"/></svg></button>
+    <button id="queueBtn" class="icon-btn" title="Up Next (Q)">☰</button>
     <span class="vol-ico">🔊</span>
     <input id="volume" type="range" min="0" max="100" value="80">
-    <button id="expandBtn" class="icon-btn" title="Now Playing">⤢</button>
+    <button id="expandBtn" class="icon-btn" title="Now Playing (F)">⤢</button>
   </div>
 </div>
 
@@ -126,7 +150,7 @@
           </section>
           <section id="lyricsCard" class="np-card hidden">
             <div class="np-card-label">LYRICS</div>
-            <div id="lyricsSync" class="hidden"><div id="lyricsSyncInner"></div></div>
+            <div id="lyricsSync" class="lyrics-sync-viewport hidden"><div id="lyricsSyncInner"></div></div>
             <pre id="lyricsText"></pre>
             <div id="lyricsSource" class="muted small"></div>
           </section>
@@ -141,6 +165,7 @@
   </div>
 </div>
 
+<div id="ctxMenu" class="hidden"></div>
 <div id="toast" class="hidden"></div>
 <script src="app.js"></script>
 </body>

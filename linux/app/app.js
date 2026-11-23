@@ -1,8 +1,4 @@
 "use strict";
-/* arzxsh for Linux — vanilla SPA over the ytmusic-backend API.
-   Mirrors the phone app: Home / Search / Library, dual-deck
-   playback with crossfade, radio continuation, liked songs and
-   history kept in localStorage (on this machine only). */
 
 const $ = (sel) => document.querySelector(sel);
 const view = $("#view");
@@ -18,9 +14,6 @@ function esc(s) {
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   }[c]));
 }
-/* Build a CSS url() value without letting the URL break out of its
-   quoted string (audit 2026-11-11): quotes, backslashes, parens and
-   control/space characters are percent-encoded before interpolation. */
 function cssUrl(u) {
   const extra = { "(": "%28", ")": "%29", "'": "%27" };
   const safe = String(u).replace(/["'()\\\s\u0000-\u001f\u007f]/g,
@@ -32,11 +25,6 @@ function fmt(sec) {
   sec = Math.max(0, Math.round(sec));
   return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
 }
-/* Per-run request token (audit 2026-11-11): the launcher generates
-   it and the backend hands it to this same-origin page via
-   /ui-config. Mutating calls and /local reads must present it, so a
-   cross-origin page (which cannot read /ui-config and cannot set
-   custom headers on a simple request) cannot drive the backend. */
 let apiToken = "";
 const tokenReady = fetch("/ui-config")
   .then((r) => r.json())
@@ -67,7 +55,6 @@ function toast(msg) {
   }, 3200);
 }
 
-/* ---------------- persistent local state ---------------- */
 const store = {
   get(key, fallback) {
     try { return JSON.parse(localStorage.getItem(key)) ?? fallback; }
@@ -95,6 +82,16 @@ const settings = {
 let vizMainColor = settings.accentMode === "custom" ? settings.customAccent : DEFAULT_ACCENT;
 let vizNpColor = vizMainColor;
 const motionReduced = () => settings.motion === "reduced";
+function setNpAccent(value) {
+  const np = $("#nowPlaying");
+  if (value) {
+    np.style.setProperty("--np-accent", value);
+    document.body.style.setProperty("--np-accent", value);
+  } else {
+    np.style.removeProperty("--np-accent");
+    document.body.style.removeProperty("--np-accent");
+  }
+}
 function saveSettings() {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
 }
@@ -106,29 +103,35 @@ function applySettings(save = true) {
   document.body.classList.toggle("viz-off", settings.vizStyle === "off");
   if (settings.accentMode === "custom") {
     root.style.setProperty("--accent", settings.customAccent);
+    root.style.setProperty("--on-accent", "#ffffff");
     vizMainColor = settings.customAccent;
+  } else if (settings.accentMode === "red") {
+    root.style.setProperty("--accent", DEFAULT_ACCENT);
+    root.style.setProperty("--on-accent", "#ffffff");
+    vizMainColor = DEFAULT_ACCENT;
   } else {
     root.style.removeProperty("--accent");
+    root.style.removeProperty("--on-accent");
     vizMainColor = DEFAULT_ACCENT;
   }
   if (settings.accentMode === "red") {
-    np.style.setProperty("--np-accent", DEFAULT_ACCENT);
+    setNpAccent(DEFAULT_ACCENT);
     vizNpColor = DEFAULT_ACCENT;
   } else if (settings.accentMode === "custom") {
-    np.style.setProperty("--np-accent", settings.customAccent);
+    setNpAccent(settings.customAccent);
     vizNpColor = settings.customAccent;
   } else if (typeof player !== "undefined" && player.current) {
     if (accentCache.has(player.current.id)) {
       const rgb = accentCache.get(player.current.id);
-      np.style.setProperty("--np-accent", rgb);
+      setNpAccent(rgb);
       vizNpColor = rgb;
     } else {
-      np.style.removeProperty("--np-accent");
+      setNpAccent(null);
       vizNpColor = DEFAULT_ACCENT;
       applyArtworkAccent(player.current);
     }
   } else {
-    np.style.removeProperty("--np-accent");
+    setNpAccent(null);
     vizNpColor = DEFAULT_ACCENT;
   }
   const accentSelect = $("#settingAccentMode");
@@ -178,7 +181,6 @@ function notePlayed(track) {
   renderSideRecent();
 }
 
-/* ---------------- routing ---------------- */
 const routes = [];
 let routeIdx = -1;
 function navigate(route, replace = false) {
@@ -243,8 +245,24 @@ document.querySelectorAll(".nav-item").forEach((b) =>
     else navigate({ type: b.dataset.nav });
   }));
 $("#likedLink").onclick = () => navigate({ type: "liked" });
+$("#railRadio").onclick = async () => {
+  if (!player.current) { toast("Play a song first, then Radio builds a station from it"); return; }
+  if (player.radioBusy) return;
+  player.radioBusy = true;
+  try {
+    const r = await api(`/radio?video_id=${encodeURIComponent(player.current.id)}`);
+    const fresh = (r.results || []).filter((t) => t.id !== player.current.id);
+    if (!fresh.length) { toast("No radio mix found for this song"); return; }
+    register(fresh, null);
+    player.queue = [player.current, ...fresh];
+    player.index = 0;
+    player.contextName = "Radio";
+    renderQueue();
+    toast("Radio station started");
+  } catch { toast("Radio is unavailable right now"); }
+  player.radioBusy = false;
+};
 
-/* ---------------- shared row builders ---------------- */
 function dlBtn(track) {
   if (track.source === "local") return "";
   const saved = downloads[track.id];
@@ -289,20 +307,43 @@ function rowHtml(track, i, opts = {}) {
 function cardHtml(item, kind) {
   if (kind === "artist") {
     return `<button class="card round" data-artist="${esc(item.id)}">
-      <img src="${esc(item.artwork || "")}" alt="" loading="lazy">
+      <span class="card-art"><img src="${esc(item.artwork || "")}" alt="" loading="lazy"><span class="card-play" data-quickplay-artist="${esc(item.id)}">▶</span></span>
       <div class="card-title">${esc(item.name)}</div>
       <div class="card-sub">Artist</div></button>`;
   }
   return `<button class="card" data-album="${esc(item.id)}">
-    <img src="${esc(item.artwork || "")}" alt="" loading="lazy">
+    <span class="card-art"><img src="${esc(item.artwork || "")}" alt="" loading="lazy"><span class="card-play" data-quickplay-album="${esc(item.id)}">▶</span></span>
     <div class="card-title">${esc(item.title)}</div>
     <div class="card-sub">${esc(item.artist || "")}${item.year ? " · " + esc(item.year) : ""}</div></button>`;
 }
+function songCardHtml(track, ctx) {
+  return `<button class="card" data-play="${esc(track.id)}" data-ctx="${ctx}">
+    <span class="card-art"><img src="${esc(track.artwork || "")}" alt="" loading="lazy"><span class="card-play">▶</span></span>
+    <div class="card-title">${esc(track.title)}</div>
+    <div class="card-sub">Song · ${esc(track.artist)}</div></button>`;
+}
+async function quickPlayAlbum(id) {
+  try {
+    const a = await api(`/album/${encodeURIComponent(id)}`);
+    const tracks = (a.tracks || []).map((t) => ({ ...t, album_id: a.id }));
+    if (tracks.length) { register(tracks, null); playFromContext(tracks, 0, "Album"); }
+  } catch { toast("Couldn't play this album."); }
+}
+async function quickPlayArtist(id) {
+  try {
+    const a = await api(`/artist/${encodeURIComponent(id)}`);
+    if (a.songs && a.songs.length) { register(a.songs, null); playFromContext(a.songs, 0, "Artist"); }
+  } catch { toast("Couldn't play this artist."); }
+}
+const CTX_LABELS = {
+  charts: "Trending now", searchSongs: "Search", artistSongs: "Artist",
+  albumTracks: "Album", recent: "Jump back in", recentLib: "Recently played",
+  recentSide: "Recently played", likedList: "Liked Songs", localList: "On this device",
+};
 function skeletons(n, h = 62) {
   return Array.from({ length: n }, () =>
     `<div class="skel" style="height:${h}px;margin-bottom:8px"></div>`).join("");
 }
-/* One delegated click handler for everything the views render. */
 view.addEventListener("click", (e) => {
   const dl = e.target.closest("[data-download]");
   if (dl) {
@@ -319,16 +360,15 @@ view.addEventListener("click", (e) => {
     if (t) toggleLike(t);
     return;
   }
+  const qpAlbum = e.target.closest("[data-quickplay-album]");
+  if (qpAlbum) { e.stopPropagation(); quickPlayAlbum(qpAlbum.dataset.quickplayAlbum); return; }
+  const qpArtist = e.target.closest("[data-quickplay-artist]");
+  if (qpArtist) { e.stopPropagation(); quickPlayArtist(qpArtist.dataset.quickplayArtist); return; }
   const play = e.target.closest("[data-play]");
   if (play) {
     const list = contexts.get(play.dataset.ctx) || [findTrack(play.dataset.play)];
     const idx = list.findIndex((t) => t.id === play.dataset.play);
-    const labels = {
-      charts: "Trending now", searchSongs: "Search", artistSongs: "Artist",
-      albumTracks: "Album", recent: "Jump back in", recentLib: "Recently played",
-      recentSide: "Recently played", likedList: "Liked Songs", localList: "On this device",
-    };
-    if (idx >= 0) playFromContext(list, idx, labels[play.dataset.ctx] || "Songs");
+    if (idx >= 0) playFromContext(list, idx, CTX_LABELS[play.dataset.ctx] || "Songs");
     return;
   }
   const artist = e.target.closest("[data-artist]");
@@ -339,9 +379,6 @@ view.addEventListener("click", (e) => {
   if (retry) { renderRoute(); }
 });
 
-/* Track registry: every rendered track is remembered so like /
-   play lookups never need a refetch. Contexts map a name to the
-   exact list a set of rows was rendered from. */
 const trackReg = new Map();
 const contexts = new Map();
 function register(list, ctxName) {
@@ -350,7 +387,6 @@ function register(list, ctxName) {
 }
 function findTrack(id) { return trackReg.get(id); }
 
-/* ---------------- Home ---------------- */
 function greeting() {
   const h = new Date().getHours();
   if (h >= 22 || h < 4) return ["Good night", "The late queue is yours."];
@@ -394,55 +430,123 @@ async function renderHome() {
   }
 }
 
-/* ---------------- Search ---------------- */
 const searchInput = $("#searchInput");
 const suggestBox = $("#suggestBox");
 let suggestTimer = null;
+let suggestSeq = 0;
+let suggestItems = []; // [{ text, kind: "history" | "suggest" }]
+let suggestActive = -1;
+function hideSuggest() {
+  suggestBox.classList.add("hidden");
+  suggestActive = -1;
+}
+function runSearch(text) {
+  const q = (text || "").trim();
+  if (!q) return;
+  searchInput.value = q;
+  saveSearch(q);
+  hideSuggest();
+  searchInput.blur();
+  navigate({ type: "search", q },
+    routeIdx >= 0 && routes[routeIdx].type === "search");
+}
+function setSuggestActive(i) {
+  suggestActive = i;
+  suggestBox.querySelectorAll("[data-suggest]").forEach((b) =>
+    b.classList.toggle("sel", Number(b.dataset.suggest) === i));
+  const el = suggestBox.querySelector(`[data-suggest="${i}"]`);
+  if (el) el.scrollIntoView({ block: "nearest" });
+}
+function paintSuggest() {
+  if (!suggestItems.length || document.activeElement !== searchInput) {
+    hideSuggest();
+    return;
+  }
+  const q = searchInput.value.trim().toLowerCase();
+  suggestBox.innerHTML = suggestItems.map((item, i) => {
+    let label = esc(item.text);
+    if (item.kind === "suggest" && q && item.text.toLowerCase().startsWith(q)) {
+      label = `<b>${esc(item.text.slice(0, q.length))}</b>${esc(item.text.slice(q.length))}`;
+    }
+    return `<button class="suggest-row ${i === suggestActive ? "sel" : ""}" data-suggest="${i}">
+      <span class="s-ico">${item.kind === "history" ? "↺" : "⌕"}</span><span class="s-text">${label}</span>${item.kind === "history" ? '<span class="s-tag">History</span>' : ""}
+    </button>`;
+  }).join("");
+  suggestBox.classList.remove("hidden");
+  suggestBox.querySelectorAll("[data-suggest]").forEach((b) => {
+    b.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const item = suggestItems[Number(b.dataset.suggest)];
+      if (item) runSearch(item.text);
+    });
+    b.addEventListener("mousemove", () => {
+      const i = Number(b.dataset.suggest);
+      if (suggestActive !== i) setSuggestActive(i);
+    });
+  });
+}
+async function refreshSuggest() {
+  const q = searchInput.value.trim();
+  const seq = ++suggestSeq;
+  if (!q) {
+    suggestItems = searchHistory.slice(0, 7).map((text) => ({ text, kind: "history" }));
+    suggestActive = -1;
+    paintSuggest();
+    return;
+  }
+  const hist = searchHistory
+    .filter((h) => h.toLowerCase().includes(q.toLowerCase()) && h.toLowerCase() !== q.toLowerCase())
+    .slice(0, 3);
+  suggestItems = hist.map((text) => ({ text, kind: "history" }));
+  suggestActive = -1;
+  paintSuggest();
+  try {
+    const r = await api(`/suggest?q=${encodeURIComponent(q)}`);
+    if (seq !== suggestSeq) return; // a newer keystroke superseded this
+    const seen = new Set(suggestItems.map((i) => i.text.toLowerCase()));
+    const live = (r.results || [])
+      .map((s) => String(s || ""))
+      .filter((s) => s && !seen.has(s.toLowerCase()));
+    suggestItems = [...suggestItems,
+      ...live.map((text) => ({ text, kind: "suggest" }))].slice(0, 10);
+    paintSuggest();
+  } catch {}
+}
 searchInput.addEventListener("input", () => {
   $("#searchClear").classList.toggle("hidden", !searchInput.value);
   clearTimeout(suggestTimer);
-  const q = searchInput.value.trim();
-  if (!q) { renderSuggest(); return; }
-  renderSuggest(q);
+  if (!searchInput.value.trim()) { refreshSuggest(); return; }
+  suggestTimer = setTimeout(refreshSuggest, 180);
 });
-searchInput.addEventListener("focus", () => renderSuggest(searchInput.value.trim()));
+searchInput.addEventListener("focus", () => refreshSuggest());
 document.addEventListener("click", (e) => {
-  if (!e.target.closest("#searchWrap")) suggestBox.classList.add("hidden");
+  if (!e.target.closest("#searchWrap")) hideSuggest();
 });
 searchInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") {
-    const q = searchInput.value.trim();
-    if (q) { saveSearch(q); suggestBox.classList.add("hidden"); navigate({ type: "search", q }, routes[routeIdx].type === "search"); }
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    if (suggestBox.classList.contains("hidden") || !suggestItems.length) return;
+    e.preventDefault();
+    const dir = e.key === "ArrowDown" ? 1 : -1;
+    let next = suggestActive + dir;
+    if (next < 0) next = suggestItems.length - 1;
+    if (next >= suggestItems.length) next = 0;
+    setSuggestActive(next);
+  } else if (e.key === "Enter") {
+    const item = suggestActive >= 0 ? suggestItems[suggestActive] : null;
+    runSearch(item ? item.text : searchInput.value);
+  } else if (e.key === "Escape") {
+    e.stopPropagation();
+    hideSuggest();
   }
 });
 $("#searchClear").onclick = () => {
   searchInput.value = "";
   $("#searchClear").classList.add("hidden");
-  renderSuggest();
+  refreshSuggest();
   searchInput.focus();
 };
-function renderSuggest(q = "") {
-  const matches = (q
-    ? searchHistory.filter((h) => h.toLowerCase().includes(q.toLowerCase()))
-    : searchHistory).slice(0, 7);
-  if (!matches.length || document.activeElement !== searchInput) {
-    suggestBox.classList.add("hidden");
-    return;
-  }
-  suggestBox.innerHTML = matches.map((h) => `
-    <button class="suggest-row" data-q="${esc(h)}">
-      <span class="s-ico">↺</span><span>${esc(h)}</span><span class="s-tag">History</span>
-    </button>`).join("");
-  suggestBox.classList.remove("hidden");
-  suggestBox.querySelectorAll("[data-q]").forEach((b) => b.addEventListener("click", () => {
-    searchInput.value = b.dataset.q;
-    saveSearch(b.dataset.q);
-    suggestBox.classList.add("hidden");
-    navigate({ type: "search", q: b.dataset.q }, routes[routeIdx].type === "search");
-  }));
-}
 async function renderSearch(q) {
-  view.innerHTML = `<div class="section-title">Results for “${esc(q)}”</div>${skeletons(6)}`;
+  view.innerHTML = `<div class="page-title">${esc(q)}</div>${skeletons(6)}`;
   try {
     const [songs, artists, albums] = await Promise.all([
       api(`/search?q=${encodeURIComponent(q)}&filter=songs&limit=25`),
@@ -451,22 +555,28 @@ async function renderSearch(q) {
     ]);
     if (routes[routeIdx].type !== "search" || routes[routeIdx].q !== q) return;
     register(songs.results, "searchSongs");
+    const topCards = [];
+    if (artists.results.length) topCards.push(cardHtml(artists.results[0], "artist"));
+    if (albums.results.length) topCards.push(cardHtml(albums.results[0], "album"));
+    songs.results.slice(0, 2).forEach((t) => topCards.push(songCardHtml(t, "searchSongs")));
     view.innerHTML = `
-      ${artists.results.length ? `<div class="section-title">Artists</div>
-        <div class="rail">${artists.results.map((a) => cardHtml(a, "artist")).join("")}</div>` : ""}
+      <div class="page-title">${esc(q)}</div>
+      ${topCards.length ? `<div class="section-title">Top Results</div>
+        <div class="rail">${topCards.join("")}</div>` : ""}
       <div class="section-title">Songs</div>
       ${songs.results.length ? songs.results.map((t, i) => rowHtml(t, i, { ctx: "searchSongs" })).join("") : `<div class="empty-note">No songs found for “${esc(q)}”.</div>`}
+      ${artists.results.length ? `<div class="section-title">Artists</div>
+        <div class="rail">${artists.results.map((a) => cardHtml(a, "artist")).join("")}</div>` : ""}
       ${albums.results.length ? `<div class="section-title">Albums</div>
         <div class="rail">${albums.results.map((a) => cardHtml(a, "album")).join("")}</div>` : ""}`;
     artists.results.forEach((a) => trackReg.set(a.id, a));
   } catch {
     if (routes[routeIdx].type !== "search") return;
-    view.innerHTML = `<div class="section-title">Results for “${esc(q)}”</div>
+    view.innerHTML = `<div class="page-title">${esc(q)}</div>
       <div class="error-note">Search failed. Check your connection.<button data-retry>Retry</button></div>`;
   }
 }
 
-/* ---------------- Artist / Album ---------------- */
 async function renderArtist(id) {
   view.innerHTML = skeletons(1, 230) + skeletons(6);
   try {
@@ -474,12 +584,21 @@ async function renderArtist(id) {
     if (routes[routeIdx].type !== "artist" || routes[routeIdx].id !== id) return;
     register(a.songs, "artistSongs");
     view.innerHTML = `
-      <div class="page-head round">
-        <img src="${esc(a.artwork || "")}" alt="">
-        <div>
-          <div class="page-kind">Artist</div>
-          <div class="page-name">${esc(a.name || "")}</div>
-          <div class="page-meta">${a.subscribers ? esc(a.subscribers) + " subscribers" : ""}</div>
+      <div class="page-hero">
+        ${a.artwork ? `<div class="page-wash" style="background-image:${cssUrl(a.artwork)}"></div>` : ""}
+        <div class="page-hero-content">
+          <div class="page-head round">
+            <img src="${esc(a.artwork || "")}" alt="">
+            <div>
+              <div class="page-kind">Artist</div>
+              <div class="page-name">${esc(a.name || "")}</div>
+              <div class="page-meta">${a.subscribers ? esc(a.subscribers) + " subscribers" : ""}</div>
+              <div class="page-actions">
+                <button class="play-pill" id="pagePlay">▶ Play</button>
+                <button class="shuffle-pill" id="pageShuffle">⤨ Shuffle</button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
       ${a.description ? `<div class="section-title">About</div><p class="about-text">${esc(a.description)}</p>` : ""}
@@ -489,6 +608,12 @@ async function renderArtist(id) {
       ${a.singles.length ? `<div class="section-title">Singles</div><div class="rail">${a.singles.map((x) => cardHtml({ ...x, artist: a.name }, "album")).join("")}</div>` : ""}
       ${a.related.length ? `<div class="section-title">Fans also like</div><div class="rail">${a.related.map((x) => cardHtml(x, "artist")).join("")}</div>` : ""}`;
     a.related.forEach((x) => trackReg.set(x.id, x));
+    $("#pagePlay").onclick = () => { if (a.songs.length) playFromContext(a.songs, 0, "Artist"); };
+    $("#pageShuffle").onclick = () => {
+      if (!a.songs.length) return;
+      if (!player.shuffle) toggleShuffle();
+      playFromContext(a.songs, Math.floor(Math.random() * a.songs.length), "Artist");
+    };
   } catch {
     if (routes[routeIdx].type !== "artist") return;
     view.innerHTML = `<div class="error-note">Couldn't load this artist.<button data-retry>Retry</button></div>`;
@@ -499,25 +624,40 @@ async function renderAlbum(id) {
   try {
     const a = await api(`/album/${encodeURIComponent(id)}`);
     if (routes[routeIdx].type !== "album" || routes[routeIdx].id !== id) return;
-    register(a.tracks, "albumTracks");
+    const tracks = (a.tracks || []).map((t) => ({ ...t, album_id: a.id, album: t.album || a.title }));
+    register(tracks, "albumTracks");
     view.innerHTML = `
-      <div class="page-head">
-        <img src="${esc(a.artwork || "")}" alt="">
-        <div>
-          <div class="page-kind">Album</div>
-          <div class="page-name">${esc(a.title || "")}</div>
-          <div class="page-meta">${esc(a.artist || "")}${a.year ? " · " + esc(a.year) : ""} · ${a.tracks.length} songs</div>
+      <div class="page-hero">
+        ${a.artwork ? `<div class="page-wash" style="background-image:${cssUrl(a.artwork)}"></div>` : ""}
+        <div class="page-hero-content">
+          <div class="page-head">
+            <img src="${esc(a.artwork || "")}" alt="">
+            <div>
+              <div class="page-kind">Album</div>
+              <div class="page-name">${esc(a.title || "")}</div>
+              <div class="page-meta">${esc(a.artist || "")}${a.year ? " · " + esc(a.year) : ""} · ${tracks.length} songs</div>
+              <div class="page-actions">
+                <button class="play-pill" id="pagePlay">▶ Play</button>
+                <button class="shuffle-pill" id="pageShuffle">⤨ Shuffle</button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
       <div class="section-title">Songs</div>
-      ${a.tracks.map((t, i) => rowHtml(t, i, { rank: true, ctx: "albumTracks" })).join("")}`;
+      ${tracks.map((t, i) => rowHtml(t, i, { rank: true, ctx: "albumTracks" })).join("")}`;
+    $("#pagePlay").onclick = () => { if (tracks.length) playFromContext(tracks, 0, "Album"); };
+    $("#pageShuffle").onclick = () => {
+      if (!tracks.length) return;
+      if (!player.shuffle) toggleShuffle();
+      playFromContext(tracks, Math.floor(Math.random() * tracks.length), "Album");
+    };
   } catch {
     if (routes[routeIdx].type !== "album") return;
     view.innerHTML = `<div class="error-note">Couldn't load this album.<button data-retry>Retry</button></div>`;
   }
 }
 
-/* ---------------- Library ---------------- */
 function renderLibrary() {
   view.innerHTML = `
     <div class="section-title">Library</div>
@@ -551,7 +691,7 @@ async function renderLocal(fresh = false) {
     if (routes[routeIdx].type !== "local") return;
     register(data.tracks, "localList");
     view.innerHTML = `
-      <div class="page-head">
+      <div class="page-head plain">
         <img src="" alt="" style="background:var(--surface2);box-shadow:none">
         <div>
           <div class="page-kind">Local library</div>
@@ -572,7 +712,7 @@ async function renderLocal(fresh = false) {
 function renderLiked() {
   register(likes, "likedList");
   view.innerHTML = `
-    <div class="page-head">
+    <div class="page-head plain">
       <img src="" alt="" style="background:var(--accent);box-shadow:none">
       <div>
         <div class="page-kind">Playlist</div>
@@ -627,6 +767,18 @@ function renderSettings() {
         </select>
       </div>
     </div>
+    <div class="section-title">Keyboard shortcuts</div>
+    <div>
+      <div class="shortcut-row"><span>Play or pause</span><kbd>Space</kbd></div>
+      <div class="shortcut-row"><span>Next / previous track</span><span><kbd>Ctrl</kbd> + <kbd>→</kbd> / <kbd>←</kbd></span></div>
+      <div class="shortcut-row"><span>Seek forward / back 10 seconds</span><span><kbd>→</kbd> / <kbd>←</kbd></span></div>
+      <div class="shortcut-row"><span>Volume up / down</span><span><kbd>↑</kbd> / <kbd>↓</kbd></span></div>
+      <div class="shortcut-row"><span>Lyrics panel</span><kbd>L</kbd></div>
+      <div class="shortcut-row"><span>Up Next panel</span><kbd>Q</kbd></div>
+      <div class="shortcut-row"><span>Now Playing</span><kbd>F</kbd></div>
+      <div class="shortcut-row"><span>Search</span><kbd>/</kbd></div>
+      <div class="shortcut-row"><span>Close menu, panel or Now Playing</span><kbd>Esc</kbd></div>
+    </div>
     <div class="settings-note">Settings are stored only in this browser on this machine. ${typeof window.__arzxshUserCss === "string" ? "A user stylesheet was supplied by the desktop shell and is active." : "No user stylesheet was supplied by the desktop shell."}</div>`;
   $("#settingAccentMode").value = settings.accentMode;
   $("#settingVizStyle").value = settings.vizStyle;
@@ -679,16 +831,10 @@ function refreshLikeUi() {
   syncHeartStates();
 }
 
-/* ================= playback engine =================
-   Two decks alternate. Where Web Audio is available the decks
-   route through per-deck gains into one analyser (real
-   visualizer data, same-origin media via the /audio proxy);
-   otherwise the elements play directly and the visualizer
-   idles. Crossfade is 3s; the next track preloads 45s out. */
 const CROSSFADE_S = 3;
 const player = {
   queue: [], index: -1, current: null, contextName: "",
-  playing: false, shuffle: false, repeat: 0, // 0 off, 1 all, 2 one
+  playing: false, shuffle: false, repeat: 0,
   radioBusy: false, failCount: 0,
 };
 function makeDeck() {
@@ -790,8 +936,6 @@ async function advance(auto, fade) {
   const n = nextIndex(auto);
   if (n >= 0) { startAt(n, fade); return; }
   if (auto) {
-    // Queue exhausted: continue with radio built on the last
-    // track (the phone app's radio endpoint), once.
     if (player.radioBusy || !player.current) return stopPlayback();
     player.radioBusy = true;
     try {
@@ -805,7 +949,7 @@ async function advance(auto, fade) {
         toast("Radio continues the queue");
         return;
       }
-    } catch { /* fall through to stop */ }
+    } catch {}
     player.radioBusy = false;
   }
   stopPlayback();
@@ -872,7 +1016,6 @@ decks.forEach((deck) => {
     if (!el.duration) return;
     wakeMotionLoop();
     const remaining = el.duration - el.currentTime;
-    // Preload the next track into the idle deck.
     if (remaining <= 45 && remaining > CROSSFADE_S + 1) {
       const n = nextIndex(true);
       if (n >= 0 && player.repeat !== 2) {
@@ -884,7 +1027,6 @@ decks.forEach((deck) => {
         }
       }
     }
-    // Crossfade window.
     if (CROSSFADE_S > 0 && remaining <= CROSSFADE_S && remaining > 0.15 &&
         player.repeat !== 2 && hasNext(true) && !deck.fading) {
       deck.fading = true;
@@ -894,7 +1036,6 @@ decks.forEach((deck) => {
   });
 });
 
-/* ---------------- player UI sync ---------------- */
 const seekInputs = [$("#seek"), $("#npSeek")];
 const seekElapsedEls = [$("#tElapsed"), $("#npElapsed")];
 const seekTotalEls = [$("#tTotal"), $("#npTotal")];
@@ -1054,6 +1195,21 @@ function crossfadeNpBackdrop(src) {
   incoming.classList.add("active");
   outgoing.classList.remove("active");
   npBackdropActive = 1 - npBackdropActive;
+  crossfadeAmbient(src);
+}
+const ambientLayers = [$("#ambientA"), $("#ambientB")];
+let ambientActive = 0;
+function crossfadeAmbient(src) {
+  const outgoing = ambientLayers[ambientActive];
+  const incoming = ambientLayers[1 - ambientActive];
+  if (!incoming || !outgoing) return;
+  const next = src ? cssUrl(src) : "";
+  if (incoming.style.backgroundImage === next && incoming.classList.contains("active")) return;
+  if (outgoing.style.backgroundImage === next && outgoing.classList.contains("active")) return;
+  incoming.style.backgroundImage = next;
+  incoming.classList.add("active");
+  outgoing.classList.remove("active");
+  ambientActive = 1 - ambientActive;
 }
 function onTrackChanged(track) {
   $("#player").classList.remove("hidden");
@@ -1088,7 +1244,6 @@ function onTrackChanged(track) {
   }
 }
 
-/* transport wiring (bar + NP share the engine) */
 $("#playBtn").onclick = togglePlay;
 $("#npPlay").onclick = togglePlay;
 $("#nextBtn").onclick = () => { const n = nextIndex(false); if (n >= 0) startAt(n, false); };
@@ -1118,17 +1273,19 @@ function toggleShuffle() {
 }
 $("#shuffleBtn").onclick = toggleShuffle;
 $("#npShuffle").onclick = toggleShuffle;
-$("#pHeart").onclick = () => { if (player.current) toggleLike(player.current); };
+$("#pHeart").onclick = (e) => { e.stopPropagation(); if (player.current) toggleLike(player.current); };
 $("#npHeart").onclick = () => { if (player.current) toggleLike(player.current); };
 $("#volume").value = store.get("arzxsh.volume", 80);
 paintRangeFill($("#volume"));
-$("#volume").addEventListener("input", () => {
-  const v = Number($("#volume").value);
+function setVolume(v) {
+  v = Math.max(0, Math.min(100, Math.round(v)));
+  $("#volume").value = v;
   paintRangeFill($("#volume"));
   store.set("arzxsh.volume", v);
   if (webAudioOk && masterGain) masterGain.gain.value = v / 100;
   else decks.forEach((d) => { d.el.volume = v / 100; });
-});
+}
+$("#volume").addEventListener("input", () => setVolume(Number($("#volume").value)));
 if (navigator.mediaSession) {
   navigator.mediaSession.setActionHandler("play", togglePlay);
   navigator.mediaSession.setActionHandler("pause", togglePlay);
@@ -1136,7 +1293,6 @@ if (navigator.mediaSession) {
   navigator.mediaSession.setActionHandler("previoustrack", prevTrack);
 }
 
-/* ---------------- Now Playing panels ---------------- */
 let npCloseTimer = null;
 let npMorphClone = null;
 let npMorphTimer = null;
@@ -1208,7 +1364,7 @@ function closeNp() {
 }
 $("#expandBtn").onclick = () => openNp(false);
 $("#playerTrack").onclick = () => openNp(false);
-$("#queueBtn").onclick = () => openNp(true);
+$("#queueBtn").onclick = () => togglePanel("queue");
 $("#npClose").onclick = closeNp;
 $("#npQueueBtn").onclick = () => {
   const card = $("#queueCard");
@@ -1217,22 +1373,160 @@ $("#npQueueBtn").onclick = () => {
   renderQueue();
 };
 function renderQueue() {
-  const box = $("#queueList");
-  if (!box) return;
-  box.innerHTML = player.queue.map((t, i) => `
+  const html = player.queue.map((t, i) => `
     <button class="queue-row ${player.current && t.id === player.current.id ? "current" : ""}" data-qid="${esc(t.id)}" data-qidx="${i}">
       <img src="${esc(t.artwork || "")}" alt="">
       <span class="q-main"><div class="q-title">${esc(t.title)}</div><div class="q-sub">${esc(t.artist)}</div></span>
       <span class="row-dur">${fmt(t.duration_s)}</span>
     </button>`).join("");
-  $("#queueNote").textContent = player.queue.length
+  const note = player.queue.length
     ? `${player.queue.length} tracks · radio continues when the queue ends`
     : "";
-  box.querySelectorAll("[data-qidx]").forEach((b) =>
-    b.addEventListener("click", () => startAt(Number(b.dataset.qidx), false)));
+  [["#queueList", "#queueNote"], ["#panelQueueList", "#panelQueueNote"]]
+    .forEach(([listSel, noteSel]) => {
+      const box = $(listSel);
+      if (!box) return;
+      box.innerHTML = html;
+      $(noteSel).textContent = note;
+      box.querySelectorAll("[data-qidx]").forEach((b) =>
+        b.addEventListener("click", () => startAt(Number(b.dataset.qidx), false)));
+    });
 }
 
-/* About the artist — same content as the phone's 0.6.17 card. */
+const panel = { open: false, tab: "lyrics" };
+function syncPanelUi() {
+  document.body.classList.toggle("panel-open", panel.open);
+  $("#panelTabLyrics").classList.toggle("active", panel.tab === "lyrics");
+  $("#panelTabQueue").classList.toggle("active", panel.tab === "queue");
+  $("#panelLyricsView").classList.toggle("hidden", panel.tab !== "lyrics");
+  $("#panelQueueView").classList.toggle("hidden", panel.tab !== "queue");
+  $("#panelLyricsBtn").classList.toggle("on", panel.open && panel.tab === "lyrics");
+  $("#queueBtn").classList.toggle("on", panel.open && panel.tab === "queue");
+}
+function setPanelTab(tab) {
+  panel.tab = tab;
+  syncPanelUi();
+  if (tab === "lyrics") {
+    loadLyricsForCurrent();
+    updateLyricsSync(activeDeck.el.currentTime || 0, true);
+  } else {
+    renderQueue();
+  }
+}
+function openPanel(tab) {
+  panel.open = true;
+  setPanelTab(tab || panel.tab);
+  setTimeout(() => updateLyricsSync(activeDeck.el.currentTime || 0, true), 420);
+  wakeMotionLoop(450);
+}
+function closePanel() {
+  panel.open = false;
+  syncPanelUi();
+}
+function togglePanel(tab) {
+  if (panel.open && panel.tab === tab) closePanel();
+  else openPanel(tab);
+}
+$("#panelTabLyrics").onclick = () => setPanelTab("lyrics");
+$("#panelTabQueue").onclick = () => setPanelTab("queue");
+$("#panelClose").onclick = closePanel;
+$("#panelLyricsBtn").onclick = () => togglePanel("lyrics");
+
+function playNext(track) {
+  if (!track) return;
+  register([track], null);
+  if (!player.current) { playFromContext([track], 0, "Songs"); return; }
+  player.queue.splice(player.index + 1, 0, track);
+  renderQueue();
+  toast("Plays next");
+}
+function addToQueue(track) {
+  if (!track) return;
+  register([track], null);
+  if (!player.current) { playFromContext([track], 0, "Songs"); return; }
+  player.queue.push(track);
+  renderQueue();
+  toast("Added to queue");
+}
+const ctxMenu = $("#ctxMenu");
+let ctxOpen = false;
+function closeCtxMenu() {
+  ctxMenu.classList.add("hidden");
+  ctxOpen = false;
+}
+function openCtxMenu(x, y, items) {
+  ctxMenu.innerHTML = items.map((it, i) => it.sep
+    ? `<div class="ctx-sep"></div>`
+    : `<button class="ctx-item" data-ctx-item="${i}"><span class="ctx-ico">${it.icon || ""}</span>${esc(it.label)}</button>`).join("");
+  ctxMenu.classList.remove("hidden");
+  ctxOpen = true;
+  const w = ctxMenu.offsetWidth;
+  const h = ctxMenu.offsetHeight;
+  ctxMenu.style.left = `${Math.max(6, Math.min(x, window.innerWidth - w - 8))}px`;
+  ctxMenu.style.top = `${Math.max(6, Math.min(y, window.innerHeight - h - 8))}px`;
+  ctxMenu.querySelectorAll("[data-ctx-item]").forEach((b) =>
+    b.addEventListener("click", () => {
+      const it = items[Number(b.dataset.ctxItem)];
+      closeCtxMenu();
+      if (it && it.action) it.action();
+    }));
+}
+function trackCtxItems(track, playAction) {
+  const items = [];
+  if (playAction) items.push({ label: "Play", icon: "▶", action: playAction });
+  items.push({ label: "Play Next", icon: "⤵", action: () => playNext(track) });
+  items.push({ label: "Add to Queue", icon: "+", action: () => addToQueue(track) });
+  items.push({ sep: true });
+  items.push({
+    label: isLiked(track.id) ? "Unlike" : "Like",
+    icon: isLiked(track.id) ? "♥" : "♡",
+    action: () => toggleLike(track),
+  });
+  if (track.source !== "local" && !downloads[track.id]) {
+    items.push({ label: "Download", icon: "⬇", action: () => doDownload(track) });
+  }
+  if (track.artist_id || track.album_id) items.push({ sep: true });
+  if (track.artist_id) {
+    items.push({ label: "Go to Artist", icon: "→", action: () => navigate({ type: "artist", id: track.artist_id }) });
+  }
+  if (track.album_id) {
+    items.push({ label: "Go to Album", icon: "→", action: () => navigate({ type: "album", id: track.album_id }) });
+  }
+  return items;
+}
+document.addEventListener("contextmenu", (e) => {
+  const row = e.target.closest("[data-play]");
+  const albumCard = e.target.closest("[data-album]");
+  const artistCard = e.target.closest("[data-artist]");
+  if (!row && !albumCard && !artistCard) return;
+  e.preventDefault();
+  if (row) {
+    const track = findTrack(row.dataset.play);
+    if (!track) return;
+    const list = contexts.get(row.dataset.ctx) || [track];
+    const idx = list.findIndex((t) => t.id === track.id);
+    openCtxMenu(e.clientX, e.clientY, trackCtxItems(track,
+      idx >= 0 ? () => playFromContext(list, idx, CTX_LABELS[row.dataset.ctx] || "Songs") : null));
+  } else if (albumCard) {
+    const id = albumCard.dataset.album;
+    openCtxMenu(e.clientX, e.clientY, [
+      { label: "Play", icon: "▶", action: () => quickPlayAlbum(id) },
+      { label: "Open Album", icon: "→", action: () => navigate({ type: "album", id }) },
+    ]);
+  } else if (artistCard) {
+    const id = artistCard.dataset.artist;
+    openCtxMenu(e.clientX, e.clientY, [
+      { label: "Play Top Songs", icon: "▶", action: () => quickPlayArtist(id) },
+      { label: "Open Artist", icon: "→", action: () => navigate({ type: "artist", id }) },
+    ]);
+  }
+});
+document.addEventListener("mousedown", (e) => {
+  if (ctxOpen && !e.target.closest("#ctxMenu")) closeCtxMenu();
+});
+view.addEventListener("scroll", () => { if (ctxOpen) closeCtxMenu(); }, { passive: true });
+window.addEventListener("resize", () => { if (ctxOpen) closeCtxMenu(); });
+
 const aboutCache = new Map();
 let aboutKey = null;
 async function loadAbout(track) {
@@ -1257,35 +1551,28 @@ async function loadAbout(track) {
   } catch { if (aboutKey === id) card.classList.add("hidden"); }
 }
 
-/* Artwork accent — Now Playing takes its tint from the current
-   cover, the way the phone app does: the value lands in the
-   --np-accent custom property (registered in CSS so it crossfades
-   between tracks). Sampling runs on a small canvas; artwork is
-   same-origin (local art endpoint) or CORS-enabled
-   (googleusercontent). Any failure keeps the previous accent. */
 const accentCache = new Map();
 let accentTrackId = null;
 function applyArtworkAccent(track) {
   accentTrackId = track.id;
-  const np = $("#nowPlaying");
   if (settings.accentMode === "red") {
-    np.style.setProperty("--np-accent", DEFAULT_ACCENT);
+    setNpAccent(DEFAULT_ACCENT);
     vizNpColor = DEFAULT_ACCENT;
     return;
   }
   if (settings.accentMode === "custom") {
-    np.style.setProperty("--np-accent", settings.customAccent);
+    setNpAccent(settings.customAccent);
     vizNpColor = settings.customAccent;
     return;
   }
   if (!track.artwork) {
-    np.style.removeProperty("--np-accent");
+    setNpAccent(null);
     vizNpColor = DEFAULT_ACCENT;
     return;
   }
   if (accentCache.has(track.id)) {
     const rgb = accentCache.get(track.id);
-    np.style.setProperty("--np-accent", rgb);
+    setNpAccent(rgb);
     vizNpColor = rgb;
     return;
   }
@@ -1297,7 +1584,7 @@ function applyArtworkAccent(track) {
     if (!rgb) return;
     accentCache.set(track.id, rgb);
     if (accentTrackId === track.id && settings.accentMode === "artwork") {
-      np.style.setProperty("--np-accent", rgb);
+      setNpAccent(rgb);
       vizNpColor = rgb;
     }
   };
@@ -1335,51 +1622,60 @@ function sampleAccent(img) {
   return `rgb(${clamp(r)}, ${clamp(g)}, ${clamp(b)})`;
 }
 
-/* Lyrics — synced lines when a source has timestamps (LRCLIB or
-   the backend's timed ytmusicapi page), plain text otherwise.
-   The sync view follows the active deck's currentTime from the
-   same timeupdate hook that drives the seek bar; clicking a line
-   seeks to it. */
 const lyricsCache = new Map();
 let lyricsTrackId = null;
-const syncState = { lines: [], els: [], active: -1, trackId: null, karaoke: -1 };
+const syncState = { lines: [], active: -1, trackId: null, karaoke: -1, wordCounts: [] };
+const syncViews = [
+  { box: $("#lyricsSync"), inner: $("#lyricsSyncInner"), els: [], words: [] },
+  { box: $("#panelLyricsSync"), inner: $("#panelLyricsSyncInner"), els: [], words: [] },
+];
+const plainLyricsEls = [$("#lyricsText"), $("#panelLyricsText")];
 function resetLyrics(track) {
   lyricsTrackId = track.id;
   clearSyncedLyrics();
   $("#lyricsCard").classList.add("hidden");
   $("#lyricsBtn").classList.remove("on");
+  if (panel.open && panel.tab === "lyrics") loadLyricsForCurrent();
 }
 function clearSyncedLyrics() {
   syncState.lines = [];
-  syncState.els = [];
   syncState.active = -1;
   syncState.trackId = null;
   syncState.karaoke = -1;
-  const box = $("#lyricsSync");
-  box.classList.add("hidden");
-  const inner = $("#lyricsSyncInner");
-  inner.innerHTML = "";
-  inner.style.transform = "";
-  $("#lyricsText").classList.remove("hidden");
+  syncState.wordCounts = [];
+  syncViews.forEach((v) => {
+    v.els = [];
+    v.words = [];
+    v.box.classList.add("hidden");
+    v.inner.innerHTML = "";
+    v.inner.style.transform = "";
+  });
+  plainLyricsEls.forEach((el) => el.classList.remove("hidden"));
 }
 function showPlainLyrics(text) {
   clearSyncedLyrics();
-  $("#lyricsText").textContent = text;
+  plainLyricsEls.forEach((el) => { el.textContent = text; });
 }
 function buildSyncedLyrics(lines) {
   clearSyncedLyrics();
   syncState.lines = lines;
   syncState.trackId = lyricsTrackId;
-  const inner = $("#lyricsSyncInner");
-  inner.innerHTML = lines.map((l, i) =>
-    `<div class="sync-line" data-li="${i}">${esc(l.text)}</div>`).join("");
-  syncState.els = [...inner.children];
-  syncState.els.forEach((el, i) => el.addEventListener("click", () => {
-    activeDeck.el.currentTime = lines[i].t;
-    updateLyricsSync(lines[i].t, true);
-  }));
-  $("#lyricsText").classList.add("hidden");
-  $("#lyricsSync").classList.remove("hidden");
+  syncState.wordCounts = lines.map((l) => l.text.split(/\s+/).filter(Boolean).length);
+  syncViews.forEach((v) => {
+    v.inner.innerHTML = lines.map((l, i) => {
+      const words = l.text.split(/\s+/).filter(Boolean);
+      if (!words.length) return `<div class="sync-line" data-li="${i}">${esc(l.text)}</div>`;
+      return `<div class="sync-line has-words" data-li="${i}">${words.map((w) => `<span class="w">${esc(w)}</span>`).join(" ")}</div>`;
+    }).join("");
+    v.els = [...v.inner.children];
+    v.words = v.els.map((el) => [...el.querySelectorAll(".w")]);
+    v.els.forEach((el, i) => el.addEventListener("click", () => {
+      activeDeck.el.currentTime = lines[i].t;
+      updateLyricsSync(lines[i].t, true);
+    }));
+    v.box.classList.remove("hidden");
+  });
+  plainLyricsEls.forEach((el) => el.classList.add("hidden"));
   updateLyricsSync(activeDeck.el.currentTime || 0, true);
 }
 function updateLyricsSync(now, force = false) {
@@ -1393,29 +1689,31 @@ function updateLyricsSync(now, force = false) {
   if (changed) {
     syncState.active = idx;
     syncState.karaoke = -1;
-    syncState.els.forEach((el, i) => {
-      const distance = idx >= 0 ? Math.abs(i - idx) : 99;
-      el.classList.toggle("active", i === idx);
-      el.classList.toggle("passed", idx >= 0 && i < idx);
-      el.classList.toggle("depth-1", distance === 1);
-      el.classList.toggle("depth-2", distance === 2);
-      el.classList.toggle("depth-3", distance === 3);
-      el.classList.toggle("depth-far", idx >= 0 && distance >= 4);
-      if (i !== idx) el.style.removeProperty("--karaoke");
+    syncViews.forEach((v) => {
+      v.els.forEach((el, i) => {
+        const distance = idx >= 0 ? Math.abs(i - idx) : 99;
+        el.classList.toggle("active", i === idx);
+        el.classList.toggle("passed", idx >= 0 && i < idx);
+        el.classList.toggle("depth-1", distance === 1);
+        el.classList.toggle("depth-2", distance === 2);
+        el.classList.toggle("depth-3", distance === 3);
+        el.classList.toggle("depth-far", idx >= 0 && distance >= 4);
+        if (i !== idx) el.style.removeProperty("--karaoke");
+      });
+      const el = v.els[Math.max(0, idx)];
+      if (el && v.box.clientHeight) {
+        const y = v.box.clientHeight / 2 - (el.offsetTop + el.offsetHeight / 2);
+        v.inner.style.transform = `translateY(${y}px)`;
+      }
     });
-    const box = $("#lyricsSync");
-    const el = syncState.els[Math.max(0, idx)];
-    if (el && box.clientHeight) {
-      const y = box.clientHeight / 2 - (el.offsetTop + el.offsetHeight / 2);
-      $("#lyricsSyncInner").style.transform = `translateY(${y}px)`;
-    }
   }
   if (idx < 0) return;
-  const activeEl = syncState.els[idx];
-  if (!activeEl) return;
+  if (!syncViews.some((v) => v.els[idx])) return;
   if (motionReduced()) {
     if (syncState.karaoke !== 1) {
-      activeEl.style.setProperty("--karaoke", "100%");
+      syncViews.forEach((v) => {
+        if (v.els[idx]) v.els[idx].style.setProperty("--karaoke", "100%");
+      });
       syncState.karaoke = 1;
     }
     return;
@@ -1425,7 +1723,17 @@ function updateLyricsSync(now, force = false) {
   const duration = Math.max(0.8, next - start);
   const pct = clamp01((now - start) / duration);
   if (force || Math.abs(pct - syncState.karaoke) >= 0.004) {
-    activeEl.style.setProperty("--karaoke", `${(pct * 100).toFixed(2)}%`);
+    const wordCount = syncState.wordCounts[idx] || 0;
+    syncViews.forEach((v) => {
+      if (!v.els[idx]) return;
+      v.els[idx].style.setProperty("--karaoke", `${(pct * 100).toFixed(2)}%`);
+      const spans = v.words[idx];
+      if (spans && wordCount) {
+        spans.forEach((s, j) => {
+          s.style.setProperty("--w", `${(clamp01(pct * wordCount - j) * 100).toFixed(1)}%`);
+        });
+      }
+    });
     syncState.karaoke = pct;
   }
 }
@@ -1433,20 +1741,13 @@ $("#npDownload").onclick = () => {
   if (player.current && player.current.source !== "local" && !downloads[player.current.id]) doDownload(player.current);
   else if (player.current) toast("Already saved for offline");
 };
-$("#lyricsBtn").onclick = async () => {
-  if (player.current && player.current.source === "local") {
-    const card = $("#lyricsCard");
-    card.classList.remove("hidden");
-    $("#lyricsBtn").classList.add("on");
+async function loadLyricsForCurrent() {
+  if (!player.current) return;
+  if (player.current.source === "local") {
     showPlainLyrics("Lyrics are not available for local files.");
     $("#lyricsSource").textContent = "";
     return;
   }
-  const card = $("#lyricsCard");
-  const show = card.classList.contains("hidden");
-  card.classList.toggle("hidden", !show);
-  $("#lyricsBtn").classList.toggle("on", show);
-  if (!show || !player.current) return;
   const id = player.current.id;
   if (lyricsCache.has(id)) { fillLyrics(lyricsCache.get(id)); return; }
   showPlainLyrics("Loading…");
@@ -1458,14 +1759,20 @@ $("#lyricsBtn").onclick = async () => {
   } catch {
     if (lyricsTrackId === id) showPlainLyrics("Lyrics could not be loaded.");
   }
-};
+}
 function fillLyrics(r) {
   if (r.synced && r.synced.length) buildSyncedLyrics(r.synced);
   else showPlainLyrics(r.lyrics || "No lyrics found for this track.");
   $("#lyricsSource").textContent = r.source ? `Source: ${r.source}` : "";
 }
+$("#lyricsBtn").onclick = () => {
+  const card = $("#lyricsCard");
+  const show = card.classList.contains("hidden");
+  card.classList.toggle("hidden", !show);
+  $("#lyricsBtn").classList.toggle("on", show);
+  if (show) loadLyricsForCurrent();
+};
 
-/* ---------------- visualizer + smoothness engine ---------------- */
 const vizEntries = [
   { canvas: $("#viz"), ctx: $("#viz").getContext("2d"), bars: 56, np: true, w: 0, h: 0, levels: null, peaks: null },
   { canvas: $("#vizMini"), ctx: $("#vizMini").getContext("2d"), bars: 14, np: false, w: 0, h: 0, levels: null, peaks: null },
@@ -1591,7 +1898,7 @@ function motionFrame(ts) {
   const now = el.currentTime || 0;
   const dur = el.duration || 0;
   if (dur) syncSeek(now, dur);
-  if (!$("#lyricsSync").classList.contains("hidden")) updateLyricsSync(now);
+  if (syncState.lines.length) updateLyricsSync(now);
   drawVisualizers(dt, ts);
   if (player.playing || scrubbing || ts < frameState.until || visualizerHasEnergy()) {
     wakeMotionLoop();
@@ -1604,26 +1911,58 @@ document.addEventListener("visibilitychange", () => {
   else wakeMotionLoop(300);
 });
 
-/* ---------------- keyboard ---------------- */
 document.addEventListener("keydown", (e) => {
   const tag = e.target.tagName;
-  if (tag === "INPUT" && e.target.type === "text") return;
+  const typing = tag === "TEXTAREA" || tag === "SELECT" ||
+    (tag === "INPUT" && ["text", "search", "color"].includes(e.target.type));
+  if (e.key === "Escape") {
+    if (ctxOpen) { closeCtxMenu(); return; }
+    if (panel.open) { closePanel(); return; }
+    if (!$("#nowPlaying").classList.contains("hidden")) { closeNp(); return; }
+    return;
+  }
+  if (typing) return;
+  if (e.key === "/") {
+    e.preventDefault();
+    searchInput.focus();
+    searchInput.select();
+    return;
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === "ArrowRight") {
+    e.preventDefault();
+    const n = nextIndex(false);
+    if (n >= 0) startAt(n, false);
+    return;
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === "ArrowLeft") {
+    e.preventDefault();
+    prevTrack();
+    return;
+  }
+  if (e.key === "l" || e.key === "L") { togglePanel("lyrics"); return; }
+  if (e.key === "q" || e.key === "Q") { togglePanel("queue"); return; }
+  if (e.key === "f" || e.key === "F") {
+    if ($("#nowPlaying").classList.contains("hidden")) openNp(false);
+    return;
+  }
   if (!player.current) return;
   if (e.code === "Space" && tag !== "BUTTON") { e.preventDefault(); togglePlay(); }
   else if (e.key === "ArrowRight" && tag !== "INPUT") activeDeck.el.currentTime += 10;
   else if (e.key === "ArrowLeft" && tag !== "INPUT") activeDeck.el.currentTime -= 10;
-  else if (e.key === "Escape") closeNp();
+  else if (e.key === "ArrowUp" && tag !== "INPUT") {
+    e.preventDefault();
+    setVolume(Number($("#volume").value) + 5);
+  } else if (e.key === "ArrowDown" && tag !== "INPUT") {
+    e.preventDefault();
+    setVolume(Number($("#volume").value) - 5);
+  }
 });
 
-/* ---------------- init ---------------- */
 document.body.classList.add("no-player");
 applySettings(false);
 paintSeekRatio(0, 0);
 renderSideRecent();
 navigate({ type: "home" }, true);
-/* Debug/testing handle, gated (audit 2026-11-11): only exposed when
-   the page was opened with ?debug=1, so shipped sessions do not hand
-   playback control to any script that reaches this origin. */
 if (new URLSearchParams(location.search).has("debug")) {
   window.__arzxsh = { player, decks };
 }
