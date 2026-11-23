@@ -226,7 +226,27 @@ def search(q: str = Query(min_length=1), filter: str = "songs", limit: int = 25)
 
     def run():
         res = ytm.search(q, filter=filter, limit=limit)
-        if filter in ("songs", "videos"):
+        if filter == "songs":
+            results = tracks(res)
+            # A songs-only search misses everything YouTube Music
+            # carries only as a video (remixes, mashups, live takes,
+            # regional uploads): the songs shelf backfills with
+            # related official tracks, so the wanted upload can be
+            # absent even from a full-length result list. Always top
+            # the list up from the videos shelf: same shaping,
+            # deduped by video id, songs first. A failed videos call
+            # leaves the songs result standing on its own.
+            try:
+                vids = ytm.search(q, filter="videos", limit=limit)
+            except Exception:
+                vids = []
+            seen = {t["id"] for t in results}
+            for t in tracks(vids):
+                if t["id"] not in seen:
+                    seen.add(t["id"])
+                    results.append(t)
+            return {"type": filter, "results": results[:50]}
+        if filter == "videos":
             return {"type": filter, "results": tracks(res)}
         if filter == "artists":
             return {
