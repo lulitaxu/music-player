@@ -2518,6 +2518,27 @@ document.addEventListener("error", (e) => {
 store.set("arzxsh.likes", likes);
 store.set("arzxsh.recent", recentPlays);
 store.set("arzxsh.playlists", playlists);
+const bootOverlay = $("#bootOverlay");
+if (bootOverlay) {
+  const bootStart = performance.now();
+  let bootGone = false;
+  const dismissBoot = () => {
+    if (bootGone) return;
+    bootGone = true;
+    if (motionReduced()) { bootOverlay.remove(); return; }
+    bootOverlay.classList.add("boot-hide");
+    setTimeout(() => bootOverlay.remove(), 500);
+  };
+  bootOverlay.addEventListener("click", dismissBoot);
+  const bootWatch = setInterval(() => {
+    const waited = performance.now() - bootStart;
+    const ready = view.querySelector(".track-row, .card, .error-note, .empty-note");
+    if ((ready && waited > 1000) || waited > 4000) {
+      clearInterval(bootWatch);
+      dismissBoot();
+    }
+  }, 150);
+}
 navigate({ type: "home" }, true);
 if (new URLSearchParams(location.search).has("debug")) {
   window.__arzxsh = { player, decks };

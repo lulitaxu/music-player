@@ -277,6 +277,26 @@ body.motion-reduced #sidePanel { transition: none; }
   color: var(--text55); border-radius: 3px; padding: 1px 4px; letter-spacing: 0.04em;
 }
 .eq { display: none; align-items: flex-end; gap: 2px; height: 14px; }
+#bootOverlay { position: fixed; inset: 0; z-index: 2000; background: #0c0c0e; display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; transition: opacity 0.45s ease; }
+#bootOverlay.boot-hide { opacity: 0; pointer-events: none; }
+.boot-word { font-size: 52px; font-weight: 800; letter-spacing: -2px; color: #f2f2f4; display: flex; }
+.boot-word span { opacity: 0; transform: translateY(14px); animation: bootLetter 0.55s cubic-bezier(0.2, 0.8, 0.3, 1) forwards; }
+.boot-word span:nth-child(2) { animation-delay: 0.06s; }
+.boot-word span:nth-child(3) { animation-delay: 0.12s; }
+.boot-word span:nth-child(4) { animation-delay: 0.18s; }
+.boot-word span:nth-child(5) { animation-delay: 0.24s; }
+.boot-word span:nth-child(6) { animation-delay: 0.3s; }
+.boot-word span:nth-child(7) { animation-delay: 0.36s; }
+.boot-word .boot-dot { color: var(--accent); }
+@keyframes bootLetter { to { opacity: 1; transform: none; } }
+.boot-eq { display: flex; gap: 4px; align-items: flex-end; height: 18px; margin-top: 22px; }
+.boot-eq i { width: 4px; border-radius: 2px; background: var(--accent); animation: eqb 0.9s ease-in-out infinite; }
+.boot-eq i:nth-child(2) { animation-delay: 0.15s; }
+.boot-eq i:nth-child(3) { animation-delay: 0.3s; }
+.boot-eq i:nth-child(4) { animation-delay: 0.45s; }
+.boot-eq i:nth-child(5) { animation-delay: 0.6s; }
+body.motion-reduced .boot-word span { animation: none; opacity: 1; transform: none; }
+body.motion-reduced .boot-eq i { animation: none; height: 10px; }
 .eq i { width: 3px; background: var(--accent); animation: eqb 0.9s ease-in-out infinite; }
 .eq i:nth-child(2) { animation-delay: 0.25s; }
 .eq i:nth-child(3) { animation-delay: 0.5s; }
