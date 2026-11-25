@@ -1409,48 +1409,39 @@ const player = {
 function makeDeck() {
   const el = new Audio();
   el.preload = "auto";
-  return { el, gain: null, source: null, trackId: null, fading: false };
+  return { el, gain: null, source: null, trackId: null, fading: false, level: 1, rampTimer: null };
 }
 const decks = [makeDeck(), makeDeck()];
 let activeDeck = decks[0];
 let idleDeck = decks[1];
 let actx = null, analyser = null, masterGain = null, webAudioOk = false;
 
-function ensureWebAudio() {
-  if (actx) { if (actx.state === "suspended") actx.resume(); return; }
-  try {
-    actx = new (window.AudioContext || window.webkitAudioContext)();
-    analyser = actx.createAnalyser();
-    analyser.fftSize = 512;
-    masterGain = actx.createGain();
-    masterGain.gain.value = Number($("#volume").value) / 100;
-    analyser.connect(masterGain);
-    masterGain.connect(actx.destination);
-    decks.forEach((d) => {
-      d.source = actx.createMediaElementSource(d.el);
-      d.filter = actx.createBiquadFilter();
-      d.filter.type = "lowpass";
-      d.filter.frequency.value = 18000;
-      d.filter.Q.value = 0.4;
-      d.gain = actx.createGain();
-      d.source.connect(d.filter);
-      d.filter.connect(d.gain);
-      d.gain.connect(analyser);
-    });
-    webAudioOk = true;
-  } catch { webAudioOk = false; }
+function ensureWebAudio() {}
+function applyDeckVolume(deck) {
+  const master = Number($("#volume").value) / 100;
+  deck.el.volume = Math.max(0, Math.min(1, deck.level * master));
 }
 function setDeckLevel(deck, v) {
-  if (webAudioOk && deck.gain && actx) {
-    deck.gain.gain.setTargetAtTime(v, actx.currentTime, 0.1);
-  }
+  if (deck.rampTimer) { clearInterval(deck.rampTimer); deck.rampTimer = null; }
+  deck.level = v;
+  applyDeckVolume(deck);
 }
 function rampDeck(deck, v, seconds) {
-  if (webAudioOk && deck.gain && actx) {
-    deck.gain.gain.cancelScheduledValues(actx.currentTime);
-    deck.gain.gain.setValueAtTime(deck.gain.gain.value, actx.currentTime);
-    deck.gain.gain.linearRampToValueAtTime(v, actx.currentTime + seconds);
-  }
+  if (deck.rampTimer) { clearInterval(deck.rampTimer); deck.rampTimer = null; }
+  const from = deck.level;
+  const steps = Math.max(1, Math.round(seconds * 20));
+  let i = 0;
+  deck.rampTimer = setInterval(() => {
+    i++;
+    deck.level = from + (v - from) * (i / steps);
+    applyDeckVolume(deck);
+    if (i >= steps) {
+      clearInterval(deck.rampTimer);
+      deck.rampTimer = null;
+      deck.level = v;
+      applyDeckVolume(deck);
+    }
+  }, 50);
 }
 function setDeckFilter(deck, freq) {
   if (webAudioOk && deck.filter && actx) {
@@ -1492,15 +1483,12 @@ function startAt(idx, fade, tr) {
   to.trackId = track.id;
   if (!wasPreloaded) to.el.src = urlFor(track);
   to.el.currentTime = fade && tr ? (tr.inSkip || 0) : 0;
-  if (webAudioOk) setDeckLevel(to, 1);
+  if (!fade) setDeckLevel(to, 1);
   to.el.play().catch((err) => { if (!err || err.name !== "AbortError") onTrackError(to); });
   if (fade) {
     const F = Math.max(0.4, (tr && tr.length) || settings.crossfade || 3);
     const style = (tr && tr.style) || "fade";
-    if (webAudioOk && to.gain && actx) {
-      to.gain.gain.cancelScheduledValues(actx.currentTime);
-      to.gain.gain.setValueAtTime(0, actx.currentTime);
-    }
+    setDeckLevel(to, 0);
     if (style === "rise") {
       setDeckFilter(to, 500);
       rampFilter(to, 18000, F);
@@ -1993,8 +1981,7 @@ function setVolume(v) {
   $("#muteBtn").innerHTML = volumeIcon(v);
   $("#npMute").innerHTML = volumeIcon(v);
   store.set("arzxsh.volume", v);
-  if (webAudioOk && masterGain) masterGain.gain.value = v / 100;
-  else decks.forEach((d) => { d.el.volume = v / 100; });
+  decks.forEach((d) => applyDeckVolume(d));
 }
 function toggleMute() {
   const cur = Number($("#volume").value);
@@ -2638,7 +2625,7 @@ function drawVisualizers(dt, ts) {
         const x = (i / points) * w;
         let v = 0;
         if (wave) v = (wave[Math.floor((i / points) * (wave.length - 1))] - 128) / 128;
-        else if (!webAudioOk) v = Math.sin(i * 0.32 + ts / 280) * 0.08;
+        else if (!webAudioOk) v = Math.sin(i * 0.32 + ts / 280) * (player.playing ? 0.17 : 0.08);
         const y = h / 2 + v * (h * 0.46);
         if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
       }
@@ -2651,7 +2638,9 @@ function drawVisualizers(dt, ts) {
     for (let i = 0; i < entry.bars; i++) {
       let target = 0;
       if (freq) target = freq[Math.floor((i / entry.bars) * freq.length * 0.72)] / 255;
-      else if (!webAudioOk) target = 0.06;
+      else if (!webAudioOk) target = player.playing
+        ? 0.18 + 0.5 * Math.abs(Math.sin(ts / 340 + i * 1.93) * Math.sin(ts / 211 + i * 0.71))
+        : 0.06;
       const level = entry.levels[i];
       entry.levels[i] = target > level
         ? level + (target - level) * 0.58
