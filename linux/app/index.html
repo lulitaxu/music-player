@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>arzxsh for Linux</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23fc3c44'/%3E%3Cpath d='M10 22V10l12 6z' fill='white'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="styles.css?v=6">
+<link rel="stylesheet" href="styles.css?v=7">
 </head>
 <body>
 <div id="bootOverlay">
@@ -75,11 +75,11 @@
 
 <div id="player" class="hidden">
   <div class="player-controls">
-    <button id="shuffleBtn" class="icon-btn small" title="Shuffle">⤨</button>
-    <button id="prevBtn" class="icon-btn" title="Previous">⏮</button>
-    <button id="playBtn" class="play-btn" title="Play or pause">▶</button>
-    <button id="nextBtn" class="icon-btn" title="Next">⏭</button>
-    <button id="repeatBtn" class="icon-btn small" title="Repeat">↻</button>
+    <button id="shuffleBtn" class="icon-btn small" title="Shuffle"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="m15 15 6 6"/><path d="M4 4l5 5"/></svg></button>
+    <button id="prevBtn" class="icon-btn" title="Previous"><svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M19 20 9.5 12 19 4z"/><rect x="5" y="4" width="2.4" height="16" rx="1"/></svg></button>
+    <button id="playBtn" class="play-btn" title="Play or pause"><svg viewBox="0 0 24 24" width="21" height="21" fill="currentColor"><path d="M8 5.4v13.2L18.6 12z"/></svg></button>
+    <button id="nextBtn" class="icon-btn" title="Next"><svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="m5 4 9.5 8L5 20z"/><rect x="16.6" y="4" width="2.4" height="16" rx="1"/></svg></button>
+    <button id="repeatBtn" class="icon-btn small" title="Repeat"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 1 4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="m7 23-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg></button>
   </div>
   <div class="player-chipwrap">
     <div class="player-track" id="playerTrack">
@@ -100,10 +100,10 @@
     <canvas id="vizMini" width="72" height="28" title="Visualizer"></canvas>
     <button id="sleepBtn" class="icon-btn" title="Sleep timer"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/></svg></button>
     <button id="panelLyricsBtn" class="icon-btn" title="Lyrics (L)"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><line x1="8" y1="8" x2="16" y2="8"/><line x1="8" y1="12" x2="13" y2="12"/></svg></button>
-    <button id="queueBtn" class="icon-btn" title="Up Next (Q)">☰</button>
+    <button id="queueBtn" class="icon-btn" title="Up Next (Q)"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="4" cy="6" r="1.3" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1.3" fill="currentColor" stroke="none"/></svg></button>
     <button id="muteBtn" class="icon-btn" title="Mute"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4z" fill="currentColor" stroke="none"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9.4 9.4 0 0 1 0 13"/></svg></button>
     <input id="volume" type="range" min="0" max="100" value="80">
-    <button id="expandBtn" class="icon-btn" title="Now Playing (F)">⤢</button>
+    <button id="expandBtn" class="icon-btn" title="Now Playing (F)"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/></svg></button>
   </div>
 </div>
 
@@ -121,7 +121,7 @@
   <div id="npBackdrop" class="np-backdrop-layer active"></div>
   <div class="np-inner">
     <div class="np-head">
-      <button id="npClose" class="round-btn" title="Close">⌄</button>
+      <button id="npClose" class="round-btn" title="Close"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></button>
       <div class="np-context" id="npContext">Now Playing</div>
       <div class="np-head-spacer"></div>
     </div>
@@ -140,11 +140,11 @@
           <span id="npTotal">0:00</span>
         </div>
         <div class="player-controls np-controls">
-          <button id="npShuffle" class="icon-btn small" title="Shuffle">⤨</button>
-          <button id="npPrev" class="icon-btn" title="Previous">⏮</button>
-          <button id="npPlay" class="play-btn big" title="Play or pause">▶</button>
-          <button id="npNext" class="icon-btn" title="Next">⏭</button>
-          <button id="npRepeat" class="icon-btn small" title="Repeat">↻</button>
+          <button id="npShuffle" class="icon-btn small" title="Shuffle"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="m15 15 6 6"/><path d="M4 4l5 5"/></svg></button>
+          <button id="npPrev" class="icon-btn" title="Previous"><svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M19 20 9.5 12 19 4z"/><rect x="5" y="4" width="2.4" height="16" rx="1"/></svg></button>
+          <button id="npPlay" class="play-btn big" title="Play or pause"><svg viewBox="0 0 24 24" width="21" height="21" fill="currentColor"><path d="M8 5.4v13.2L18.6 12z"/></svg></button>
+          <button id="npNext" class="icon-btn" title="Next"><svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="m5 4 9.5 8L5 20z"/><rect x="16.6" y="4" width="2.4" height="16" rx="1"/></svg></button>
+          <button id="npRepeat" class="icon-btn small" title="Repeat"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 1 4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="m7 23-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg></button>
         </div>
         <div class="np-toggles">
           <button id="lyricsBtn" class="chip-btn">Lyrics</button>
@@ -200,6 +200,6 @@
 
 <div id="ctxMenu" class="hidden"></div>
 <div id="toast" class="hidden"></div>
-<script src="app.js?v=6"></script>
+<script src="app.js?v=7"></script>
 </body>
 </html>

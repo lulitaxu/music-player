@@ -322,7 +322,11 @@ body.motion-reduced .boot-eq i { animation: none; height: 10px; }
 .page-kind { font-size: 12px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--text55); }
 .page-name { font-size: 44px; font-weight: 850; letter-spacing: -1px; line-height: 1.05; margin: 6px 0; }
 .page-meta { color: var(--text55); font-size: 14px; }
-.page-actions { display: flex; gap: 10px; margin-top: 22px; }
+.page-actions { display: flex; gap: 10px; margin-top: 22px; flex-wrap: wrap; align-items: center; }
+img[src=""] { opacity: 0; }
+.skel-row { height: 58px; margin-bottom: 6px; border-radius: 10px; position: relative; overflow: hidden; }
+.skel-row::before { content: ""; position: absolute; left: 8px; top: 9px; width: 40px; height: 40px; border-radius: 7px; background: rgba(255, 255, 255, 0.07); }
+.skel-row::after { content: ""; position: absolute; left: 60px; top: 14px; width: 34%; height: 9px; border-radius: 5px; background: rgba(255, 255, 255, 0.07); box-shadow: 0 19px 0 -1px rgba(255, 255, 255, 0.05); }
 .play-pill {
   background: var(--accent); color: var(--on-accent); border-radius: 999px;
   padding: 10px 30px; font-size: 15px; font-weight: 700;
@@ -750,3 +754,5 @@ body.lowfx.art-live .np-art-layer.active { animation-duration: 28s; }
 body.motion-reduced .np-art-layer.active { animation: none; }
 @keyframes bufPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 body.buffering #playBtn, body.buffering #npPlay { animation: bufPulse 0.9s ease-in-out infinite; }
+.play-btn svg { display: block; }
+.icon-btn svg { display: block; }

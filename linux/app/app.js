@@ -439,9 +439,10 @@ const CTX_LABELS = {
   recentSide: "Recently played", likedList: "Liked Songs", localList: "On this device",
   playlistTracks: "Playlist",
 };
-function skeletons(n, h = 62) {
-  return Array.from({ length: n }, () =>
+function skeletons(n, h) {
+  if (h) return Array.from({ length: n }, () =>
     `<div class="skel" style="height:${h}px;margin-bottom:8px"></div>`).join("");
+  return Array.from({ length: n }, () => `<div class="skel skel-row"></div>`).join("");
 }
 view.addEventListener("click", (e) => {
   const dl = e.target.closest("[data-download]");
@@ -640,7 +641,7 @@ function wireMoodChips() {
     b.addEventListener("click", () => runSearch(b.dataset.mood)));
 }
 function heavyRotationHtml() {
-  if (!recentPlays.length) return "";
+  if (recentPlays.length <= 6) return "";
   return `<div class="section-title">Heavy rotation</div>
     <div class="rail">${recentPlays.map((t) => songCardHtml(t, "recent")).join("")}</div>`;
 }
@@ -976,6 +977,10 @@ async function renderLocal(fresh = false) {
           <div class="page-kind">Local library</div>
           <div class="page-name">On this device</div>
           <div class="page-meta">${data.tracks.length} tracks · ${esc(data.dir)}</div>
+          <div class="page-actions">
+            <button class="play-pill" id="localPlay">▶ Play</button>
+            <button class="shuffle-pill" id="localShuffle">⤨ Shuffle</button>
+          </div>
         </div>
       </div>
       <button class="chip-btn" id="rescanBtn" style="margin:6px 0 4px">↻ Rescan folder</button>
@@ -984,6 +989,12 @@ async function renderLocal(fresh = false) {
       <div class="section-title">Songs</div>
       ${tracks.length ? tracks.map((t, i) => rowHtml(t, i, { ctx: "localList" })).join("") : `<div class="empty-note">No audio files found in that folder yet. Downloads you save land in its arzxsh subfolder.</div>`}`;
     $("#rescanBtn").onclick = () => renderLocal(true);
+    $("#localPlay").onclick = () => { if (tracks.length) playFromContext(tracks, 0, "Local library"); };
+    $("#localShuffle").onclick = () => {
+      if (!tracks.length) return;
+      if (!player.shuffle) toggleShuffle();
+      playFromContext(tracks, Math.floor(Math.random() * tracks.length), "Local library");
+    };
     $("#sortBtn").onclick = () => {
       store.set("arzxsh.localSort", sortMode === "alpha" ? "recent" : "alpha");
       renderLocal();
@@ -1199,6 +1210,8 @@ function renderLiked() {
         <div class="page-name">Liked Songs</div>
         <div class="page-meta">${likes.length} songs · stored on this machine only</div>
         <div class="page-actions">
+          <button class="play-pill" id="likedPlay">▶ Play</button>
+          <button class="shuffle-pill" id="likedShuffle">⤨ Shuffle</button>
           <button class="chip-btn" id="likedSortBtn">Sort: ${sortMode === "alpha" ? "A–Z" : "Recently liked"}</button>
         </div>
       </div>
@@ -1208,6 +1221,12 @@ function renderLiked() {
   $("#likedSortBtn").onclick = () => {
     store.set("arzxsh.likedSort", sortMode === "alpha" ? "recent" : "alpha");
     renderLiked();
+  };
+  $("#likedPlay").onclick = () => { if (tracks.length) playFromContext(tracks, 0, "Liked Songs"); };
+  $("#likedShuffle").onclick = () => {
+    if (!tracks.length) return;
+    if (!player.shuffle) toggleShuffle();
+    playFromContext(tracks, Math.floor(Math.random() * tracks.length), "Liked Songs");
   };
 }
 function renderSettings() {
@@ -1741,11 +1760,13 @@ function paintArtLive() {
   document.body.classList.toggle("art-live",
     npOpen && player.playing && settings.animatedArt && !motionReduced());
 }
+const PLAY_ICON = '<svg viewBox="0 0 24 24" width="21" height="21" fill="currentColor"><path d="M8 5.4v13.2L18.6 12z"/></svg>';
+const PAUSE_ICON = '<svg viewBox="0 0 24 24" width="21" height="21" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1.2"/><rect x="14" y="5" width="4" height="14" rx="1.2"/></svg>';
 function syncPlayButtons() {
   if (!player.playing) document.body.classList.remove("buffering");
-  const glyph = player.playing ? "⏸" : "▶";
-  $("#playBtn").textContent = glyph;
-  $("#npPlay").textContent = glyph;
+  const icon = player.playing ? PAUSE_ICON : PLAY_ICON;
+  $("#playBtn").innerHTML = icon;
+  $("#npPlay").innerHTML = icon;
   document.title = player.current
     ? `${player.current.title} · ${player.current.artist} — arzxsh`
     : "arzxsh for Linux";
@@ -2731,7 +2752,7 @@ applySettings(false);
 paintSeekRatio(0, 0);
 renderSideRecent();
 renderSidePlaylists();
-const ART_SPACER = "data:image/gif;base64,R0lGODlhAQABAAAAACw=";
+const ART_SPACER = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 document.addEventListener("error", (e) => {
   const t = e.target;
   if (t && t.tagName === "IMG" && t.src !== ART_SPACER) t.src = ART_SPACER;
