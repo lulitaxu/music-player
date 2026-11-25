@@ -916,10 +916,14 @@ async function renderLocal(fresh = false) {
   try {
     const data = await api(`/local${fresh ? "?fresh=1" : ""}`);
     if (routes[routeIdx].type !== "local") return;
-    register(data.tracks, "localList");
+    const sortMode = store.get("arzxsh.localSort", "recent");
+    const tracks = data.tracks.slice().sort((a, b) => sortMode === "alpha"
+      ? (a.title || "").localeCompare(b.title || "", undefined, { sensitivity: "base" })
+      : (b.added_at || 0) - (a.added_at || 0));
+    register(tracks, "localList");
     view.innerHTML = `
       <div class="page-head plain">
-        ${coverHtml(data.tracks[0], "♪")}
+        ${coverHtml(tracks[0], "♪")}
         <div>
           <div class="page-kind">Local library</div>
           <div class="page-name">On this device</div>
@@ -928,9 +932,14 @@ async function renderLocal(fresh = false) {
       </div>
       <button class="chip-btn" id="rescanBtn" style="margin:6px 0 4px">↻ Rescan folder</button>
       ${data.tracks.some((t) => !t.artwork) ? `<button class="chip-btn" id="healBtn" style="margin:6px 0 4px">Fetch missing covers & lyrics</button>` : ""}
+      <button class="chip-btn" id="sortBtn" style="margin:6px 0 4px">Sort: ${sortMode === "alpha" ? "A–Z" : "Recently added"}</button>
       <div class="section-title">Songs</div>
-      ${data.tracks.length ? data.tracks.map((t, i) => rowHtml(t, i, { ctx: "localList" })).join("") : `<div class="empty-note">No audio files found in that folder yet. Downloads you save land in its arzxsh subfolder.</div>`}`;
+      ${tracks.length ? tracks.map((t, i) => rowHtml(t, i, { ctx: "localList" })).join("") : `<div class="empty-note">No audio files found in that folder yet. Downloads you save land in its arzxsh subfolder.</div>`}`;
     $("#rescanBtn").onclick = () => renderLocal(true);
+    $("#sortBtn").onclick = () => {
+      store.set("arzxsh.localSort", sortMode === "alpha" ? "recent" : "alpha");
+      renderLocal();
+    };
     const healBtn = $("#healBtn");
     if (healBtn) healBtn.onclick = async () => {
       const missing = data.tracks.filter((t) => !t.artwork);
