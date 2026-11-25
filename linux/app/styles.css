@@ -748,3 +748,5 @@ body.lowfx .sync-line.depth-3, body.lowfx .sync-line.depth-far { filter: none; }
 body.art-live .np-art-layer.active { animation: artDrift 16s ease-in-out infinite alternate; will-change: transform; }
 body.lowfx.art-live .np-art-layer.active { animation-duration: 28s; }
 body.motion-reduced .np-art-layer.active { animation: none; }
+@keyframes bufPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+body.buffering #playBtn, body.buffering #npPlay { animation: bufPulse 0.9s ease-in-out infinite; }

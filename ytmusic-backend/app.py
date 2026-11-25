@@ -195,7 +195,7 @@ def hi_res_art(url):
             return url + "=w1080-h1080"
         return url
     if "i.ytimg.com" in url:
-        return url.replace("mqdefault", "hqdefault")
+        return re.sub(r"/(mqdefault|hqdefault|sddefault|default)\.jpg", "/maxresdefault.jpg", url, count=1)
     return url
 
 

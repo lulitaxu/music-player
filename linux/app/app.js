@@ -1586,6 +1586,12 @@ decks.forEach((deck) => {
     advance(true, false);
   });
   deck.el.addEventListener("error", () => onTrackError(deck));
+  deck.el.addEventListener("waiting", () => {
+    if (deck === activeDeck) document.body.classList.add("buffering");
+  });
+  deck.el.addEventListener("canplay", () => {
+    if (deck === activeDeck) document.body.classList.remove("buffering");
+  });
   deck.el.addEventListener("playing", () => {
     if (deck !== activeDeck) return;
     player.failCount = 0;
@@ -1736,6 +1742,7 @@ function paintArtLive() {
     npOpen && player.playing && settings.animatedArt && !motionReduced());
 }
 function syncPlayButtons() {
+  if (!player.playing) document.body.classList.remove("buffering");
   const glyph = player.playing ? "⏸" : "▶";
   $("#playBtn").textContent = glyph;
   $("#npPlay").textContent = glyph;
