@@ -1178,6 +1178,100 @@ def local_art(track_id: str):
                              "x-content-type-options": "nosniff"})
 
 
+def _extract_lyrics(path: Path):
+    if mutagen is None:
+        return None
+    try:
+        raw = mutagen.File(path)
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        tags = getattr(raw, "tags", None)
+        if tags is not None and hasattr(tags, "getall"):
+            frames = tags.getall("USLT")
+            if frames:
+                text = str(frames[0].text or "").strip()
+                if text:
+                    return text
+        for key in list(raw.keys()):
+            low = key.lower()
+            if key == "\xa9lyr" or low == "lyrics":
+                vals = raw[key]
+                if isinstance(vals, (list, tuple)):
+                    if vals:
+                        text = str(vals[0]).strip()
+                        if text:
+                            return text
+                else:
+                    text = str(vals).strip()
+                    if text:
+                        return text
+            elif low.startswith("uslt"):
+                text = str(getattr(raw[key], "text", "") or "").strip()
+                if text:
+                    return text
+    except Exception:
+        return None
+    return None
+
+
+@app.get("/local/lyrics/{track_id}")
+def local_lyrics(track_id: str):
+    path = _registry_lookup(track_id)
+    if path is None:
+        raise HTTPException(404, "local track not found")
+    text = _extract_lyrics(path)
+    if not text:
+        return {"id": track_id, "lyrics": None, "source": None,
+                "synced": None}
+    synced = _parse_lrc(text)
+    plain = ("\n".join(line["text"] for line in synced)
+             if synced else text)
+    return {"id": track_id, "lyrics": plain, "source": None,
+            "synced": synced}
+
+
+@app.post("/local/heal/{track_id}")
+def heal_local(track_id: str):
+    path = _registry_lookup(track_id)
+    if path is None:
+        raise HTTPException(404, "local track not found")
+    track = _local_track(path)
+    need_art = not track.get("artwork")
+    need_lyrics = _extract_lyrics(path) is None
+    if not need_art and not need_lyrics:
+        return {"ok": True, "changed": False, "track": track}
+    query = f"{track.get('title') or ''} {track.get('artist') or ''}".strip()
+    hits = []
+    try:
+        hits = tracks(ytm.search(query, filter="songs", limit=3))
+    except Exception:
+        hits = []
+    if not hits:
+        return {"ok": False, "changed": False, "track": track}
+    video_id = hits[0]["id"]
+    art = None
+    if need_art:
+        art = _fetch_art_bytes(hits[0].get("artwork") or "")
+        if art is None:
+            art = _fetch_art_bytes(
+                f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
+    lyrics_text = None
+    if need_lyrics:
+        try:
+            res = lyrics(video_id)
+            lyrics_text = _lrc_text(res.get("synced")) or res.get("lyrics")
+        except Exception:
+            lyrics_text = None
+    if art is None and not lyrics_text:
+        return {"ok": False, "changed": False, "track": track}
+    _embed_art_lyrics(path, lyrics_text, art)
+    _cache.pop("local:scan", None)
+    return {"ok": True, "changed": True, "track": _local_track(path)}
+
+
 def _lrc_text(synced) -> str | None:
     if not synced:
         return None

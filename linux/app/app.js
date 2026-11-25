@@ -927,9 +927,26 @@ async function renderLocal(fresh = false) {
         </div>
       </div>
       <button class="chip-btn" id="rescanBtn" style="margin:6px 0 4px">↻ Rescan folder</button>
+      ${data.tracks.some((t) => !t.artwork) ? `<button class="chip-btn" id="healBtn" style="margin:6px 0 4px">Fetch missing covers & lyrics</button>` : ""}
       <div class="section-title">Songs</div>
       ${data.tracks.length ? data.tracks.map((t, i) => rowHtml(t, i, { ctx: "localList" })).join("") : `<div class="empty-note">No audio files found in that folder yet. Downloads you save land in its arzxsh subfolder.</div>`}`;
     $("#rescanBtn").onclick = () => renderLocal(true);
+    const healBtn = $("#healBtn");
+    if (healBtn) healBtn.onclick = async () => {
+      const missing = data.tracks.filter((t) => !t.artwork);
+      healBtn.disabled = true;
+      let done = 0, fixed = 0;
+      for (const t of missing) {
+        healBtn.textContent = `Fetching ${done + 1} / ${missing.length}…`;
+        try {
+          const r = await apiPost(`/local/heal/${encodeURIComponent(t.id)}`);
+          if (r.changed) fixed++;
+        } catch {}
+        done++;
+      }
+      toast(fixed ? `Added covers or lyrics to ${fixed} track${fixed === 1 ? "" : "s"}` : "No matches found for the missing ones");
+      renderLocal(true);
+    };
   } catch {
     if (routes[routeIdx].type !== "local") return;
     view.innerHTML = `<div class="section-title">On this device</div>
@@ -2261,17 +2278,14 @@ $("#npDownload").onclick = () => {
 };
 async function loadLyricsForCurrent() {
   if (!player.current) return;
-  if (player.current.source === "local") {
-    showPlainLyrics("Lyrics are not available for local files.");
-    $("#lyricsSource").textContent = "";
-    return;
-  }
   const id = player.current.id;
   if (lyricsCache.has(id)) { fillLyrics(lyricsCache.get(id)); return; }
   showPlainLyrics("Loading…");
   $("#lyricsSource").textContent = "";
   try {
-    const r = await api(`/lyrics/${encodeURIComponent(id)}`);
+    const r = await api(player.current.source === "local"
+      ? `/local/lyrics/${encodeURIComponent(id)}`
+      : `/lyrics/${encodeURIComponent(id)}`);
     lyricsCache.set(id, r);
     if (lyricsTrackId === id) fillLyrics(r);
   } catch {
