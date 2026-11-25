@@ -5,4 +5,5 @@ for d in /app/lib/python3*/site-packages; do
   fi
 done
 export PYTHONPATH
+export GDK_BACKEND="${GDK_BACKEND:-x11}"
 exec python3 /app/share/arzxsh/shell/arzxsh_shell.py "$@"
