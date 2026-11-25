@@ -131,7 +131,9 @@ class App(Gtk.Application):
         win.set_title("arzxsh")
         win.set_default_size(1120, 720)
         win.set_size_request(860, 540)
-        self.view = WebKit.WebView()
+        context = WebKit.WebContext.get_default()
+        context.set_cache_model(WebKit.CacheModel.DOCUMENT_VIEWER)
+        self.view = WebKit.WebView(web_context=context)
         css = user_css()
         if css.strip():
             script = WebKit.UserScript(
