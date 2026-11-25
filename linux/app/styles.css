@@ -354,10 +354,13 @@ body.motion-reduced .boot-eq i { animation: none; height: 10px; }
 .setting-name { font-size: 15px; font-weight: 700; }
 .setting-desc { font-size: 13px; line-height: 1.45; color: var(--text55); margin-top: 3px; max-width: 480px; }
 .setting-row select {
-  min-width: 172px; background: rgba(0, 0, 0, 0.3); color: var(--text);
-  border: none; border-radius: 12px; padding: 10px 12px;
-  font: inherit; outline: none;
+  min-width: 172px; background-color: rgba(0, 0, 0, 0.3); color: var(--text);
+  border: none; border-radius: 12px; padding: 10px 34px 10px 12px;
+  font: inherit; outline: none; -webkit-appearance: none; appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23a8a8ad' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 12px center;
 }
+.setting-row select option { background-color: #1d1d20; color: #f2f2f4; }
 .setting-row input[type="color"] {
   width: 58px; height: 38px; border: none; border-radius: 12px;
   background: rgba(0, 0, 0, 0.3); padding: 3px; cursor: pointer;

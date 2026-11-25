@@ -2532,7 +2532,7 @@ if (bootOverlay) {
   bootOverlay.addEventListener("click", dismissBoot);
   const bootWatch = setInterval(() => {
     const waited = performance.now() - bootStart;
-    const ready = view.querySelector(".track-row, .card, .error-note, .empty-note");
+    const ready = view.querySelector(".row, .card, .error-note, .empty-note");
     if ((ready && waited > 1000) || waited > 4000) {
       clearInterval(bootWatch);
       dismissBoot();
