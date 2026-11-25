@@ -54,7 +54,35 @@ if _UA:
     _yth.USER_AGENT = _UA
 
 app = FastAPI(title="arzxsh-ytm", version="0.1.0")
-ytm = YTMusic()
+
+
+class _LazyYTMusic:
+    def __init__(self):
+        self._client = None
+        self._lock = threading.Lock()
+
+    def get(self):
+        if self._client is None:
+            with self._lock:
+                if self._client is None:
+                    self._client = YTMusic()
+        return self._client
+
+    def __getattr__(self, name):
+        return getattr(self.get(), name)
+
+
+ytm = _LazyYTMusic()
+
+
+def _prewarm_ytm():
+    try:
+        ytm.get()
+    except Exception:
+        pass
+
+
+threading.Thread(target=_prewarm_ytm, daemon=True).start()
 
 # --- request guards (audit 2026-11-11) ---------------------------------------
 # The service is a same-machine, single-user backend with no accounts.
