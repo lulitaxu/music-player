@@ -1712,4 +1712,10 @@ _WEB_APP_DIR = Path(__file__).resolve().parent.parent / "linux" / "app"
 if _WEB_APP_DIR.is_dir():
     from fastapi.staticfiles import StaticFiles
 
-    app.mount("/", StaticFiles(directory=_WEB_APP_DIR, html=True), name="webapp")
+    class _NoCacheStaticFiles(StaticFiles):
+        async def get_response(self, path, scope):
+            response = await super().get_response(path, scope)
+            response.headers["Cache-Control"] = "no-cache"
+            return response
+
+    app.mount("/", _NoCacheStaticFiles(directory=_WEB_APP_DIR, html=True), name="webapp")
