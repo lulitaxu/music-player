@@ -6,6 +6,9 @@ import sys
 import urllib.request
 from pathlib import Path
 
+os.environ.setdefault("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
+os.environ.setdefault("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
+
 import gi
 
 gi.require_version("Gtk", "4.0")
