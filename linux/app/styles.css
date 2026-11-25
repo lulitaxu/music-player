@@ -728,8 +728,11 @@ body.lowfx #main, body.lowfx #sidebar, body.lowfx #sidePanel, body.lowfx #rail, 
 body.lowfx #main { background: rgba(43, 41, 39, 0.97); }
 body.lowfx #sidebar, body.lowfx #rail { background: rgba(28, 28, 30, 0.97); }
 body.lowfx #sidePanel, body.lowfx #player { background: rgba(24, 24, 26, 0.97); }
-body.lowfx .ambient-layer { filter: blur(40px) brightness(0.36) saturate(1.4); }
-body.lowfx .np-backdrop-layer { filter: blur(36px) brightness(0.5) saturate(1.3); }
+body.lowfx .ambient-layer { filter: none; }
+body.lowfx .ambient-layer.active { opacity: 0.38; }
+body.lowfx .np-backdrop-layer { filter: none; }
+body.lowfx .np-backdrop-layer.active { opacity: 0.5; }
+body.lowfx.art-live .np-art-layer.active { animation: none; }
 body.lowfx .sync-line.depth-1, body.lowfx .sync-line.depth-2,
 body.lowfx .sync-line.depth-3, body.lowfx .sync-line.depth-far { filter: none; }
 .mood-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 16px 0 2px; }

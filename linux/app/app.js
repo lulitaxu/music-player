@@ -1605,6 +1605,9 @@ decks.forEach((deck) => {
     advance(true, false);
   });
   deck.el.addEventListener("error", () => onTrackError(deck));
+  deck.el.addEventListener("timeupdate", () => {
+    if (deck === activeDeck && !scrubbing && deck.el.duration) syncSeek(deck.el.currentTime || 0, deck.el.duration);
+  });
   deck.el.addEventListener("waiting", () => {
     if (deck === activeDeck) document.body.classList.add("buffering");
   });
@@ -2600,8 +2603,11 @@ function visualizerHasEnergy() {
   return vizEntries.some((entry) =>
     entry.levels.some((v) => v > 0.012) || entry.peaks.some((v) => v > 0.012));
 }
+let vizLastTs = 0;
 function drawVisualizers(dt, ts) {
   if (settings.vizStyle === "off") return;
+  if (ts - vizLastTs < 33) return;
+  vizLastTs = ts;
   const npOpen = !$("#nowPlaying").classList.contains("hidden");
   const playerVisible = !$("#player").classList.contains("hidden");
   if (!npOpen && !playerVisible) return;
@@ -2686,10 +2692,16 @@ function motionFrame(ts) {
   const el = activeDeck.el;
   const now = el.currentTime || 0;
   const dur = el.duration || 0;
-  if (dur) syncSeek(now, dur);
-  if (syncState.lines.length) updateLyricsSync(now);
-  drawVisualizers(dt, ts);
-  if (player.playing || scrubbing || ts < frameState.until || visualizerHasEnergy()) {
+  let alive = player.playing || scrubbing;
+  try {
+    if (dur) syncSeek(now, dur);
+    if (syncState.lines.length) updateLyricsSync(now);
+    drawVisualizers(dt, ts);
+    alive = alive || ts < frameState.until || visualizerHasEnergy();
+  } catch (err) {
+    alive = player.playing || scrubbing;
+  }
+  if (alive) {
     wakeMotionLoop();
   } else {
     frameState.lastTs = 0;
@@ -2699,6 +2711,9 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) stopMotionLoop();
   else wakeMotionLoop(300);
 });
+setInterval(() => {
+  if (player.playing && player.current && !document.hidden && !frameState.running) wakeMotionLoop();
+}, 2500);
 
 document.addEventListener("keydown", (e) => {
   const tag = e.target.tagName;
