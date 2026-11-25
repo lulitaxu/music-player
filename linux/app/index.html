@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>arzxsh for Linux</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23fc3c44'/%3E%3Cpath d='M10 22V10l12 6z' fill='white'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="styles.css?v=5">
+<link rel="stylesheet" href="styles.css?v=6">
 </head>
 <body>
 <div id="bootOverlay">
@@ -65,6 +65,7 @@
         <pre id="panelLyricsText"></pre>
       </div>
       <div id="panelQueueView" class="panel-view hidden">
+        <button class="chip-btn" id="smartShuffleBtn" style="margin:2px 0 10px">Smart Shuffle</button>
         <div id="panelQueueList"></div>
         <div class="muted small" id="panelQueueNote"></div>
       </div>
@@ -97,12 +98,22 @@
   </div>
   <div class="player-right">
     <canvas id="vizMini" width="72" height="28" title="Visualizer"></canvas>
+    <button id="sleepBtn" class="icon-btn" title="Sleep timer"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/></svg></button>
     <button id="panelLyricsBtn" class="icon-btn" title="Lyrics (L)"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><line x1="8" y1="8" x2="16" y2="8"/><line x1="8" y1="12" x2="13" y2="12"/></svg></button>
     <button id="queueBtn" class="icon-btn" title="Up Next (Q)">☰</button>
     <button id="muteBtn" class="icon-btn" title="Mute"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4z" fill="currentColor" stroke="none"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9.4 9.4 0 0 1 0 13"/></svg></button>
     <input id="volume" type="range" min="0" max="100" value="80">
     <button id="expandBtn" class="icon-btn" title="Now Playing (F)">⤢</button>
   </div>
+</div>
+
+<div id="sleepMenu" class="sleep-menu hidden">
+  <button class="ctx-item" data-sleep="off">Off</button>
+  <button class="ctx-item" data-sleep="15">15 minutes</button>
+  <button class="ctx-item" data-sleep="30">30 minutes</button>
+  <button class="ctx-item" data-sleep="45">45 minutes</button>
+  <button class="ctx-item" data-sleep="60">60 minutes</button>
+  <button class="ctx-item" data-sleep="track">End of this track</button>
 </div>
 
 <div id="nowPlaying" class="hidden">
@@ -189,6 +200,6 @@
 
 <div id="ctxMenu" class="hidden"></div>
 <div id="toast" class="hidden"></div>
-<script src="app.js?v=5"></script>
+<script src="app.js?v=6"></script>
 </body>
 </html>

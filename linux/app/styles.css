@@ -728,3 +728,23 @@ body.lowfx .ambient-layer { filter: blur(40px) brightness(0.36) saturate(1.4); }
 body.lowfx .np-backdrop-layer { filter: blur(36px) brightness(0.5) saturate(1.3); }
 body.lowfx .sync-line.depth-1, body.lowfx .sync-line.depth-2,
 body.lowfx .sync-line.depth-3, body.lowfx .sync-line.depth-far { filter: none; }
+.mood-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 16px 0 2px; }
+.sleep-menu { position: fixed; right: 14px; bottom: 86px; z-index: 70; min-width: 176px; padding: 6px; border-radius: 12px; background: rgba(28, 28, 30, 0.97); border: 1px solid rgba(255, 255, 255, 0.1); box-shadow: 0 14px 40px rgba(0, 0, 0, 0.5); display: flex; flex-direction: column; }
+.sleep-menu .ctx-item { text-align: left; }
+.sleep-menu.hidden { display: none; }
+#sleepBtn.on { color: var(--accent); }
+.q-smart { font-size: 10px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: var(--accent); border: 1px solid var(--accent); border-radius: 20px; padding: 2px 7px; white-space: nowrap; }
+.queue-row.dragging { opacity: 0.45; }
+.queue-row.drag-over { box-shadow: inset 0 2px 0 var(--accent); }
+.cover-picker { display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0 2px; align-items: center; }
+.cover-picker.hidden { display: none; }
+.cover-pick { width: 62px; height: 62px; border-radius: 10px; overflow: hidden; background: rgba(255, 255, 255, 0.07); color: var(--text); font-size: 12px; font-weight: 650; flex: none; }
+.cover-pick img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.side-link.pinned::before { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-right: 3px; vertical-align: 2px; }
+@keyframes artDrift {
+  from { transform: scale(1.03) translate(0.6%, -0.6%); }
+  to { transform: scale(1.12) translate(-1.4%, 1.4%); }
+}
+body.art-live .np-art-layer.active { animation: artDrift 16s ease-in-out infinite alternate; will-change: transform; }
+body.lowfx.art-live .np-art-layer.active { animation-duration: 28s; }
+body.motion-reduced .np-art-layer.active { animation: none; }

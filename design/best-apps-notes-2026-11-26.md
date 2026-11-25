@@ -10,15 +10,17 @@ Taken 2026-11-26 at Arzu's request. Each item: what the best apps do, whether ar
 - Downloads with embedded art and lyrics: matched, plus the heal pass for older files.
 - Library sorting (recently added, A-Z): Spotify and Apple Music both sort the library; arzxsh Local got it 2026-11-26.
 
-## Worth stealing, ranked
-1. Home shelves (Spotify, YouTube Music). Home is still a single "Trending now" list. Best apps open with Quick picks from your recents and likes, then mood and genre shelves. Biggest visible upgrade, and it matches the standing Home directive (Spotify/Apple layout, greeting first).
-2. Sleep timer (all of them). Stop playback after 15/30/45/60 minutes or at end of track. Small build, used nightly.
-3. Sorting everywhere (Spotify, Apple Music). Same Recently added / A-Z control on Liked Songs and inside playlists, not just Local.
-4. Smart Shuffle (Spotify). Shuffle that slips in similar tracks from radio seeds instead of only queue items. Medium build on top of the existing radio.
-5. Queue drag-reorder (Apple Music, Spotify). The Up Next panel exists; dragging to reorder is the missing half.
-6. Playlist pins and custom covers (Spotify). Pin up to a few playlists at the top of the sidebar; pick a cover from its tracks. Small.
+## Worth stealing, ranked — ALL BUILT 2026-11-26 (desktop)
+1. Home shelves (Spotify, YouTube Music). Mood chips (Chill/Focus/Workout/Party/Romance/Drive, they run a search) plus a Heavy rotation card rail from recents, on top of Jump back in, Trending and Top artists.
+2. Sleep timer (all of them). Moon button in the player bar: 15/30/45/60 minutes or end of track.
+3. Sorting everywhere (Spotify, Apple Music). Liked Songs: Recently liked / A-Z. Playlists: Custom order / Title A-Z / Artist A-Z (view-only, mix bars only in custom order).
+4. Smart Shuffle (Spotify). Toggle in the Up Next panel; radio-seeded similar tracks slip into the queue, tagged "Smart pick".
+5. Queue drag-reorder (Apple Music, Spotify). Drag upcoming tracks in Up Next to reorder them.
+6. Playlist pins and custom covers (Spotify). Pin from the playlist page (pinned playlists sit on top of the sidebar with a dot); Cover button picks any track artwork from the playlist, or Auto for the collage.
 
-## Not worth it
-- Animated album artwork and Canvas loops: heavy assets, licensing problems, low value on desktop.
+## Built anyway at Arzu's order
+- Animated artwork: the Now Playing cover slowly drifts and zooms while playing (Apple Music style), with a Settings toggle. Ken Burns on the artwork layer, so no heavy assets needed. Pauses with the music and respects reduced motion.
+
+## Still not worth it
 - Group sessions and shared queues: needs accounts and servers arzxsh does not have.
 - Lossless badges: the sources are streams; a badge would be decoration, not truth.

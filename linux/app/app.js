@@ -89,6 +89,7 @@ const settings = {
   crossfade: Number.isFinite(storedSettings.crossfade)
     ? Math.max(0, Math.min(12, Math.round(storedSettings.crossfade))) : 6,
   name: typeof storedSettings.name === "string" ? storedSettings.name.slice(0, 40) : "",
+  animatedArt: storedSettings.animatedArt !== false,
 };
 if (/AppleWebKit/.test(navigator.userAgent) && !/Chrome|Chromium|Edg|OPR/.test(navigator.userAgent)) {
   document.body.classList.add("lowfx");
@@ -194,6 +195,26 @@ function notePlayed(track) {
   recentPlays = [track, ...recentPlays.filter((t) => t.id !== track.id)].slice(0, 12);
   store.set("arzxsh.recent", recentPlays);
   renderSideRecent();
+  if (track && player.smartShuffle && player.queue.length - player.index - 1 < 2) smartTopUp(track);
+}
+async function smartTopUp(seed) {
+  if (player.smartBusy || !seed || seed.source === "local") return;
+  player.smartBusy = true;
+  try {
+    const r = await api(`/radio?video_id=${encodeURIComponent(seed.id)}`);
+    const inQueue = new Set(player.queue.map((t) => t.id));
+    const fresh = (r.results || []).filter((t) => !inQueue.has(t.id)).slice(0, 5);
+    if (fresh.length) {
+      register(fresh, null);
+      player.queue.push(...fresh.map((t) => ({ ...t, _smart: true })));
+      renderQueue();
+    }
+  } catch {}
+  player.smartBusy = false;
+}
+function paintSmartShuffleBtn() {
+  const b = $("#smartShuffleBtn");
+  if (b) b.classList.toggle("on", player.smartShuffle);
 }
 
 let modalResolve = null;
@@ -241,11 +262,15 @@ function removeFromPlaylist(p, trackId) {
   p.tracks = p.tracks.filter((t) => t.id !== trackId);
   savePlaylists();
 }
+function pinnedIds() { return store.get("arzxsh.pinnedPlaylists", []); }
 function renderSidePlaylists() {
   const box = $("#sidePlaylists");
   if (!box) return;
-  box.innerHTML = playlists.map((p) =>
-    `<button class="side-link" data-pl="${esc(p.id)}">♪&nbsp; ${esc(p.name)} <span class="side-count">${p.tracks.length}</span></button>`).join("");
+  const pins = pinnedIds();
+  const ordered = [...playlists].sort((a, b) =>
+    (pins.includes(b.id) ? 1 : 0) - (pins.includes(a.id) ? 1 : 0));
+  box.innerHTML = ordered.map((p) =>
+    `<button class="side-link ${pins.includes(p.id) ? "pinned" : ""}" data-pl="${esc(p.id)}">♪&nbsp; ${esc(p.name)} <span class="side-count">${p.tracks.length}</span></button>`).join("");
   box.querySelectorAll("[data-pl]").forEach((b) => { b.onclick = () => navigate({ type: "playlist", id: b.dataset.pl }); });
 }
 $("#sideNewPlaylist").onclick = async () => {
@@ -602,17 +627,37 @@ function greeting() {
     "Tonight's rotation.", "Golden hour, good songs.", "The day is done, the queue isn't.",
     "Evening mode: on.", "Songs for the slow hours."])];
 }
+const MOODS = [
+  ["Chill", "chill vibes"], ["Focus", "focus beats"], ["Workout", "workout hits"],
+  ["Party", "party hits"], ["Romance", "romantic songs"], ["Drive", "road trip songs"],
+];
+function moodChipsHtml() {
+  return `<div class="mood-row">${MOODS.map(([label, q]) =>
+    `<button class="chip-btn" data-mood="${esc(q)}">${label}</button>`).join("")}</div>`;
+}
+function wireMoodChips() {
+  view.querySelectorAll("[data-mood]").forEach((b) =>
+    b.addEventListener("click", () => runSearch(b.dataset.mood)));
+}
+function heavyRotationHtml() {
+  if (!recentPlays.length) return "";
+  return `<div class="section-title">Heavy rotation</div>
+    <div class="rail">${recentPlays.map((t) => songCardHtml(t, "recent")).join("")}</div>`;
+}
 async function renderHome() {
   const [g, sub] = greeting();
   view.innerHTML = `<div class="greeting">${g}</div><div class="greeting-sub">${sub}</div>
+    ${moodChipsHtml()}
     ${recentPlays.length ? `<div class="section-title">Jump back in</div>
       <div class="quick-grid">${recentPlays.slice(0, 6).map((t) => `
         <button class="quick-tile" data-play="${esc(t.id)}" data-ctx="recent">
           <img src="${esc(t.artwork || "")}" alt="">
           <span><div class="qt-title">${esc(t.title)}</div><div class="qt-sub">${esc(t.artist)}</div></span>
         </button>`).join("")}</div>` : ""}
+    ${heavyRotationHtml()}
     <div class="section-title">Trending now</div>${skeletons(6)}
     <div class="section-title">Top artists</div>${skeletons(1, 190)}`;
+  wireMoodChips();
   register(recentPlays, "recent");
   try {
     const charts = await api("/charts");
@@ -620,16 +665,19 @@ async function renderHome() {
     register(charts.songs, "charts");
     register(charts.artists.map((a) => ({ id: a.id })), null);
     view.innerHTML = `<div class="greeting">${g}</div><div class="greeting-sub">${sub}</div>
+      ${moodChipsHtml()}
       ${recentPlays.length ? `<div class="section-title">Jump back in</div>
         <div class="quick-grid">${recentPlays.slice(0, 6).map((t) => `
           <button class="quick-tile" data-play="${esc(t.id)}" data-ctx="recent">
             <img src="${esc(t.artwork || "")}" alt="">
             <span><div class="qt-title">${esc(t.title)}</div><div class="qt-sub">${esc(t.artist)}</div></span>
           </button>`).join("")}</div>` : ""}
+      ${heavyRotationHtml()}
       <div class="section-title">Trending now</div>
       ${charts.songs.slice(0, 15).map((t, i) => rowHtml(t, i, { rank: true, ctx: "charts" })).join("")}
       <div class="section-title">Top artists</div>
       <div class="rail">${charts.artists.map((a) => cardHtml(a, "artist")).join("")}</div>`;
+    wireMoodChips();
     charts.artists.forEach((a) => trackReg.set(a.id, a));
   } catch {
     if (routes[routeIdx].type !== "home") return;
@@ -967,6 +1015,7 @@ function coverHtml(track, glyph = "♪", cls = "") {
   return `<span class="cover cover-fallback ${cls}">${glyph}</span>`;
 }
 function playlistCoverHtml(p, cls = "") {
+  if (p.cover) return `<span class="cover ${cls}"><img src="${esc(p.cover)}" alt=""></span>`;
   const arts = [...new Set(p.tracks.map((t) => t.artwork).filter(Boolean))].slice(0, 4);
   if (arts.length >= 2) return `<span class="cover cover-collage ${cls}">${arts.map((a) => `<img src="${esc(a)}" alt="">`).join("")}</span>`;
   if (arts.length === 1) return `<span class="cover ${cls}"><img src="${esc(arts[0])}" alt=""></span>`;
@@ -1008,7 +1057,12 @@ function mixBarHtml(p, out, inn, i) {
 function renderPlaylist(id) {
   const p = getPlaylist(id);
   if (!p) { navigate({ type: "library" }, true); return; }
-  const tracks = p.tracks;
+  const plSort = store.get("arzxsh.playlistSort", "custom");
+  const tracks = plSort === "alpha"
+    ? p.tracks.slice().sort(byTitle)
+    : plSort === "artist"
+      ? p.tracks.slice().sort((a, b) => (a.artist || "").localeCompare(b.artist || "", undefined, { sensitivity: "base" }) || byTitle(a, b))
+      : p.tracks;
   register(tracks, "playlistTracks");
   view.innerHTML = `
     <div class="page-head plain">
@@ -1024,11 +1078,36 @@ function renderPlaylist(id) {
           ${autoMixStore[p.id] ? `<button class="chip-btn" id="plSmart">Smart reorder</button>` : ""}
           <button class="chip-btn" id="plRename">Rename</button>
           <button class="chip-btn" id="plDelete">Delete</button>
+          <button class="chip-btn" id="plSort">Sort: ${plSort === "alpha" ? "Title A–Z" : plSort === "artist" ? "Artist A–Z" : "Custom order"}</button>
+          <button class="chip-btn" id="plPin">${pinnedIds().includes(p.id) ? "Unpin" : "Pin"}</button>
+          <button class="chip-btn" id="plCover">Cover</button>
         </div>
       </div>
     </div>
+    <div id="coverPicker" class="cover-picker hidden">
+      <button class="cover-pick" data-cover="">Auto</button>
+      ${[...new Set(tracks.map((t) => t.artwork).filter(Boolean))].slice(0, 8).map((a) =>
+        `<button class="cover-pick" data-cover="${esc(a)}"><img src="${esc(a)}" alt=""></button>`).join("")}
+    </div>
     <div class="section-title">Songs</div>
-    ${tracks.length ? tracks.map((t, i) => rowHtml(t, i, { rank: true, ctx: "playlistTracks" }) + (i < tracks.length - 1 ? mixBarHtml(p, tracks[i], tracks[i + 1], i) : "")).join("") : `<div class="empty-note">Nothing here yet. Right-click any song and choose Add to Playlist.</div>`}`;
+    ${tracks.length ? tracks.map((t, i) => rowHtml(t, i, { rank: true, ctx: "playlistTracks" }) + (plSort === "custom" && i < tracks.length - 1 ? mixBarHtml(p, tracks[i], tracks[i + 1], i) : "")).join("") : `<div class="empty-note">Nothing here yet. Right-click any song and choose Add to Playlist.</div>`}`;
+  $("#plSort").onclick = () => {
+    store.set("arzxsh.playlistSort", plSort === "custom" ? "alpha" : plSort === "alpha" ? "artist" : "custom");
+    renderPlaylist(id);
+  };
+  $("#plPin").onclick = () => {
+    const pins = pinnedIds();
+    store.set("arzxsh.pinnedPlaylists",
+      pins.includes(p.id) ? pins.filter((x) => x !== p.id) : [...pins, p.id]);
+    renderSidePlaylists();
+    renderPlaylist(id);
+  };
+  $("#plCover").onclick = () => $("#coverPicker").classList.toggle("hidden");
+  view.querySelectorAll("[data-cover]").forEach((b) => b.onclick = () => {
+    p.cover = b.dataset.cover || null;
+    savePlaylists();
+    renderPlaylist(id);
+  });
   $("#pagePlay").onclick = () => { if (tracks.length) playFromContext(tracks, 0, "Playlist", p.id); };
   $("#pageShuffle").onclick = () => {
     if (!tracks.length) return;
@@ -1080,10 +1159,10 @@ function renderPlaylist(id) {
   };
   const smartBtn = $("#plSmart");
   if (smartBtn) smartBtn.onclick = () => {
-    const reordered = smartReorder(tracks);
-    const changed = reordered.some((t, i) => t !== tracks[i]);
+    const reordered = smartReorder(p.tracks);
+    const changed = reordered.some((t, i) => t !== p.tracks[i]);
     if (!changed) { toast("Already in smooth order"); return; }
-    const unknown = tracks.filter((t) => !getAnalysis(t)).length;
+    const unknown = p.tracks.filter((t) => !getAnalysis(t)).length;
     p.tracks = reordered;
     savePlaylists();
     renderPlaylist(id);
@@ -1107,19 +1186,29 @@ function renderPlaylist(id) {
     navigate({ type: "library" }, true);
   };
 }
+const byTitle = (a, b) => (a.title || "").localeCompare(b.title || "", undefined, { sensitivity: "base" });
 function renderLiked() {
-  register(likes, "likedList");
+  const sortMode = store.get("arzxsh.likedSort", "recent");
+  const tracks = sortMode === "alpha" ? likes.slice().sort(byTitle) : likes;
+  register(tracks, "likedList");
   view.innerHTML = `
     <div class="page-head plain">
-      ${coverHtml(likes[0], "♥", "cover-liked")}
+      ${coverHtml(tracks[0], "♥", "cover-liked")}
       <div>
         <div class="page-kind">Playlist</div>
         <div class="page-name">Liked Songs</div>
         <div class="page-meta">${likes.length} songs · stored on this machine only</div>
+        <div class="page-actions">
+          <button class="chip-btn" id="likedSortBtn">Sort: ${sortMode === "alpha" ? "A–Z" : "Recently liked"}</button>
+        </div>
       </div>
     </div>
     <div class="section-title">Songs</div>
-    ${likes.length ? likes.map((t, i) => rowHtml(t, i, { ctx: "likedList" })).join("") : `<div class="empty-note">Tap the heart on any song and it lands here.</div>`}`;
+    ${tracks.length ? tracks.map((t, i) => rowHtml(t, i, { ctx: "likedList" })).join("") : `<div class="empty-note">Tap the heart on any song and it lands here.</div>`}`;
+  $("#likedSortBtn").onclick = () => {
+    store.set("arzxsh.likedSort", sortMode === "alpha" ? "recent" : "alpha");
+    renderLiked();
+  };
 }
 function renderSettings() {
   view.innerHTML = `
@@ -1185,6 +1274,16 @@ function renderSettings() {
       </div>
       <div class="setting-row">
         <div>
+          <div class="setting-name">Animated artwork</div>
+          <div class="setting-desc">The Now Playing cover slowly drifts and zooms while a song plays, Apple Music style.</div>
+        </div>
+        <select id="settingAnimatedArt" aria-label="Animated artwork">
+          <option value="on">On</option>
+          <option value="off">Off</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <div>
           <div class="setting-name">Your name</div>
           <div class="setting-desc">Used in the Home greeting. Stays on this machine.</div>
         </div>
@@ -1207,6 +1306,12 @@ function renderSettings() {
   $("#settingAccentMode").value = settings.accentMode;
   $("#settingVizStyle").value = settings.vizStyle;
   $("#settingMotion").value = settings.motion;
+  $("#settingAnimatedArt").value = settings.animatedArt ? "on" : "off";
+  $("#settingAnimatedArt").addEventListener("change", (e) => {
+    settings.animatedArt = e.target.value === "on";
+    applySettings();
+    paintArtLive();
+  });
   $("#settingTheme").value = settings.theme;
   $("#settingTheme").addEventListener("change", (e) => {
     settings.theme = e.target.value;
@@ -1280,6 +1385,7 @@ const player = {
   queue: [], index: -1, current: null, contextName: "",
   playing: false, shuffle: false, repeat: 0, playlistId: null,
   radioBusy: false, failCount: 0,
+  smartShuffle: !!store.get("arzxsh.smartShuffle", false), smartBusy: false,
 };
 function makeDeck() {
   const el = new Audio();
@@ -1368,7 +1474,7 @@ function startAt(idx, fade, tr) {
   if (!wasPreloaded) to.el.src = urlFor(track);
   to.el.currentTime = fade && tr ? (tr.inSkip || 0) : 0;
   if (webAudioOk) setDeckLevel(to, 1);
-  to.el.play().catch(() => onTrackError(to));
+  to.el.play().catch((err) => { if (!err || err.name !== "AbortError") onTrackError(to); });
   if (fade) {
     const F = Math.max(0.4, (tr && tr.length) || settings.crossfade || 3);
     const style = (tr && tr.style) || "fade";
@@ -1454,7 +1560,7 @@ function togglePlay() {
     activeDeck.el.pause();
     player.playing = false;
   } else {
-    activeDeck.el.play().catch(() => onTrackError(activeDeck));
+    activeDeck.el.play().catch((err) => { if (!err || err.name !== "AbortError") onTrackError(activeDeck); });
     player.playing = true;
   }
   syncPlayButtons();
@@ -1476,6 +1582,7 @@ decks.forEach((deck) => {
   deck.el.addEventListener("ended", () => {
     if (deck !== activeDeck) return;
     if (deck.fading) return;
+    if (sleepEndOfTrack()) return;
     advance(true, false);
   });
   deck.el.addEventListener("error", () => onTrackError(deck));
@@ -1623,6 +1730,11 @@ function syncSeek(cur, dur) {
   paintSeekRatio(cur / dur, bufferedRatio(activeDeck.el, cur));
   setSeekLabels(cur, dur);
 }
+function paintArtLive() {
+  const npOpen = !$("#nowPlaying").classList.contains("hidden");
+  document.body.classList.toggle("art-live",
+    npOpen && player.playing && settings.animatedArt && !motionReduced());
+}
 function syncPlayButtons() {
   const glyph = player.playing ? "⏸" : "▶";
   $("#playBtn").textContent = glyph;
@@ -1630,6 +1742,7 @@ function syncPlayButtons() {
   document.title = player.current
     ? `${player.current.title} · ${player.current.artist} — arzxsh`
     : "arzxsh for Linux";
+  paintArtLive();
 }
 function syncHeartStates() {
   const t = player.current;
@@ -1763,6 +1876,73 @@ function toggleShuffle() {
 }
 $("#shuffleBtn").onclick = toggleShuffle;
 $("#npShuffle").onclick = toggleShuffle;
+
+const sleepTimer = { id: 0, endAt: 0, endOfTrack: false, labelId: 0 };
+function paintSleepBtn() {
+  const b = $("#sleepBtn");
+  if (!b) return;
+  b.classList.toggle("on", !!(sleepTimer.endAt || sleepTimer.endOfTrack));
+  b.title = sleepTimer.endOfTrack
+    ? "Sleep timer: stops after this track"
+    : sleepTimer.endAt
+      ? `Sleep timer: ${Math.max(1, Math.round((sleepTimer.endAt - Date.now()) / 60000))} min left`
+      : "Sleep timer";
+}
+function clearSleepTimer() {
+  if (sleepTimer.id) clearTimeout(sleepTimer.id);
+  if (sleepTimer.labelId) clearInterval(sleepTimer.labelId);
+  sleepTimer.id = 0;
+  sleepTimer.endAt = 0;
+  sleepTimer.endOfTrack = false;
+  sleepTimer.labelId = 0;
+  paintSleepBtn();
+}
+function setSleepTimer(mode) {
+  clearSleepTimer();
+  if (mode === "off") { toast("Sleep timer off"); return; }
+  if (mode === "track") {
+    sleepTimer.endOfTrack = true;
+    toast("Sleep timer: stops after this track");
+  } else {
+    const mins = Number(mode);
+    sleepTimer.endAt = Date.now() + mins * 60000;
+    sleepTimer.id = setTimeout(() => {
+      clearSleepTimer();
+      stopPlayback();
+      toast("Sleep timer: playback stopped");
+    }, mins * 60000);
+    sleepTimer.labelId = setInterval(paintSleepBtn, 20000);
+    toast(`Sleep timer: ${mins} minutes`);
+  }
+  paintSleepBtn();
+}
+function sleepEndOfTrack() {
+  if (!sleepTimer.endOfTrack) return false;
+  clearSleepTimer();
+  stopPlayback();
+  toast("Sleep timer: playback stopped");
+  return true;
+}
+paintSmartShuffleBtn();
+$("#smartShuffleBtn").onclick = () => {
+  player.smartShuffle = !player.smartShuffle;
+  store.set("arzxsh.smartShuffle", player.smartShuffle);
+  paintSmartShuffleBtn();
+  toast(player.smartShuffle ? "Smart Shuffle on: similar songs slip into your queue" : "Smart Shuffle off");
+  if (player.smartShuffle && player.current) smartTopUp(player.current);
+};
+$("#sleepBtn").onclick = (e) => {
+  e.stopPropagation();
+  $("#sleepMenu").classList.toggle("hidden");
+};
+$("#sleepMenu").querySelectorAll("[data-sleep]").forEach((b) =>
+  b.addEventListener("click", () => {
+    setSleepTimer(b.dataset.sleep);
+    $("#sleepMenu").classList.add("hidden");
+  }));
+document.addEventListener("click", (e) => {
+  if (!e.target.closest("#sleepMenu,#sleepBtn")) $("#sleepMenu").classList.add("hidden");
+});
 $("#pHeart").onclick = (e) => { e.stopPropagation(); if (player.current) toggleLike(player.current); };
 $("#npHeart").onclick = () => { if (player.current) toggleLike(player.current); };
 let preMuteVolume = 80;
@@ -1861,11 +2041,13 @@ function openNp(showQueue = false) {
   fitVizEntries();
   updateLyricsSync(activeDeck.el.currentTime || 0, true);
   wakeMotionLoop(450);
+  paintArtLive();
 }
 function closeNp() {
   const np = $("#nowPlaying");
   if (!np.classList.contains("hidden")) beginArtworkMorph(false);
   np.classList.remove("np-visible");
+  paintArtLive();
   clearTimeout(npCloseTimer);
   npCloseTimer = setTimeout(() => {
     np.classList.add("hidden");
@@ -1887,6 +2069,7 @@ function renderQueue() {
     <button class="queue-row ${player.current && t.id === player.current.id ? "current" : ""}" data-qid="${esc(t.id)}" data-qidx="${i}">
       <img src="${esc(t.artwork || "")}" alt="">
       <span class="q-main"><div class="q-title">${esc(t.title)}</div><div class="q-sub">${esc(t.artist)}</div></span>
+      ${t._smart ? `<span class="q-smart">Smart pick</span>` : ""}
       <span class="row-dur">${fmt(t.duration_s)}</span>
     </button>`).join("");
   const note = player.queue.length
@@ -1898,9 +2081,46 @@ function renderQueue() {
       if (!box) return;
       box.innerHTML = html;
       $(noteSel).textContent = note;
-      box.querySelectorAll("[data-qidx]").forEach((b) =>
-        b.addEventListener("click", () => startAt(Number(b.dataset.qidx), false)));
+      box.querySelectorAll("[data-qidx]").forEach((b) => {
+        b.addEventListener("click", () => {
+          if (Date.now() - lastQueueDragEnd < 250) return;
+          startAt(Number(b.dataset.qidx), false);
+        });
+        const idx = Number(b.dataset.qidx);
+        if (idx <= player.index) return;
+        b.draggable = true;
+        b.addEventListener("dragstart", (e) => {
+          dragQIdx = idx;
+          e.dataTransfer.effectAllowed = "move";
+          try { e.dataTransfer.setData("text/plain", String(idx)); } catch {}
+          b.classList.add("dragging");
+        });
+        b.addEventListener("dragend", () => {
+          dragQIdx = -1;
+          lastQueueDragEnd = Date.now();
+          box.querySelectorAll(".drag-over").forEach((r) => r.classList.remove("drag-over"));
+        });
+        b.addEventListener("dragover", (e) => {
+          if (dragQIdx < 0) return;
+          e.preventDefault();
+          b.classList.add("drag-over");
+        });
+        b.addEventListener("dragleave", () => b.classList.remove("drag-over"));
+        b.addEventListener("drop", (e) => {
+          e.preventDefault();
+          moveQueueItem(dragQIdx, idx);
+        });
+      });
     });
+}
+let dragQIdx = -1;
+let lastQueueDragEnd = 0;
+function moveQueueItem(from, to) {
+  if (from < 0 || to < 0 || from === to) return;
+  if (from <= player.index || to <= player.index) return;
+  const [item] = player.queue.splice(from, 1);
+  player.queue.splice(to, 0, item);
+  renderQueue();
 }
 
 const panel = { open: false, tab: "lyrics" };
