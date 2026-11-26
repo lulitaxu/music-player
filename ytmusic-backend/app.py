@@ -592,7 +592,20 @@ def audio(video_id: str, request: Request):
         raise HTTPException(502, f"audio fetch failed: {e.__class__.__name__}")
     if upstream.status_code not in (200, 206):
         upstream.close()
-        raise HTTPException(502, f"audio fetch returned {upstream.status_code}")
+        _cache.pop(f"stream:{video_id}", None)
+        try:
+            resolved = cached(f"stream:{video_id}", 300, lambda: _resolve_stream(video_id))
+            url = resolved.get("url")
+            if not url:
+                raise HTTPException(502, "stream resolution returned no URL")
+            upstream = requests.get(url, headers=headers, stream=True, timeout=30)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(502, f"audio fetch failed: {e.__class__.__name__}")
+        if upstream.status_code not in (200, 206):
+            upstream.close()
+            raise HTTPException(502, f"audio fetch returned {upstream.status_code}")
     passthrough = {}
     for name in ("content-type", "content-length", "content-range", "accept-ranges"):
         value = upstream.headers.get(name)

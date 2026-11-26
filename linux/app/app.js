@@ -20,6 +20,21 @@ function cssUrl(u) {
     (c) => extra[c] || encodeURIComponent(c));
   return `url("${safe}")`;
 }
+function artAt(url, px) {
+  if (!url || !/^https:\/\//.test(url)) return url || "";
+  if (url.includes("googleusercontent.com")) {
+    if (/=w\d+-h\d+/.test(url)) return url.replace(/=w\d+-h\d+/, `=w${px}-h${px}`);
+    if (!url.split("/").pop().includes("=")) return `${url}=w${px}-h${px}`;
+    return url;
+  }
+  if (url.includes("i.ytimg.com")) {
+    return url.split("?")[0].replace(/\/(maxresdefault|sddefault|hqdefault|mqdefault|default)\.jpg/,
+      px <= 226 ? "/mqdefault.jpg" : "/hqdefault.jpg");
+  }
+  return url;
+}
+const artSmall = (url) => artAt(url, 226);
+const artMed = (url) => artAt(url, 540);
 function fmt(sec) {
   if (!isFinite(sec) || sec == null) return "0:00";
   sec = Math.max(0, Math.round(sec));
@@ -392,7 +407,7 @@ function rowHtml(track, i, opts = {}) {
   const cur = player.current && player.current.id === track.id;
   return `<div class="row ${cur ? "current" : ""} ${cur && player.playing ? "playing" : ""}" data-play="${esc(track.id)}" data-ctx="${opts.ctx || ""}" role="button" tabindex="0">
     ${opts.rank ? `<span class="rank">${i + 1}</span>` : ""}
-    <img src="${esc(track.artwork || "")}" alt="" loading="lazy">
+    <img src="${esc(artSmall(track.artwork))}" alt="" loading="lazy">
     <span class="row-main">
       <span class="row-title">${esc(track.title)} ${track.is_explicit ? '<span class="badge-x">E</span>' : ""}<span class="eq"><i></i><i></i><i></i></span></span>
       <span class="row-sub">${esc(track.artist)}${track.album ? " · " + esc(track.album) : ""}</span>
@@ -405,18 +420,18 @@ function rowHtml(track, i, opts = {}) {
 function cardHtml(item, kind) {
   if (kind === "artist") {
     return `<button class="card round" data-artist="${esc(item.id)}">
-      <span class="card-art"><img src="${esc(item.artwork || "")}" alt="" loading="lazy"><span class="card-play" data-quickplay-artist="${esc(item.id)}">▶</span></span>
+      <span class="card-art"><img src="${esc(artMed(item.artwork))}" alt="" loading="lazy"><span class="card-play" data-quickplay-artist="${esc(item.id)}">▶</span></span>
       <div class="card-title">${esc(item.name)}</div>
       <div class="card-sub">Artist</div></button>`;
   }
   return `<button class="card" data-album="${esc(item.id)}">
-    <span class="card-art"><img src="${esc(item.artwork || "")}" alt="" loading="lazy"><span class="card-play" data-quickplay-album="${esc(item.id)}">▶</span></span>
+    <span class="card-art"><img src="${esc(artMed(item.artwork))}" alt="" loading="lazy"><span class="card-play" data-quickplay-album="${esc(item.id)}">▶</span></span>
     <div class="card-title">${esc(item.title)}</div>
     <div class="card-sub">${esc(item.artist || "")}${item.year ? " · " + esc(item.year) : ""}</div></button>`;
 }
 function songCardHtml(track, ctx) {
   return `<button class="card" data-play="${esc(track.id)}" data-ctx="${ctx}">
-    <span class="card-art"><img src="${esc(track.artwork || "")}" alt="" loading="lazy"><span class="card-play">▶</span></span>
+    <span class="card-art"><img src="${esc(artMed(track.artwork))}" alt="" loading="lazy"><span class="card-play">▶</span></span>
     <div class="card-title">${esc(track.title)}</div>
     <div class="card-sub">Song · ${esc(track.artist)}</div></button>`;
 }
@@ -652,7 +667,7 @@ async function renderHome() {
     ${recentPlays.length ? `<div class="section-title">Jump back in</div>
       <div class="quick-grid">${recentPlays.slice(0, 6).map((t) => `
         <button class="quick-tile" data-play="${esc(t.id)}" data-ctx="recent">
-          <img src="${esc(t.artwork || "")}" alt="">
+          <img src="${esc(artSmall(t.artwork))}" alt="">
           <span><div class="qt-title">${esc(t.title)}</div><div class="qt-sub">${esc(t.artist)}</div></span>
         </button>`).join("")}</div>` : ""}
     ${heavyRotationHtml()}
@@ -670,7 +685,7 @@ async function renderHome() {
       ${recentPlays.length ? `<div class="section-title">Jump back in</div>
         <div class="quick-grid">${recentPlays.slice(0, 6).map((t) => `
           <button class="quick-tile" data-play="${esc(t.id)}" data-ctx="recent">
-            <img src="${esc(t.artwork || "")}" alt="">
+            <img src="${esc(artSmall(t.artwork))}" alt="">
             <span><div class="qt-title">${esc(t.title)}</div><div class="qt-sub">${esc(t.artist)}</div></span>
           </button>`).join("")}</div>` : ""}
       ${heavyRotationHtml()}
@@ -842,10 +857,10 @@ async function renderArtist(id) {
     register(a.songs, "artistSongs");
     view.innerHTML = `
       <div class="page-hero">
-        ${a.artwork ? `<div class="page-wash" style="background-image:${cssUrl(a.artwork)}"></div>` : ""}
+        ${a.artwork ? `<div class="page-wash" style="background-image:${cssUrl(artSmall(a.artwork))}"></div>` : ""}
         <div class="page-hero-content">
           <div class="page-head round">
-            <img src="${esc(a.artwork || "")}" alt="">
+            <img src="${esc(artMed(a.artwork))}" alt="">
             <div>
               <div class="page-kind">Artist</div>
               <div class="page-name">${esc(a.name || "")}</div>
@@ -885,10 +900,10 @@ async function renderAlbum(id) {
     register(tracks, "albumTracks");
     view.innerHTML = `
       <div class="page-hero">
-        ${a.artwork ? `<div class="page-wash" style="background-image:${cssUrl(a.artwork)}"></div>` : ""}
+        ${a.artwork ? `<div class="page-wash" style="background-image:${cssUrl(artSmall(a.artwork))}"></div>` : ""}
         <div class="page-hero-content">
           <div class="page-head">
-            <img src="${esc(a.artwork || "")}" alt="">
+            <img src="${esc(artMed(a.artwork))}" alt="">
             <div>
               <div class="page-kind">Album</div>
               <div class="page-name">${esc(a.title || "")}</div>
@@ -972,7 +987,7 @@ async function renderLocal(fresh = false) {
     register(tracks, "localList");
     view.innerHTML = `
       <div class="page-head plain">
-        ${coverHtml(tracks[0], "♪")}
+        ${coverHtml(tracks[0], "♪", "", true)}
         <div>
           <div class="page-kind">Local library</div>
           <div class="page-name">On this device</div>
@@ -1021,15 +1036,16 @@ async function renderLocal(fresh = false) {
       <div class="error-note">Couldn't read your music folder. Try again.<button data-retry>Retry</button></div>`;
   }
 }
-function coverHtml(track, glyph = "♪", cls = "") {
-  if (track && track.artwork) return `<span class="cover ${cls}"><img src="${esc(track.artwork)}" alt=""></span>`;
+function coverHtml(track, glyph = "♪", cls = "", med = false) {
+  if (track && track.artwork) return `<span class="cover ${cls}"><img src="${esc(med ? artMed(track.artwork) : artSmall(track.artwork))}" alt=""></span>`;
   return `<span class="cover cover-fallback ${cls}">${glyph}</span>`;
 }
-function playlistCoverHtml(p, cls = "") {
-  if (p.cover) return `<span class="cover ${cls}"><img src="${esc(p.cover)}" alt=""></span>`;
+function playlistCoverHtml(p, cls = "", med = false) {
+  if (p.cover) return `<span class="cover ${cls}"><img src="${esc(med ? artMed(p.cover) : artSmall(p.cover))}" alt=""></span>`;
   const arts = [...new Set(p.tracks.map((t) => t.artwork).filter(Boolean))].slice(0, 4);
-  if (arts.length >= 2) return `<span class="cover cover-collage ${cls}">${arts.map((a) => `<img src="${esc(a)}" alt="">`).join("")}</span>`;
-  if (arts.length === 1) return `<span class="cover ${cls}"><img src="${esc(arts[0])}" alt=""></span>`;
+  const sized = arts.map((a) => (med ? artMed(a) : artSmall(a)));
+  if (sized.length >= 2) return `<span class="cover cover-collage ${cls}">${sized.map((a) => `<img src="${esc(a)}" alt="">`).join("")}</span>`;
+  if (sized.length === 1) return `<span class="cover ${cls}"><img src="${esc(sized[0])}" alt=""></span>`;
   return `<span class="cover cover-fallback ${cls}">♪</span>`;
 }
 function mixSummary(tr) {
@@ -1077,7 +1093,7 @@ function renderPlaylist(id) {
   register(tracks, "playlistTracks");
   view.innerHTML = `
     <div class="page-head plain">
-      ${playlistCoverHtml(p)}
+      ${playlistCoverHtml(p, "", true)}
       <div>
         <div class="page-kind">Playlist</div>
         <div class="page-name">${esc(p.name)}</div>
@@ -1098,7 +1114,7 @@ function renderPlaylist(id) {
     <div id="coverPicker" class="cover-picker hidden">
       <button class="cover-pick" data-cover="">Auto</button>
       ${[...new Set(tracks.map((t) => t.artwork).filter(Boolean))].slice(0, 8).map((a) =>
-        `<button class="cover-pick" data-cover="${esc(a)}"><img src="${esc(a)}" alt=""></button>`).join("")}
+        `<button class="cover-pick" data-cover="${esc(a)}"><img src="${esc(artSmall(a))}" alt=""></button>`).join("")}
     </div>
     <div class="section-title">Songs</div>
     ${tracks.length ? tracks.map((t, i) => rowHtml(t, i, { rank: true, ctx: "playlistTracks" }) + (plSort === "custom" && i < tracks.length - 1 ? mixBarHtml(p, tracks[i], tracks[i + 1], i) : "")).join("") : `<div class="empty-note">Nothing here yet. Right-click any song and choose Add to Playlist.</div>`}`;
@@ -1204,7 +1220,7 @@ function renderLiked() {
   register(tracks, "likedList");
   view.innerHTML = `
     <div class="page-head plain">
-      ${coverHtml(tracks[0], "♥", "cover-liked")}
+      ${coverHtml(tracks[0], "♥", "cover-liked", true)}
       <div>
         <div class="page-kind">Playlist</div>
         <div class="page-name">Liked Songs</div>
@@ -1380,7 +1396,7 @@ function renderSideRecent() {
   $("#likedCount").textContent = likes.length ? String(likes.length) : "";
   $("#sideRecent").innerHTML = recentPlays.slice(0, 5).map((t) => `
     <button class="side-recent" data-play="${esc(t.id)}" data-ctx="recentSide">
-      <img src="${esc(t.artwork || "")}" alt=""><span>${esc(t.title)}</span>
+      <img src="${esc(artSmall(t.artwork))}" alt=""><span>${esc(t.title)}</span>
     </button>`).join("");
   register(recentPlays, "recentSide");
   $("#sideRecent").querySelectorAll("[data-play]").forEach((b) =>
@@ -1471,6 +1487,19 @@ function urlFor(track) {
     ? `/local/file/${encodeURIComponent(track.id)}`
     : `/audio/${encodeURIComponent(track.id)}`;
 }
+let warmTimer = null;
+function warmNextStream() {
+  clearTimeout(warmTimer);
+  warmTimer = setTimeout(() => {
+    if (!player.current || player.shuffle || player.repeat === 2) return;
+    const n = player.index + 1 < player.queue.length ? player.index + 1
+      : (player.repeat === 1 && player.queue.length ? 0 : -1);
+    if (n < 0) return;
+    const nt = player.queue[n];
+    if (!nt || nt.source === "local") return;
+    fetch(`/stream/${encodeURIComponent(nt.id)}`).catch(() => {});
+  }, 5000);
+}
 function playFromContext(list, idx, ctxLabel, playlistId) {
   if (!list || !list.length || idx < 0) return;
   player.queue = list.slice();
@@ -1527,6 +1556,7 @@ function startAt(idx, fade, tr) {
   notePlayed(track);
   onTrackChanged(track);
   wakeMotionLoop();
+  warmNextStream();
 }
 function hasNext(auto) {
   if (player.shuffle) return player.queue.length > 1;
@@ -1848,7 +1878,7 @@ function crossfadeAmbient(src) {
 function onTrackChanged(track) {
   $("#player").classList.remove("hidden");
   document.body.classList.remove("no-player");
-  $("#pArt").src = track.artwork || "";
+  $("#pArt").src = artSmall(track.artwork);
   $("#pTitle").textContent = track.title;
   $("#pArtist").textContent = track.artist;
   crossfadeNpArt(track.artwork || "");
@@ -2098,7 +2128,7 @@ $("#npQueueBtn").onclick = () => {
 function renderQueue() {
   const html = player.queue.map((t, i) => `
     <button class="queue-row ${player.current && t.id === player.current.id ? "current" : ""}" data-qid="${esc(t.id)}" data-qidx="${i}">
-      <img src="${esc(t.artwork || "")}" alt="">
+      <img src="${esc(artSmall(t.artwork))}" alt="">
       <span class="q-main"><div class="q-title">${esc(t.title)}</div><div class="q-sub">${esc(t.artist)}</div></span>
       ${t._smart ? `<span class="q-smart">Smart pick</span>` : ""}
       <span class="row-dur">${fmt(t.duration_s)}</span>
@@ -2327,7 +2357,7 @@ async function loadAbout(track) {
     if (!aboutCache.has(id)) aboutCache.set(id, await api(`/artist/${encodeURIComponent(id)}`));
     if (aboutKey !== id) return;
     const a = aboutCache.get(id);
-    $("#aboutArt").src = a.artwork || "";
+    $("#aboutArt").src = artSmall(a.artwork);
     $("#aboutName").textContent = a.name || track.artist;
     $("#aboutSubs").textContent = a.subscribers ? `${a.subscribers} subscribers` : "";
     const bio = a.description || "";
@@ -2777,9 +2807,6 @@ document.addEventListener("error", (e) => {
 [likes, recentPlays, ...playlists.map((p) => p.tracks)].forEach((list) => {
   list.forEach((t) => {
     if (!t || !t.artwork) return;
-    if (t.artwork.includes("maxresdefault")) {
-      t.artwork = t.artwork.replace("maxresdefault", "hqdefault");
-    }
     if (t.artwork.includes("googleusercontent.com")) {
       if (/=w\d+-h\d+/.test(t.artwork)) {
         t.artwork = t.artwork.replace(/=w\d+-h\d+/, "=w1080-h1080");
